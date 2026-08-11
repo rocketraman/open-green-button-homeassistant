@@ -569,27 +569,54 @@ async def test_bulk_zero_cost_falls_back_to_billing_summary(hass: HomeAssistant)
     assert [round(s["sum"], 2) for s in cost_calls[0].args[2]] == [20.0, 50.0]
 
 
-def _accumulation_response(behaviour: str, flow_direction: str = "FORWARD") -> UsageResponse:
+def _series(
+    behaviour: str,
+    flow_direction: str = "FORWARD",
+    *,
+    meter_reading_id: str = "mr1",
+    unit: str = "WATT_HOURS",
+    readings: list[UsageReading] | None = None,
+) -> MeterReadingSeries:
     """One hourly FORWARD-by-default series carrying an arbitrary accumulation behaviour."""
-    reading_type = NormalizedReadingType(
-        commodity="ELECTRICITY_SECONDARY_METERED",
-        flow_direction=flow_direction,
-        accumulation_behaviour=behaviour,
-        interval_length_seconds=3600,
-        unit_of_measure="WATT_HOURS",
-        unit_of_measure_symbol="Wh",
-        power_of_ten_multiplier=0,
-        currency_numeric_code=124,
+    return MeterReadingSeries(
+        meter_reading_id=meter_reading_id,
+        reading_type=NormalizedReadingType(
+            commodity="ELECTRICITY_SECONDARY_METERED",
+            flow_direction=flow_direction,
+            accumulation_behaviour=behaviour,
+            interval_length_seconds=3600,
+            unit_of_measure=unit,
+            unit_of_measure_symbol="Wh",
+            power_of_ten_multiplier=0,
+            currency_numeric_code=124,
+        ),
+        readings=(
+            [
+                UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0),
+                UsageReading(datetime(2026, 7, 5, 6, tzinfo=UTC), 3600, 1500.0),
+            ]
+            if readings is None
+            else readings
+        ),
     )
-    series = MeterReadingSeries(
-        meter_reading_id="mr1",
-        reading_type=reading_type,
-        readings=[
-            UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0),
-            UsageReading(datetime(2026, 7, 5, 6, tzinfo=UTC), 3600, 1500.0),
-        ],
-    )
-    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[series])
+
+
+def _accumulation_response(
+    behaviour: str,
+    flow_direction: str = "FORWARD",
+    *,
+    sibling: MeterReadingSeries | None = None,
+) -> UsageResponse:
+    """A UsagePoint carrying [behaviour], optionally alongside a second series.
+
+    The sibling is what makes a cumulative register *excludable* — see
+    [statistics._is_interval_consumption_series]. Without one, a register is all the utility
+    publishes and is imported.
+    """
+    series = [_series(behaviour, flow_direction)]
+    if sibling is not None:
+        series.append(sibling)
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=series)
     return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
 
 
@@ -630,29 +657,106 @@ async def test_reverse_non_delta_series_still_imports(hass: HomeAssistant) -> No
     assert usage_calls[0].args[1]["statistic_id"].endswith("_reverse")
 
 
-async def test_every_cumulative_behaviour_is_excluded(hass: HomeAssistant) -> None:
-    """BULK_QUANTITY isn't special — every cumulative-register behaviour is excluded.
+async def test_every_cumulative_behaviour_is_excluded_when_superseded(
+    hass: HomeAssistant,
+) -> None:
+    """BULK_QUANTITY isn't special — every register behaviour loses to a same-flow sibling.
 
+    This is Milton Hydro's shape (issue #6): an hourly DELTA_DATA consumption series and a
+    register snapshot on one UsagePoint, both FORWARD, both mapping to one statistic_id.
     CONTINUOUS_CUMULATIVE (ESPI 2) is the one that matters: it used to normalize to "OTHER" and
     would have slipped straight past a name-based exclusion.
+
+    Only the sibling's readings may land — 1.0 then 2.5 kWh cumulative. If the register were
+    summed in too, the sums would be doubled.
     """
     for behaviour in ("BULK_QUANTITY", "CUMULATIVE", "CONTINUOUS_CUMULATIVE"):
-        assert await _import_and_collect_usage(hass, _accumulation_response(behaviour)) == [], (
-            f"{behaviour} should not be summed into a consumption statistic"
+        calls = await _import_and_collect_usage(
+            hass,
+            _accumulation_response(
+                behaviour, sibling=_series("DELTA_DATA", meter_reading_id="mr2")
+            ),
         )
+        assert len(calls) == 1, f"{behaviour} should not be summed into a consumption statistic"
+        assert [round(s["sum"], 3) for s in calls[0].args[2]] == [1.0, 2.5], behaviour
 
 
-async def test_only_cumulative_series_logs_error(
+async def test_lone_cumulative_series_still_imports(hass: HomeAssistant) -> None:
+    """A register with no sibling is all the utility publishes — import it.
+
+    Consumers Energy (via UtilityAPI) publishes one reading per billing period, genuine
+    per-period consumption, mislabelled BULK_QUANTITY. Excluding on the name alone dropped
+    100% of that feed and left an empty Energy dashboard.
+    """
+    for behaviour in ("BULK_QUANTITY", "CUMULATIVE", "CONTINUOUS_CUMULATIVE"):
+        calls = await _import_and_collect_usage(hass, _accumulation_response(behaviour))
+        assert len(calls) == 1, f"{behaviour} with no sibling must still import"
+        assert [round(s["sum"], 3) for s in calls[0].args[2]] == [1.0, 2.5], behaviour
+
+
+async def test_register_survives_a_sibling_of_the_other_flow_direction(
+    hass: HomeAssistant,
+) -> None:
+    """A REVERSE delta series doesn't supersede a FORWARD register — no statistic_id collision.
+
+    Excluding on "any non-cumulative sibling" would drop the only consumption data there is
+    and leave the account showing solar export but no usage.
+    """
+    calls = await _import_and_collect_usage(
+        hass,
+        _accumulation_response(
+            "BULK_QUANTITY",
+            sibling=_series("DELTA_DATA", flow_direction="REVERSE", meter_reading_id="mr2"),
+        ),
+    )
+    assert {c.args[1]["statistic_id"].rsplit("_", 1)[-1] for c in calls} == {"forward", "reverse"}
+
+
+async def test_billing_period_reading_spreads_across_its_hours(hass: HomeAssistant) -> None:
+    """A month-long reading becomes one row per hour, not a single spike at the period start.
+
+    Consumers Energy's shape: one reading per billing period. ESPI publishes an inclusive end,
+    so a 3-hour period is 10799s, and the total must survive the split exactly.
+    """
+    up = UsagePoint(
+        usage_point_id="up1",
+        service_kind="electricity",
+        series=[
+            _series(
+                "BULK_QUANTITY",
+                readings=[UsageReading(datetime(2026, 6, 2, tzinfo=UTC), 10799, 3000.0)],
+            )
+        ],
+    )
+    calls = await _import_and_collect_usage(
+        hass, UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+    )
+    assert len(calls) == 1
+    rows = calls[0].args[2]
+    assert [r["start"] for r in rows] == [datetime(2026, 6, 2, h, tzinfo=UTC) for h in (0, 1, 2)]
+    # 3 kWh spread evenly, accumulated: the trailing hour is 1s short (inclusive end) and must
+    # NOT be deferred — a closed billing period is never re-published.
+    assert [round(r["sum"], 3) for r in rows] == [1.0, 2.0, 3.0]
+
+
+async def test_unmappable_unit_on_every_series_logs_error(
     hass: HomeAssistant, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A UsagePoint with nothing but registers writes nothing — and says so loudly.
+    """A UsagePoint whose every series is unrepresentable writes nothing — and says so loudly.
 
-    Deriving deltas from a register isn't implemented, so such a feed yields no energy at all.
-    That's an empty Energy dashboard, which has to be diagnosable from the log alone.
+    That's an empty Energy dashboard, which has to be diagnosable from the log alone. Since a
+    register is now only excluded when a sibling supersedes it, the remaining way to import
+    nothing is a unit we have no HA mapping for.
     """
+    up = UsagePoint(
+        usage_point_id="up1",
+        service_kind="electricity",
+        series=[_series("DELTA_DATA", unit="OTHER")],
+    )
+    response = UsageResponse(updated=None, usage_points=[up], new_credentials=None)
     with caplog.at_level(logging.ERROR, logger="custom_components.greenbutton.statistics"):
-        assert await _import_and_collect_usage(hass, _accumulation_response("BULK_QUANTITY")) == []
-    assert "no per-interval consumption series" in caplog.text
+        assert await _import_and_collect_usage(hass, response) == []
+    assert "no importable consumption series" in caplog.text
 
 
 def _summary_only_response() -> UsageResponse:

@@ -829,6 +829,82 @@ async def test_import_migration_skips_entry_with_no_prior_statistics(
     assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
 
 
+def _billing_period_response() -> UsageResponse:
+    """Consumers Energy's shape: one month-long reading, mislabelled BULK_QUANTITY, no sibling."""
+    reading_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="BULK_QUANTITY",
+        interval_length_seconds=2505599,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=0,
+        currency_numeric_code=840,
+    )
+    series = MeterReadingSeries(
+        meter_reading_id="B12888756_kwh_1",
+        reading_type=reading_type,
+        readings=[UsageReading(datetime(2026, 6, 2, tzinfo=UTC), 2505599, 914_523.0, cost=234.02)],
+    )
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[series])
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+def _stamp(hass: HomeAssistant, entry: MockConfigEntry, revision: int) -> None:
+    """Mark [entry] as holding rows produced by import-logic [revision]."""
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_IMPORT_LOGIC_REVISION: revision}
+    )
+
+
+async def test_import_migration_rebuilds_entry_wiped_by_revision_1(hass: HomeAssistant) -> None:
+    """A billing-only entry emptied by revision 1 repairs itself — despite having no rows.
+
+    Revision 1 classed a month-long reading as a cumulative register, so its repair rebuild
+    purged the entry and re-imported nothing, leaving it stamped 1 with an empty store and a
+    cursor advanced past its data. "No statistics" must NOT be read as "newly added" here, or
+    the account stays permanently blank with nothing left to trigger a re-import.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, 1)
+    api = _api_returning(_billing_period_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=False)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    assert coordinator.last_exception is None
+    assert api.fetch_usage.await_count == 2  # the poll, then the rebuild's full-history re-fetch
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
+async def test_import_migration_does_not_rebuild_repaired_entry_twice(
+    hass: HomeAssistant,
+) -> None:
+    """An entry already at revision 1 with an hourly feed is stamped forward, not rebuilt again.
+
+    Milton's register spans 24 hours, but it's excluded in favour of its hourly DELTA_DATA
+    sibling — so its stored rows never came from a multi-hour reading and revision 2 doesn't
+    apply. Re-pulling its whole history would be pure waste.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, 1)
+    api = _api_returning(_response_with_cumulative_register())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    api.fetch_usage.assert_awaited_once()  # no rebuild re-fetch
+    clear_mock.assert_not_awaited()
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
 async def test_import_migration_defers_decision_on_empty_response(hass: HomeAssistant) -> None:
     """An empty poll can't clear an entry: "no register" may just mean "nothing published".
 

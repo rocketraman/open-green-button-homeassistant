@@ -62,7 +62,7 @@ from .statistics import (
     async_clear_statistics_for_entry,
     async_entry_has_statistics,
     import_usage_statistics,
-    response_has_cumulative_series,
+    response_needs_import_migration,
 )
 from .storage import xml_cache_path
 
@@ -473,17 +473,19 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
 
         A blanket rebuild would be the simple answer and the wrong one: it makes every user
         re-pull their entire initial-history window from their utility to fix a bug most of them
-        never had. So we rebuild only entries whose feed shows the offending shape, and stamp the
-        rest as current on the spot. For revision 1 that shape is a cumulative meter register in
-        the response ([statistics.response_has_cumulative_series]) — exactly the series that used
-        to be summed into consumption (#6) and to hijack cost selection with its `cost=0` (#7).
+        never had. So we rebuild only entries whose feed shows an offending shape, and stamp the
+        rest as current on the spot. [statistics.response_needs_import_migration] owns the
+        per-revision recognition, and tests every revision newer than this entry's stamp — so an
+        entry that skipped a release gets each repair it's owed, in a single rebuild.
 
         Three ways this resolves, all at most once per entry:
 
-          - **No statistics predate this code** → nothing was written by the old logic, so stamp
-            and move on. Covers a newly-added entry, whose very first import is already correct.
-          - **The feed has no cumulative register** → this entry was never affected; stamp.
-            Held back on an empty response, where "no register" only means the utility published
+          - **Never imported at all** → nothing was written by the old logic, so stamp and move
+            on. Covers a newly-added entry, whose very first import is already correct. Note this
+            needs BOTH an empty store and no stamp: revision 1 purged affected entries and then
+            imported nothing, so "no rows" on its own can mean *damaged*, not new.
+          - **The feed has no offending shape** → this entry was never affected; stamp. Held back
+            on an empty response, where "no offending shape" only means the utility published
             nothing in this window — the decision waits for a poll that carries readings.
           - **Affected** → rebuild, then stamp.
 
@@ -494,7 +496,13 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         """
         from homeassistant.exceptions import HomeAssistantError
 
-        if not had_prior_statistics:
+        stamped_revision = self.entry.data.get(CONF_IMPORT_LOGIC_REVISION, 0)
+
+        # An empty store alone does NOT mean "never imported" — revision 1 rebuilt affected
+        # entries by purging first and then importing nothing, which is precisely the damage
+        # revision 2 repairs. A stamp is proof the entry has imported before, so only an
+        # unstamped entry with no rows is genuinely new and safe to stamp forward untouched.
+        if not had_prior_statistics and not stamped_revision:
             self._store_import_logic_revision()
             return None
 
@@ -506,22 +514,24 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             )
             return None
 
-        if not response_has_cumulative_series(response):
+        if not response_needs_import_migration(response, stamped_revision):
             _LOGGER.debug(
-                "Entry %s is unaffected by the import-logic change (no cumulative meter "
-                "register in its feed); marking revision %d without a rebuild",
+                "Entry %s is unaffected by the import-logic changes since revision %d; marking "
+                "revision %d without a rebuild",
                 self.entry.entry_id,
+                stamped_revision,
                 IMPORT_LOGIC_REVISION,
             )
             self._store_import_logic_revision()
             return None
 
         _LOGGER.warning(
-            "Entry %s imported statistics under superseded logic: its feed publishes a "
-            "cumulative meter register, which older versions summed into the consumption "
-            "statistic as if it were interval usage. Rebuilding this entry's statistics from a "
-            "full history re-fetch — this runs once and may take several minutes",
+            "Entry %s imported statistics under superseded logic (revision %d, current is %d) "
+            "and its feed has the shape that bug applied to. Rebuilding this entry's statistics "
+            "from a full history re-fetch — this runs once and may take several minutes",
             self.entry.entry_id,
+            stamped_revision,
+            IMPORT_LOGIC_REVISION,
         )
         try:
             rebuilt = await self.async_rebuild_statistics(publish=publish)

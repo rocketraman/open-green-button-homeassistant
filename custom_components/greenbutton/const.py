@@ -110,13 +110,24 @@ CONF_LAST_FETCHED_AT = "last_fetched_at"
 # [coordinator.GreenButtonCoordinator._async_migrate_import].
 CONF_IMPORT_LOGIC_REVISION = "import_logic_revision"
 
-# Bump when a change means previously-imported rows are wrong and must be rebuilt, AND teach
-# the coordinator how to recognize an affected entry's feed (a blanket rebuild would make every
-# user re-pull their full history against their utility for a bug that may not affect them).
+# Bump when a change means previously-imported rows are wrong and must be rebuilt, AND add a
+# recognition predicate to [statistics._IMPORT_MIGRATION_CHECKS] so the coordinator can tell an
+# affected entry's feed from an unaffected one (a blanket rebuild would make every user re-pull
+# their full history against their utility for a bug that may not affect them). An entry stamped
+# at revision N is tested against every predicate above N, so a user who skipped a release still
+# gets each repair they're owed.
 #   1 — cumulative meter registers (ESPI BULK_QUANTITY et al) were summed into the consumption
 #       statistic, and their `cost=0` placeholder suppressed real UsageSummary billing.
 #       Affects feeds that publish a cumulative register: Milton Hydro. (issues #6, #7)
-IMPORT_LOGIC_REVISION = 1
+#   2 — a reading longer than an hour was written entirely into the hour it started in, instead
+#       of being spread across the hours it spans. Affects billing-only feeds, where one reading
+#       covers a whole billing period: Consumers Energy, and any UtilityAPI utility whose account
+#       has no interval data (Eversource, El Paso Electric).
+#       Revision 1 compounded this: it classed those same readings as cumulative registers and
+#       excluded them, so an affected entry's rebuild purged its rows and re-imported nothing.
+#       Those entries are stamped 1 and sitting on an EMPTY store with a cursor advanced past
+#       their data — nothing but this migration will ever re-import them.
+IMPORT_LOGIC_REVISION = 2
 
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see

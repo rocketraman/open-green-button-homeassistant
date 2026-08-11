@@ -14,6 +14,7 @@ the id format — never construct one ad-hoc elsewhere.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -149,7 +150,51 @@ def response_has_cumulative_series(response: UsageResponse) -> bool:
     [coordinator.GreenButtonCoordinator._async_migrate_import].
     """
     return any(
-        not _is_interval_consumption_series(s) for up in response.usage_points for s in up.series
+        not _is_interval_consumption_series(up, s)
+        for up in response.usage_points
+        for s in up.series
+    )
+
+
+def response_has_multi_hour_readings(response: UsageResponse) -> bool:
+    """True when [response] carries an importable reading that spans more than one hour.
+
+    The revision-2 signal (see [const.IMPORT_LOGIC_REVISION]). Such a reading used to be
+    written entirely into the hour it started in — a whole billing period's consumption as one
+    midnight spike — where it is now spread across the hours it covers ([_hours_spanned]).
+
+    Scoped to series that actually import, which is what keeps Milton Hydro off this path: its
+    daily ``BULK_QUANTITY`` register spans 24 hours, but it's excluded in favour of the hourly
+    ``DELTA_DATA`` sibling, so its stored rows never came from a multi-hour reading and it needs
+    no second rebuild. Hourly feeds (Burlington, Elexicon) are stamped forward untouched.
+    """
+    return any(
+        len(_hours_spanned(r.start, r.duration_seconds)) > 1
+        for up in response.usage_points
+        for s in up.series
+        if _is_interval_consumption_series(up, s)
+        for r in s.readings
+    )
+
+
+# Recognition predicates keyed by the import-logic revision that fixed the bug. An entry stamped
+# at revision N is tested against every predicate for a revision > N — so a user who skipped a
+# release still gets each repair they're owed, in one rebuild rather than one per revision.
+_IMPORT_MIGRATION_CHECKS: dict[int, Callable[[UsageResponse], bool]] = {
+    1: response_has_cumulative_series,
+    2: response_has_multi_hour_readings,
+}
+
+
+def response_needs_import_migration(response: UsageResponse, stamped_revision: int) -> bool:
+    """True when [response]'s shape shows this entry's rows were produced by a since-fixed bug.
+
+    [stamped_revision] is the entry's ``CONF_IMPORT_LOGIC_REVISION`` (0 when never stamped).
+    """
+    return any(
+        check(response)
+        for revision, check in _IMPORT_MIGRATION_CHECKS.items()
+        if revision > stamped_revision
     )
 
 
@@ -189,7 +234,7 @@ async def import_usage_statistics(
     for up in response.usage_points:
         imported_any = False
         for series in up.series:
-            if not _is_interval_consumption_series(series):
+            if not _is_interval_consumption_series(up, series):
                 _warn_once(
                     f"{entry.entry_id}:{up.usage_point_id}:{series.meter_reading_id}:cumulative",
                     "Skipping meter reading %s on usage point %s: accumulation behaviour %s is a "
@@ -201,19 +246,25 @@ async def import_usage_statistics(
                     series.reading_type.accumulation_behaviour,
                 )
                 continue
-            imported_any = True
-            await _import_series(hass, entry, up, series, utility_display_name, fresh=fresh)
+            # Call first, then OR — `or` short-circuits, and every series must be imported.
+            imported = await _import_series(
+                hass, entry, up, series, utility_display_name, fresh=fresh
+            )
+            imported_any = imported or imported_any
         if up.series and not imported_any:
-            # Every series was a cumulative register. Deriving deltas from a register is
-            # possible in principle but isn't implemented, so this usage point contributes no
-            # energy at all — loud, because the symptom is an empty Energy dashboard.
+            # Nothing on this usage point could be represented. Since a register is now only
+            # excluded when a same-flow sibling supersedes it (see
+            # [_is_interval_consumption_series]), reaching here means every series carried a
+            # unit we have no HA mapping for. The usage point contributes no energy at all —
+            # loud, because the symptom is an empty Energy dashboard.
             _LOGGER.error(
-                "Usage point %s has no per-interval consumption series — every one of its %d "
-                "series is a cumulative meter register (%s). No energy statistics will be "
-                "written for it; please report this feed at %s",
+                "Usage point %s has no importable consumption series — all %d were skipped "
+                "(accumulation behaviours: %s; units: %s). No energy statistics will be written "
+                "for it; please report this feed at %s",
                 up.usage_point_id,
                 len(up.series),
                 ", ".join(sorted({s.reading_type.accumulation_behaviour for s in up.series})),
+                ", ".join(sorted({s.reading_type.unit_of_measure for s in up.series})),
                 "https://github.com/rocketraman/open-green-button-homeassistant/issues",
             )
 
@@ -304,6 +355,11 @@ _CUMULATIVE_ACCUMULATION = frozenset(
     }
 )
 
+# Seconds of hourly coverage we forgive before calling an hour partial. ESPI durations use an
+# inclusive end (a 29-day billing period is 2505599s), so the final hour of any spread reading is
+# one second short of full. See [_drop_incomplete_trailing_hour].
+_HOUR_COVERAGE_SLACK = 1
+
 # Keys already logged at WARNING by [_warn_once], so a permanent condition doesn't repeat the
 # warning on every poll. Module-level (not per-entry) and never pruned: it holds a handful of
 # short strings for the lifetime of the process, and a full HA restart re-arms every warning.
@@ -325,7 +381,7 @@ def _warn_once(key: str, msg: str, *args: object) -> None:
     _LOGGER.warning(msg, *args)
 
 
-def _is_interval_consumption_series(series: MeterReadingSeries) -> bool:
+def _is_interval_consumption_series(up: UsagePoint, series: MeterReadingSeries) -> bool:
     """True when a series' readings are per-interval quantities we can sum into a statistic.
 
     False for cumulative meter registers. Milton Hydro publishes an hourly ``DELTA_DATA``
@@ -333,8 +389,33 @@ def _is_interval_consumption_series(series: MeterReadingSeries) -> bool:
     both FORWARD — so both map to one [statistic_id_for_series] and the register's
     meter-lifetime total was being added to the hourly running sum, reporting an enormous
     false spike (issue #6).
+
+    The accumulation behaviour ALONE can't make that call, because utilities mislabel it.
+    Consumers Energy (via UtilityAPI) publishes one reading per billing period — genuine
+    per-period consumption, values that rise and fall month to month (446–1246 kWh) — tagged
+    ``BULK_QUANTITY``. Excluding on the name alone dropped 100% of that feed, left an empty
+    Energy dashboard, and (via [response_has_cumulative_series]) triggered a repair rebuild
+    that purged the account's existing rows and re-imported nothing.
+
+    So a cumulative-named series is only excluded when this UsagePoint also carries a
+    non-cumulative series of the *same flow direction* — which is precisely the statistic_id
+    collision that motivated #6, and a strictly better source to resolve it in favour of. With
+    no such sibling the series is everything the utility publishes, and importing it is the
+    only way the account gets any energy at all. Flow direction matters: a FORWARD register
+    alongside a REVERSE delta series is not a collision, and excluding it would drop the only
+    consumption data there is.
+
+    Testing the values for monotonicity instead does NOT work here: each Consumers Energy
+    MeterReading holds exactly one reading, and a one-element series is trivially
+    non-decreasing, so every one of them would still read as a register.
     """
-    return series.reading_type.accumulation_behaviour not in _CUMULATIVE_ACCUMULATION
+    if series.reading_type.accumulation_behaviour not in _CUMULATIVE_ACCUMULATION:
+        return True
+    return not any(
+        other.reading_type.accumulation_behaviour not in _CUMULATIVE_ACCUMULATION
+        and other.reading_type.flow_direction == series.reading_type.flow_direction
+        for other in up.series
+    )
 
 
 def _forward_interval_series(up: UsagePoint) -> list[MeterReadingSeries]:
@@ -347,7 +428,7 @@ def _forward_interval_series(up: UsagePoint) -> list[MeterReadingSeries]:
     return [
         s
         for s in up.series
-        if s.reading_type.flow_direction == "FORWARD" and _is_interval_consumption_series(s)
+        if s.reading_type.flow_direction == "FORWARD" and _is_interval_consumption_series(up, s)
     ]
 
 
@@ -377,9 +458,16 @@ async def _import_series(
     utility_display_name: str,
     *,
     fresh: bool = False,
-) -> None:
+) -> bool:
+    """Import one series. Returns False only when its unit has no HA mapping.
+
+    The return value feeds the "this usage point imported nothing" check in
+    [import_usage_statistics], so it reports *representability*, not whether rows were
+    actually written: an empty or fully stale-filtered series is a normal quiet poll, not a
+    misconfigured feed, and must not trip that error.
+    """
     if not series.readings:
-        return  # Nothing to write; keeps logs quiet on the test-lab empty-account case.
+        return True  # Nothing to write; keeps logs quiet on the test-lab empty-account case.
 
     statistic_id = statistic_id_for_series(
         entry.entry_id,
@@ -396,7 +484,7 @@ async def _import_series(
             series.reading_type.commodity,
             series.reading_type.unit_of_measure,
         )
-        return
+        return False
 
     metadata: StatisticMetaData = {
         "has_mean": False,
@@ -436,7 +524,7 @@ async def _import_series(
         stats.append(StatisticData(start=hour, state=running, sum=running))
 
     if not stats:
-        return
+        return True
 
     _LOGGER.info(
         "Importing %d statistic rows for %s (resume_from_sum=%.3f)",
@@ -445,6 +533,7 @@ async def _import_series(
         resume_from_sum,
     )
     async_add_external_statistics(hass, metadata, stats)
+    return True
 
 
 def _hourly_totals(series: MeterReadingSeries) -> tuple[dict[datetime, float], dict[datetime, int]]:
@@ -462,14 +551,55 @@ def _hourly_totals(series: MeterReadingSeries) -> tuple[dict[datetime, float], d
 
     Summing per hour here makes each hour exactly one row, so the row we write and the cursor
     we later resume from describe the same unit of time.
+
+    A reading LONGER than an hour is spread across the hours it spans — see [_hours_spanned].
     """
     by_hour: dict[datetime, float] = {}
     covered_seconds: dict[datetime, int] = {}
     for reading in series.readings:
-        hour = _align_to_hour(reading.start)
-        by_hour[hour] = by_hour.get(hour, 0.0) + _to_ha_units(reading.value, series.reading_type)
-        covered_seconds[hour] = covered_seconds.get(hour, 0) + reading.duration_seconds
+        value = _to_ha_units(reading.value, series.reading_type)
+        for hour, overlap, fraction in _hours_spanned(reading.start, reading.duration_seconds):
+            by_hour[hour] = by_hour.get(hour, 0.0) + value * fraction
+            covered_seconds[hour] = covered_seconds.get(hour, 0) + overlap
     return by_hour, covered_seconds
+
+
+def _hours_spanned(start: datetime, duration_seconds: int) -> list[tuple[datetime, int, float]]:
+    """Split ``[start, start+duration)`` into ``(hour_start, seconds_in_hour, fraction)`` triples.
+
+    ``fraction`` is that hour's share of the reading and sums to 1.0 across the result, so
+    callers multiply rather than divide — a reading with a degenerate duration can't produce a
+    division by zero at a call site.
+
+    Sub-hourly and exactly-hourly readings yield a single pair, so the common path is
+    unchanged. The point is readings that span MANY hours: a billing-only utility publishes
+    one reading per billing period, and folding that to ``_align_to_hour(start)`` alone wrote
+    a whole month's consumption into the period's first hour — an ~900 kWh spike at midnight
+    on day one and nothing for the remaining ~700 hours. Consumers Energy (via UtilityAPI)
+    publishes exactly this: 23 months of history arrived as 23 statistic rows.
+
+    Distributing evenly across the period does not invent detail the feed doesn't have — the
+    hourly shape is unknowable from a monthly total — but it is the only representation HA's
+    hourly statistics can carry, it makes daily/monthly dashboard rollups correct, and it
+    matches what [_import_cost_summaries] already does with a monthly bill.
+
+    Degenerate durations (0 or negative — a malformed feed) fall back to the single aligned
+    hour so the reading is still imported rather than silently vanishing.
+    """
+    if duration_seconds <= 0:
+        return [(_align_to_hour(start), 0, 1.0)]
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=UTC)
+    end = start + timedelta(seconds=duration_seconds)
+    spans: list[tuple[datetime, int, float]] = []
+    hour = _align_to_hour(start)
+    while hour < end:
+        hour_end = hour + timedelta(hours=1)
+        overlap = int((min(end, hour_end) - max(start, hour)).total_seconds())
+        if overlap > 0:
+            spans.append((hour, overlap, overlap / duration_seconds))
+        hour = hour_end
+    return spans
 
 
 def _drop_incomplete_trailing_hour(
@@ -490,12 +620,18 @@ def _drop_incomplete_trailing_hour(
     and is imported as-is. An hour with no duration information at all (0s covered) is left
     alone rather than deferred forever. Hourly feeds — every utility in scope today — cover a
     full 3600s per hour and never trip this.
+
+    [_HOUR_COVERAGE_SLACK] accounts for ESPI's inclusive-end durations: a 29-day billing period
+    is published as 2505599s, not 2505600, so the last hour of a spread reading lands exactly
+    one second short. Without the slack that hour is deferred on every closed billing period —
+    and never imported, because a closed period is never re-published — quietly losing ~0.14%
+    of each month and leaving the summed hours short of the bill the cost pass divides by.
     """
     if not by_hour:
         return
     last_hour = max(by_hour)
     covered = covered_seconds.get(last_hour, 0)
-    if 0 < covered < 3600:
+    if 0 < covered < 3600 - _HOUR_COVERAGE_SLACK:
         _LOGGER.debug(
             "Deferring partial hour %s for %s (%ds of 3600 covered) until the feed completes it",
             last_hour.isoformat(),
@@ -768,8 +904,12 @@ async def _import_cost_from_readings(
         for reading in series.readings:
             if reading.cost is None:
                 continue
-            hour = _align_to_hour(reading.start)
-            cost_by_hour[hour] = cost_by_hour.get(hour, 0.0) + reading.cost
+            # Spread across the reading's span for the same reason usage is — see
+            # [_hours_spanned]. A billing-only feed carries the whole period's cost on one
+            # reading, and pinning it to the first hour puts a month's bill in a single hour
+            # of the cost statistic while the usage it pairs with is spread across the period.
+            for hour, _overlap, fraction in _hours_spanned(reading.start, reading.duration_seconds):
+                cost_by_hour[hour] = cost_by_hour.get(hour, 0.0) + reading.cost * fraction
     if not cost_by_hour:
         return
 
@@ -911,8 +1051,12 @@ def _ha_unit_class_for(reading_type: NormalizedReadingType) -> str | None:
 
 
 def _to_ha_units(value: float, reading_type: NormalizedReadingType) -> float:
-    """Apply the unit conversion implied by [_ha_unit_for]. The server already applied the
-    ESPI ``powerOfTenMultiplier`` on its end, so ``value`` is in the base unit."""
+    """Apply the unit conversion implied by [_ha_unit_for].
+
+    ``value`` already arrives in the ReadingType's base unit (Wh, m³) — [espi._assemble] scales
+    each reading by the ESPI ``powerOfTenMultiplier`` as it builds the UsageReading, so this
+    must not apply it a second time.
+    """
     if reading_type.unit_of_measure == "WATT_HOURS":
         return value / 1000.0
     return value
