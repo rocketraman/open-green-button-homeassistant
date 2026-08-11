@@ -19,17 +19,22 @@ import voluptuous as vol
 from aiohttp import ClientError
 from homeassistant.config_entries import (
     SOURCE_REAUTH,
+    ConfigEntry,
     ConfigFlow,
     ConfigFlowResult,
+    OptionsFlowWithReload,
 )
+from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
+    BooleanSelector,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
     TextSelector,
     TextSelectorConfig,
     TextSelectorType,
+    TimeSelector,
 )
 
 from .api import (
@@ -42,6 +47,8 @@ from .api import (
 from .const import (
     CONF_API_VERSION,
     CONF_CLAIM_CODE,
+    CONF_DAILY_POLL_TIME,
+    CONF_DAILY_POLL_TIME_ENABLED,
     CONF_ENCRYPTED_REFRESH_BLOB,
     CONF_INITIAL_HISTORY_SECONDS,
     CONF_POLL_INTERVAL_SECONDS,
@@ -51,6 +58,7 @@ from .const import (
     CONF_SUBSCRIPTION_URI,
     CONF_UTILITY_ID,
     CONF_UTILITY_NAME,
+    DEFAULT_DAILY_POLL_TIME,
     DEFAULT_SERVER_BASE_URL,
     DOMAIN,
 )
@@ -70,6 +78,12 @@ class GreenButtonConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Open Green Button."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> GreenButtonOptionsFlow:
+        """Expose the polling-schedule options flow (Configure on the entry card)."""
+        return GreenButtonOptionsFlow()
 
     def __init__(self) -> None:
         """Initialise transient flow state."""
@@ -255,6 +269,34 @@ class GreenButtonConfigFlow(ConfigFlow, domain=DOMAIN):
         if entry is None:
             raise RuntimeError(f"entry {entry_id} disappeared during reauth")
         return entry
+
+
+class GreenButtonOptionsFlow(OptionsFlowWithReload):
+    """Polling-schedule preferences for one entry.
+
+    Subclasses OptionsFlowWithReload so saving reloads the entry — that's what re-arms the
+    poll timer with the new schedule. It reloads on *save* only, which is why the integration
+    can still avoid the blanket update listener described in [__init__.async_setup_entry].
+    """
+
+    async def async_step_init(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Show and save the polling options."""
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_DAILY_POLL_TIME_ENABLED, default=False): BooleanSelector(),
+                vol.Required(CONF_DAILY_POLL_TIME, default=DEFAULT_DAILY_POLL_TIME): TimeSelector(),
+            }
+        )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=self.add_suggested_values_to_schema(schema, self.config_entry.options),
+        )
 
 
 def _unique_id_for(claim: ClaimResponse) -> str:

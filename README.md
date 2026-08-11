@@ -51,7 +51,15 @@ data:
   config_entry_id: <your entry>   # optional — omit to rebuild every configured account
 ```
 
-It deletes that account's imported energy and cost statistics, then re-downloads and recomputes the full history from scratch. Because it pulls the entire initial-history window, it puts the same load on your utility as a fresh setup — run it when you need it, not on a schedule. If the re-fetch fails partway (network/utility hiccup), the statistics simply repopulate on the next successful 6-hour poll or the next rebuild.
+It deletes that account's imported energy and cost statistics, then re-downloads and recomputes the full history from scratch. Because it pulls the entire initial-history window, it puts the same load on your utility as a fresh setup — run it when you need it, not on a schedule. If the re-fetch fails partway (network/utility hiccup), the statistics simply repopulate on the next successful poll or the next rebuild.
+
+### Polling schedule
+
+How often each utility may be polled is decided by that utility and passed to the integration by the proxy server — you can't make it poll more often. Most utilities publish once a day.
+
+When the cadence works out to exactly once a day, you can choose *when* that poll runs, under **Settings → Devices & services → Open Green Button → Configure**. Enable **Poll daily at a specific local time** and pick a time. It uses Home Assistant's timezone and follows daylight-saving changes. Utilities on a shorter or multi-day cadence ignore the setting and keep their own interval.
+
+If Home Assistant is down when a poll was due — either the interval elapsed or the daily time went by — the poll runs when it next starts. Restarting inside a window that has already been polled doesn't re-fetch: that data is already in the recorder, so the restart just waits for the next scheduled poll.
 
 ## Supported utilities
 
@@ -87,7 +95,7 @@ The venv at `.venv/` is auto-activated when you `cd` into the repo.
 **Working today**
 
 - OAuth authorization against the proxy server, with refresh-token rotation handled automatically
-- Polls the proxy every 6 hours and writes hourly consumption into the Energy dashboard's long-term statistics via [`async_add_external_statistics`](https://developers.home-assistant.io/docs/core/entity/sensor#statistics-imported-from-external-sources)
+- Polls the proxy at the utility's permitted cadence, optionally anchored to a local time of day, and writes hourly consumption into the Energy dashboard's long-term statistics via [`async_add_external_statistics`](https://developers.home-assistant.io/docs/core/entity/sensor#statistics-imported-from-external-sources)
 - Reauth flow surfaces as an HA notification when the utility revokes our refresh token
 - Imports per-billing-period cost from ESPI `UsageSummary` blocks into the Energy dashboard's Cost column, with Ontario time-of-use distribution
 

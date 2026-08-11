@@ -19,18 +19,25 @@ the same utility (sandbox / test account beside a real account, or multi-meter h
 from __future__ import annotations
 
 import logging
+from datetime import datetime, time, timedelta
 from typing import TYPE_CHECKING
 
 import voluptuous as vol
+from homeassistant.core import CoreState
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
+from homeassistant.util import dt as dt_util
 
 from .api import OpenGbApi
 from .const import (
     ATTR_CONFIG_ENTRY_ID,
+    CONF_DAILY_POLL_TIME,
+    CONF_DAILY_POLL_TIME_ENABLED,
+    CONF_LAST_FETCHED_AT,
     CONF_SERVER_BASE_URL,
+    DAILY_CADENCE,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_SERVER_BASE_URL,
     DOMAIN,
@@ -49,12 +56,67 @@ _REBUILD_STATISTICS_SCHEMA = vol.Schema({vol.Optional(ATTR_CONFIG_ENTRY_ID): cv.
 _LOGGER = logging.getLogger(__name__)
 
 
+def _configured_daily_poll_time(entry: ConfigEntry, poll_interval: timedelta) -> time | None:
+    """The user's local poll time, if one applies to this entry's cadence.
+
+    The server-supplied cadence stays authoritative: a wall-clock time can only change the
+    *phase* of an already-daily schedule, never turn a six-hour or multi-day cadence into a
+    daily one. Anything unparseable falls back to interval scheduling with a warning rather
+    than failing setup.
+    """
+    if poll_interval != DAILY_CADENCE or not entry.options.get(CONF_DAILY_POLL_TIME_ENABLED):
+        return None
+
+    raw = entry.options.get(CONF_DAILY_POLL_TIME)
+    parsed = dt_util.parse_time(raw) if isinstance(raw, str) else None
+    if parsed is None:
+        _LOGGER.warning(
+            "Ignoring invalid daily poll time for entry %s (%r); falling back to every %s",
+            entry.entry_id,
+            raw,
+            poll_interval,
+        )
+    return parsed
+
+
+def _previous_daily_occurrence(now: datetime, at: time) -> datetime:
+    """The most recent moment the local wall-clock time ``at`` went past, as UTC.
+
+    Built from a naive local datetime so it follows HA's timezone through DST rather than
+    doing arithmetic on a fixed offset.
+    """
+    local_today = dt_util.as_local(now).date()
+    todays = dt_util.as_utc(datetime.combine(local_today, at))
+    if todays <= now:
+        return todays
+    return dt_util.as_utc(datetime.combine(local_today - timedelta(days=1), at))
+
+
+def _poll_is_due(entry: ConfigEntry, poll_interval: timedelta, daily_at: time | None) -> bool:
+    """Whether the schedule says a fetch should already have happened.
+
+    Only consulted while HA is starting, to decide whether the setup-time fetch is doing real
+    work. An entry that has never polled, one whose interval has elapsed, and one that was
+    down at its wall-clock time are all due; an entry that polled within its own cadence is
+    not, and its data is already in the recorder.
+    """
+    raw = entry.data.get(CONF_LAST_FETCHED_AT)
+    last_fetched = dt_util.parse_datetime(raw) if isinstance(raw, str) else None
+    if last_fetched is None:
+        return True
+
+    now = dt_util.utcnow()
+    if daily_at is None:
+        return now - last_fetched >= poll_interval
+    return last_fetched < _previous_daily_occurrence(now, daily_at)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up an Open Green Button config entry.
 
-    Creates a coordinator, kicks off a first refresh (which will trigger reauth if the
-    persisted refresh token has been revoked while HA was down), and stashes the coordinator
-    in ``hass.data`` for diagnostics.
+    Creates a coordinator, fetches when the schedule says a fetch is owed (which will trigger
+    reauth if the persisted refresh token has been revoked while HA was down), and stashes the
+    coordinator in ``hass.data`` for diagnostics.
     """
     api = OpenGbApi(
         session=async_get_clientsession(hass),
@@ -62,9 +124,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     coordinator = GreenButtonCoordinator(hass, api, entry)
 
+    # The server's per-utility cadence, not a fixed daily tick — see the poll timer below.
+    poll_interval = coordinator.update_interval or DEFAULT_SCAN_INTERVAL
+    daily_poll_time = _configured_daily_poll_time(entry, poll_interval)
+
     # First refresh raises ConfigEntryAuthFailed → HA opens a reauth notification. Any other
     # failure becomes ConfigEntryNotReady → HA retries with backoff.
-    await coordinator.async_config_entry_first_refresh()
+    #
+    # Skipped only on an HA *restart* that lands inside the current polling window: the usage
+    # for that window is already in the recorder, so the fetch would ask the utility to resend
+    # what we just read, on the startup critical path. A first install and a manual reload run
+    # with `hass` already running and always fetch; so does a restart after a poll was missed —
+    # including one missed because HA was down at the daily wall-clock time. That keeps this
+    # the place a token revoked while HA was down still surfaces, and keeps the coordinator's
+    # import-logic repair (CONF_IMPORT_LOGIC_REVISION) running at startup.
+    if hass.state is CoreState.running or _poll_is_due(entry, poll_interval, daily_poll_time):
+        await coordinator.async_config_entry_first_refresh()
+    else:
+        _LOGGER.info(
+            "Entry %s polled at %s, within its %s cadence — skipping the startup fetch and "
+            "waiting for the next scheduled poll",
+            entry.entry_id,
+            entry.data.get(CONF_LAST_FETCHED_AT),
+            f"daily {daily_poll_time.isoformat()} local" if daily_poll_time else poll_interval,
+        )
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
@@ -73,27 +156,39 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # entry's `pref_disable_polling` is off (update_coordinator._schedule_refresh). Relying on
     # that gated scheduler is fragile for a poll-only integration — a stray "disable polling"
     # system-option silently stops all data updates. So we drive the periodic refresh
-    # ourselves with an unconditional time interval that HA can't turn off. The first fetch
-    # already ran above via async_config_entry_first_refresh; this covers every fetch after.
+    # ourselves with a schedule HA can't turn off. Any fetch owed at setup already ran above;
+    # this covers every fetch after.
     async def _async_poll(now) -> None:
         _LOGGER.debug("Periodic poll firing for entry %s (scheduled tick %s)", entry.entry_id, now)
         await coordinator.async_refresh()
 
-    entry.async_on_unload(async_track_time_interval(hass, _async_poll, DEFAULT_SCAN_INTERVAL))
+    if daily_poll_time is not None:
+        entry.async_on_unload(
+            async_track_time_change(
+                hass,
+                _async_poll,
+                hour=daily_poll_time.hour,
+                minute=daily_poll_time.minute,
+                second=daily_poll_time.second,
+            )
+        )
+        schedule = f"daily at {daily_poll_time.isoformat()} local time"
+    else:
+        entry.async_on_unload(async_track_time_interval(hass, _async_poll, poll_interval))
+        schedule = f"every {poll_interval}"
     # Emitted once, immediately, on every successful setup. If you do NOT see this line in the
     # log right after an HA (full) restart, the running code is stale — the deployed files or the
     # loaded module predate the timer. A config-entry *reload* is not enough; Python caches the
     # module, so only a full HA restart re-imports this file.
-    _LOGGER.info(
-        "Armed periodic poll for entry %s: every %s", entry.entry_id, DEFAULT_SCAN_INTERVAL
-    )
+    _LOGGER.info("Armed periodic poll for entry %s: %s", entry.entry_id, schedule)
 
     # NOTE: deliberately NO `add_update_listener(...reload...)` here. The coordinator writes
     # bookkeeping (CONF_LAST_FETCHED_AT, rotated credentials) into entry.data on every poll;
     # a blanket reload-on-update listener would tear the entry down and re-set it up on each
     # of those writes. Reauth reloads itself via the config flow's
-    # `async_update_reload_and_abort`, and there is no options flow, so nothing else needs a
-    # reload on data change.
+    # `async_update_reload_and_abort`, and the polling options flow subclasses
+    # OptionsFlowWithReload, which reloads only when the user saves the form — so nothing
+    # here needs a reload on data change.
     _async_register_services(hass)
     _LOGGER.info(
         "Set up Open Green Button entry %s for utility %s",

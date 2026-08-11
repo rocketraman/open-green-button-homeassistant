@@ -39,6 +39,19 @@ PUBLISHED_MAX_LOOKAHEAD = timedelta(days=1)
 # on a multi-hour-to-multi-day lag, so a daily poll captures everything without over-polling.
 DEFAULT_SCAN_INTERVAL = timedelta(days=1)
 
+# A utility whose permitted cadence is exactly this may be anchored to a local wall-clock time
+# instead of drifting with whenever HA last started. Named separately from DEFAULT_SCAN_INTERVAL
+# because the two mean different things — this one is "a cadence a clock time can express".
+DAILY_CADENCE = timedelta(days=1)
+
+# Optional per-entry polling options (options flow, not entry.data — the user owns these, the
+# server owns the cadence). Disabled by default so existing entries keep polling on an interval
+# measured from setup. Shorter or multi-day utility cadences ignore the option entirely: it only
+# changes *when* an already-daily poll runs, never how often any poll runs.
+CONF_DAILY_POLL_TIME_ENABLED = "daily_poll_time_enabled"
+CONF_DAILY_POLL_TIME = "daily_poll_time"
+DEFAULT_DAILY_POLL_TIME = "06:00:00"
+
 # The hosted proxy server. May be overridden per-config-entry for self-hosters via the
 # server_base_url in entry.data.
 DEFAULT_SERVER_BASE_URL = "https://api.opengreenbutton.org"

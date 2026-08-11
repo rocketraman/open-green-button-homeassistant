@@ -36,6 +36,22 @@
       "reauth_successful": "Re-authorization complete."
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Polling schedule",
+        "description": "Your utility tells the Open Green Button server how often it may be polled, and that cadence is always respected. When it works out to once a day, you can choose which time of day that poll runs.",
+        "data": {
+          "daily_poll_time_enabled": "Poll daily at a specific local time",
+          "daily_poll_time": "Daily polling time"
+        },
+        "data_description": {
+          "daily_poll_time_enabled": "Turn this off to poll once every 24 hours counted from when Home Assistant last started. Utilities that allow more or less frequent polling ignore this setting.",
+          "daily_poll_time": "Uses Home Assistant's local timezone and follows daylight-saving changes. If Home Assistant is down at this time, the poll runs when it next starts."
+        }
+      }
+    }
+  },
   "issues": {
     "background_load_unsupported": {
       "title": "{utility} is sending a large background data load we can't import yet",
