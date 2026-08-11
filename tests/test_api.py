@@ -268,3 +268,29 @@ async def test_fetch_usage_translates_202_to_data_pending_exception(
 
     with pytest.raises(OpenGbDataPendingError):
         await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
+
+
+async def test_fetch_usage_202_surfaces_the_proxys_message(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """The proxy's `message` (the custodian's own 202) reaches the raised exception.
+
+    That message carries the resource server's status, headers, and body — Location names where
+    the prepared batch will live, Retry-After says when. It cannot be reproduced on demand (it
+    needs a live authorization at a custodian that defers), so the affected user's HA log is the
+    only place to collect it from; dropping it here would strand the investigation.
+    """
+    aioclient_mock.post(
+        PROXY_USAGE_URL,
+        status=202,
+        json={
+            "error": "utility_data_pending",
+            "message": "response-headers: [Location: https://dc.example/Batch/Bulk/000001]",
+        },
+    )
+
+    with pytest.raises(OpenGbDataPendingError) as excinfo:
+        await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
+
+    assert "https://dc.example/Batch/Bulk/000001" in str(excinfo.value)

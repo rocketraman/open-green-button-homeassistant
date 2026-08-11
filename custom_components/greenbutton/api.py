@@ -340,11 +340,15 @@ class OpenGbAuthExpiredError(OpenGbApiError):
 class OpenGbDataPendingError(OpenGbApiError):
     """The utility is preparing the data asynchronously (ESPI async batch — HTTP 202).
 
-    The proxy surfaces this as ``utility_data_pending`` (HTTP 202) when the utility answers
-    the batch request with "data is being collected, available later" — which only happens
-    for very large datasets. We don't implement the Notification/BatchList retrieval flow
-    yet, so the coordinator maps this to a repair issue (with a link to the tracking GitHub
-    issue) instead of treating it as a transient ``UpdateFailed``.
+    The proxy surfaces this as ``utility_data_pending`` (HTTP 202) when the utility answers the
+    batch request with "data is being collected, available later". NOT a size threshold, despite
+    what this docstring used to claim: Alectra (Savage Data) answers this way for a two-month
+    window as readily as a two-year one — for some custodians it is simply how the endpoint works.
+
+    Recoverable, and usually within minutes. The coordinator freezes the request window so each
+    re-attempt can collect the batch the utility prepared (see ``CONF_PENDING_PUBLISHED_MIN``),
+    re-attempts on a short timer, and surfaces a repair issue that only escalates to an error if
+    the data never arrives.
     """
 
 
@@ -480,15 +484,24 @@ class OpenGbApi:
                 )
             if resp.status == 202:
                 # The proxy passes the utility's 202 Accepted through as `utility_data_pending`:
-                # the dataset is large enough that the utility is assembling it out-of-band
-                # (ESPI async batch). We don't implement the Notification/BatchList retrieval
-                # flow yet, so raise a distinct error the coordinator turns into a repair issue.
+                # the utility is assembling the dataset out-of-band (ESPI async batch). Retries
+                # replay the same window rather than recomputing it — see
+                # CONF_PENDING_PUBLISHED_MIN — because a re-asked question is the only thing the
+                # custodian can answer with the batch it prepared.
                 text = await resp.text()
                 error_code = _safe_json_field(text, "error")
+                # Carry the proxy's `message` through verbatim, exactly as the 401 branch above
+                # does. It holds the custodian's own 202 response — status, headers (Location /
+                # Content-Location name where the prepared batch will live, Retry-After says
+                # when), and body. This is not reproducible on demand: it needs a live
+                # authorization at a custodian that defers, so the affected user's HA log is the
+                # only place it can be collected from. Dropping it leaves us guessing.
+                detail = _safe_json_field(text, "message")
+                reason = f" ({detail})" if detail else ""
                 raise OpenGbDataPendingError(
                     "Utility is preparing data asynchronously (HTTP 202, "
                     f"{error_code or 'utility_data_pending'}); background data loads are not "
-                    "yet supported",
+                    f"yet supported{reason}",
                     new_credentials=new_credentials,
                 )
             if resp.status != 200:

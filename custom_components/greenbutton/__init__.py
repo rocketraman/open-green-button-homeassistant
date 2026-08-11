@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 import voluptuous as vol
 from homeassistant.core import CoreState
-from homeassistant.exceptions import ServiceValidationError
+from homeassistant.exceptions import ConfigEntryNotReady, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
@@ -139,7 +139,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # the place a token revoked while HA was down still surfaces, and keeps the coordinator's
     # import-logic repair (CONF_IMPORT_LOGIC_REVISION) running at startup.
     if hass.state is CoreState.running or _poll_is_due(entry, poll_interval, daily_poll_time):
-        await coordinator.async_config_entry_first_refresh()
+        try:
+            await coordinator.async_config_entry_first_refresh()
+        except ConfigEntryNotReady:
+            # A utility preparing a deferred batch (HTTP 202) is NOT a failed setup. The entry is
+            # authorized, its credentials work, and the data is coming — it just isn't here yet,
+            # which for some custodians is the normal first-connection path. Refusing to finish
+            # setup for that would leave the entry showing as broken and, worse, would leave the
+            # poll timer below unarmed and the user's polling options inert, since HA never gets
+            # past this line. The coordinator raises a repair issue and re-attempts on its own
+            # short timer instead. Every other failure still means "can't start" — re-raise so
+            # HA retries with its own backoff.
+            if not coordinator.data_pending:
+                raise
+            _LOGGER.info(
+                "Entry %s: utility is still preparing the data (HTTP 202). Completing setup "
+                "anyway — the coordinator will keep re-attempting until it lands",
+                entry.entry_id,
+            )
     else:
         _LOGGER.info(
             "Entry %s polled at %s, within its %s cadence — skipping the startup fetch and "
@@ -150,6 +167,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+
+    # The coordinator arms its own short timer while a utility is preparing a deferred batch
+    # (see GreenButtonCoordinator._schedule_pending_retry). It re-arms itself across attempts, so
+    # the unsubscribe isn't a fixed handle we can hand to async_on_unload directly — tear it down
+    # through the coordinator instead, or a reload leaves a callback firing at a dead entry.
+    entry.async_on_unload(coordinator.cancel_pending_retry)
 
     # This integration owns no entities, so nothing subscribes to the coordinator. HA's
     # DataUpdateCoordinator only arms its internal poll timer when it has ≥1 listener AND the

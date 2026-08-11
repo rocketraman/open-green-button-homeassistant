@@ -53,9 +53,13 @@
     }
   },
   "issues": {
-    "background_load_unsupported": {
-      "title": "{utility} is sending a large background data load we can't import yet",
-      "description": "{utility} answered the initial data request asynchronously (HTTP 202 — \"the data is being collected and will be available later\"), which only happens for very large datasets. Open Green Button doesn't support this background-delivery flow yet, so importing is paused for this account and the entry will keep failing until it's implemented.\n\nYou're one of the first to hit this. Please use the **Learn more** link below to open the tracking issue on GitHub and add a comment with: your utility/energy provider and region, roughly how much history you were importing, and whether this is a residential or commercial account. With a real example we can implement and verify the fix."
+    "background_load_pending": {
+      "title": "{utility} is preparing your data",
+      "description": "{utility} answered the data request with \"collecting it now, it'll be available later\" (HTTP 202) instead of returning it straight away. That's a normal mode for some utilities — it isn't an error, and it doesn't mean anything is misconfigured.\n\nOpen Green Button is re-checking every few minutes and will import the data as soon as your utility releases it. **No action is needed.** This notice clears itself on the first successful import.\n\nIf it's still here tomorrow, the message will change to say so."
+    },
+    "background_load_stuck": {
+      "title": "{utility} still hasn't delivered the data it promised",
+      "description": "{utility} said it was preparing your data (HTTP 202) more than a day ago, and it still hasn't been delivered. Open Green Button has been re-asking with the same request the whole time, which is what the utility needs in order to hand back the batch it prepared.\n\nThis one we'd like to see. Please use the **Learn more** link below to open the tracking issue on GitHub and add a comment with: your utility/energy provider and region, how much history you were importing, and whether this is a residential or commercial account. Enabling debug logging for the integration first (Settings → Devices & Services → ⋮ → Enable debug logging) captures your utility's own response, which is the part we can't get any other way."
     }
   },
   "services": {

@@ -126,6 +126,50 @@ async def test_setup_polls_on_interval(hass: HomeAssistant) -> None:
         assert fetch.await_count == 2, "periodic poll did not fire on the scan interval"
 
 
+async def test_setup_completes_when_the_utility_is_still_preparing_data(
+    hass: HomeAssistant,
+) -> None:
+    """A 202 must not block setup — and the entry must retry in minutes, not at its cadence.
+
+    Refusing to finish setup would leave the entry showing as broken and, more damagingly, would
+    leave the poll timer unarmed: HA never reaches it. The coordinator's own short retry is what
+    carries a deferred fetch, so assert it actually fires well inside the (daily) poll interval.
+    """
+    from custom_components.greenbutton.api import OpenGbDataPendingError
+    from custom_components.greenbutton.const import PENDING_RETRY_INTERVAL
+
+    entry = _entry()
+    entry.add_to_hass(hass)
+
+    fetch = AsyncMock(side_effect=OpenGbDataPendingError("data pending (202)"))
+    with _stub_network(fetch):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert fetch.await_count == 1
+
+        # Far short of DEFAULT_SCAN_INTERVAL — only the pending-retry timer can fire here.
+        async_fire_time_changed(
+            hass, dt_util.utcnow() + PENDING_RETRY_INTERVAL + timedelta(seconds=30)
+        )
+        await hass.async_block_till_done()
+        assert fetch.await_count == 2, "deferred fetch was not re-attempted on the short timer"
+
+    await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_setup_still_fails_for_errors_that_are_not_a_deferred_fetch(
+    hass: HomeAssistant,
+) -> None:
+    """The 202 escape hatch must not swallow genuine "can't start" failures."""
+    from custom_components.greenbutton.api import OpenGbApiError
+
+    entry = _entry()
+    entry.add_to_hass(hass)
+
+    with _stub_network(AsyncMock(side_effect=OpenGbApiError("proxy exploded"))):
+        assert not await hass.config_entries.async_setup(entry.entry_id)
+
+
 async def test_poll_timer_uses_the_server_supplied_cadence(hass: HomeAssistant) -> None:
     """Regression: the poll timer must honour the utility's cadence, not a fixed daily tick.
 

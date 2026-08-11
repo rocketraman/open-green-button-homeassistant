@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 from homeassistant.core import CoreState
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -47,6 +48,9 @@ from .const import (
     CONF_IMPORT_LOGIC_REVISION,
     CONF_INITIAL_HISTORY_SECONDS,
     CONF_LAST_FETCHED_AT,
+    CONF_PENDING_PUBLISHED_MAX,
+    CONF_PENDING_PUBLISHED_MIN,
+    CONF_PENDING_SINCE,
     CONF_POLL_INTERVAL_SECONDS,
     CONF_PROXY_TOKEN,
     CONF_UTILITY_NAME,
@@ -55,6 +59,8 @@ from .const import (
     IMPORT_LOGIC_REVISION,
     INITIAL_FETCH_LOOKBACK,
     LAST_FETCHED_OVERLAP,
+    PENDING_ESCALATE_AFTER,
+    PENDING_RETRY_INTERVAL,
     PUBLISHED_MAX_LOOKAHEAD,
     SERVICE_REBUILD_STATISTICS,
 )
@@ -67,6 +73,8 @@ from .statistics import (
 from .storage import xml_cache_path
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
 
@@ -157,12 +165,23 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         # Guards [_schedule_deferred_import_migration] against arming the one-time statistics
         # repair twice — two concurrent full-history rebuilds would fight over the same store.
         self._import_migration_armed = False
+        # Unsubscribe for the armed fast retry of a deferred (HTTP 202) fetch, if any.
+        # See [_schedule_pending_retry].
+        self._pending_retry_unsub: Callable[[], None] | None = None
+
+    @property
+    def data_pending(self) -> bool:
+        """True when the utility is preparing a deferred batch we haven't collected yet.
+
+        Read by `async_setup_entry` to distinguish "this entry can't start" from "this entry is
+        fine, its data just isn't ready" — a distinction HA has no built-in vocabulary for.
+        """
+        return CONF_PENDING_PUBLISHED_MIN in self.entry.data
 
     async def _async_update_data(self) -> UsageResponse:
         """Fetch, persist rotated credentials, then write statistics."""
         now = datetime.now(UTC)
-        published_min = self._published_min(now)
-        published_max = now + PUBLISHED_MAX_LOOKAHEAD
+        published_min, published_max = self._fetch_window(now)
 
         _LOGGER.info(
             "Fetching usage for entry %s with published-min=%s published-max=%s",
@@ -260,13 +279,18 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             self._persist_rotated_credentials(err.new_credentials)
             raise ConfigEntryAuthFailed(str(err)) from err
         except OpenGbDataPendingError as err:
-            # The utility is assembling a large dataset out-of-band (ESPI async batch). We
-            # don't implement the Notification/BatchList retrieval flow yet, so raise a repair
-            # issue linking to the tracking GitHub issue and ask the (rare) affected user to
-            # comment — then fail this refresh so the entry shows as failed. Must be caught
-            # BEFORE OpenGbApiError, of which it is a subclass.
+            # The utility is assembling the dataset out-of-band (ESPI async batch). Freeze this
+            # exact window so every retry re-asks the identical question — the custodian prepared
+            # its batch for the URL we sent, and a window recomputed from `now` would enqueue a
+            # new job instead of collecting the finished one (see CONF_PENDING_PUBLISHED_MIN).
+            # Then raise a repair issue and fail this refresh. Must be caught BEFORE
+            # OpenGbApiError, of which it is a subclass.
             self._persist_rotated_credentials(err.new_credentials)
+            self._remember_pending_window(published_min, published_max)
             self._async_create_background_load_issue()
+            # Come back in minutes, not at the utility's daily cadence — the batch usually lands
+            # within one interval. Ordered AFTER the window freeze so the retry replays it.
+            self._schedule_pending_retry()
             raise UpdateFailed(str(err)) from err
         except OpenGbApiError as err:
             # Crucial for one-time refresh tokens (savagedata/OpenIddict): the proxy may have
@@ -279,6 +303,10 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             raise UpdateFailed(f"network error talking to the proxy: {err}") from err
 
         self._persist_rotated_credentials(response.new_credentials)
+        # The deferred batch (if there was one) has landed — stop replaying its window and stand
+        # the fast retry down, so the next poll goes back to asking for whatever is new.
+        self._clear_pending_window()
+        self.cancel_pending_retry()
         return response
 
     def _persist_rotated_credentials(self, new_credentials: NewCredentials | None) -> None:
@@ -610,8 +638,9 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         now = datetime.now(UTC)
         self._force_full_history = True
         try:
-            published_min = self._published_min(now)
-            published_max = now + PUBLISHED_MAX_LOOKAHEAD
+            # `_force_full_history` also overrides any frozen pending window: a rebuild is an
+            # explicit "go get everything again", not a resumption of the deferred fetch.
+            published_min, published_max = self._fetch_window(now)
             _LOGGER.info(
                 "Rebuild for entry %s: re-fetching full history (published-min=%s) before purge",
                 self.entry.entry_id,
@@ -673,26 +702,39 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         return f"background_load_{self.entry.entry_id}"
 
     def _async_create_background_load_issue(self) -> None:
-        """Raise a (non-fixable) repair issue pointing at the background-load tracking issue.
+        """Raise (or update) the repair issue for a utility that's preparing data out of band.
 
-        The issue carries `learn_more_url` so HA renders a "Learn more" link straight to the
-        GitHub issue, and the description asks the user to comment with their utility/details.
-        We don't implement the async batch flow yet, so this is the user-facing surface for it.
+        Severity tracks how long we've been waiting, because the two cases need opposite things
+        from the user. A utility that has just said "collecting it now" is working as designed and
+        the user should do *nothing* — an ERROR there is a false alarm that makes a normal mode
+        look like a broken integration. One that still hasn't delivered a day later is a real
+        problem we want reported.
+
+        Re-creating with the same issue_id updates the existing issue in place, so an entry that
+        crosses PENDING_ESCALATE_AFTER upgrades from one to the other rather than accumulating two.
         """
         from homeassistant.helpers import issue_registry as ir
 
+        stuck = self._pending_elapsed() >= PENDING_ESCALATE_AFTER
         ir.async_create_issue(
             self.hass,
             DOMAIN,
             self._background_load_issue_id,
             is_fixable=False,
-            severity=ir.IssueSeverity.ERROR,
-            translation_key="background_load_unsupported",
+            severity=ir.IssueSeverity.ERROR if stuck else ir.IssueSeverity.WARNING,
+            translation_key="background_load_stuck" if stuck else "background_load_pending",
             translation_placeholders={
                 "utility": self.entry.data.get(CONF_UTILITY_NAME, "your utility"),
             },
             learn_more_url=BACKGROUND_LOAD_ISSUE_URL,
         )
+
+    def _pending_elapsed(self) -> timedelta:
+        """How long the current deferred fetch has been outstanding (zero if it's brand new)."""
+        since = _parse_iso_or_none(self.entry.data.get(CONF_PENDING_SINCE))
+        if since is None:
+            return timedelta(0)
+        return max(timedelta(0), datetime.now(UTC) - since)
 
     def _async_clear_background_load_issue(self) -> None:
         """Delete the background-load repair issue for this entry (no-op if absent)."""
@@ -717,6 +759,103 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             _LOGGER.debug("Persisted %d bytes of raw upstream XML to %s", len(data), path)
 
         return sink
+
+    def _fetch_window(self, now: datetime) -> tuple[datetime, datetime]:
+        """Return the (`published_min`, `published_max`) to send on the next /proxy/usage call.
+
+        Normally derived from `now` — see [_published_min]. The exception is an outstanding
+        asynchronous batch: when a previous fetch came back HTTP 202, the custodian prepared that
+        dataset under the URL it was asked for, and only an identical request can collect it. So
+        the frozen window wins over a freshly-computed one until a fetch succeeds. Freezing BOTH
+        bounds matters — `published_max` is `now`-relative too, so leaving it to drift would keep
+        the request unique even with `published_min` pinned.
+
+        A rebuild (`_force_full_history`) deliberately ignores the freeze: the user asked for
+        everything, not for the resumption of a deferred slice.
+        """
+        if not self._force_full_history:
+            pending = self._pending_window()
+            if pending is not None:
+                _LOGGER.debug(
+                    "Entry %s replaying the window of a deferred (HTTP 202) fetch: %s → %s",
+                    self.entry.entry_id,
+                    pending[0].isoformat(),
+                    pending[1].isoformat(),
+                )
+                return pending
+        return self._published_min(now), now + PUBLISHED_MAX_LOOKAHEAD
+
+    def _pending_window(self) -> tuple[datetime, datetime] | None:
+        """The frozen window of an outstanding 202, or None. Unparseable values are discarded."""
+        parsed_min = _parse_iso_or_none(self.entry.data.get(CONF_PENDING_PUBLISHED_MIN))
+        parsed_max = _parse_iso_or_none(self.entry.data.get(CONF_PENDING_PUBLISHED_MAX))
+        if parsed_min is None or parsed_max is None:
+            return None
+        return parsed_min, parsed_max
+
+    def _remember_pending_window(self, published_min: datetime, published_max: datetime) -> None:
+        """Freeze the window a 202 was returned for, so every retry re-asks identically.
+
+        Also stamps when the wait started, the first time. Both are no-ops once frozen: the stamp
+        must NOT restart on every retry (it's what decides when to stop waiting), and rewriting
+        unchanged values would churn the config entry every few minutes.
+        """
+        if self._pending_window() == (published_min, published_max):
+            return
+        self.hass.config_entries.async_update_entry(
+            self.entry,
+            data={
+                **self.entry.data,
+                CONF_PENDING_PUBLISHED_MIN: published_min.isoformat(),
+                CONF_PENDING_PUBLISHED_MAX: published_max.isoformat(),
+                CONF_PENDING_SINCE: datetime.now(UTC).isoformat(),
+            },
+        )
+
+    def _clear_pending_window(self) -> None:
+        """Drop the frozen window after a successful fetch (no-op when none is set)."""
+        if CONF_PENDING_PUBLISHED_MIN not in self.entry.data:
+            return
+        data = {**self.entry.data}
+        data.pop(CONF_PENDING_PUBLISHED_MIN, None)
+        data.pop(CONF_PENDING_PUBLISHED_MAX, None)
+        data.pop(CONF_PENDING_SINCE, None)
+        self.hass.config_entries.async_update_entry(self.entry, data=data)
+
+    def _schedule_pending_retry(self) -> None:
+        """Re-attempt a deferred fetch soon, rather than at the utility's ordinary cadence.
+
+        The ordinary cadence is the utility's own poll interval — a day, typically — which is the
+        wrong scale for a batch that lands in about a minute. Without this, completing setup on a
+        202 (instead of leaving the entry in ConfigEntryNotReady, whose HA-driven backoff retried
+        every 10 minutes) would trade a bad error state for a 24-hour wait.
+
+        Armed at most once at a time, and only while we're still inside PENDING_ESCALATE_AFTER;
+        past that we stop the fast cadence and let the normal poll timer carry it, so a custodian
+        that never delivers isn't polled every five minutes forever.
+        """
+        if self._pending_retry_unsub is not None:
+            return
+        if self._pending_elapsed() >= PENDING_ESCALATE_AFTER:
+            _LOGGER.debug(
+                "Entry %s has been waiting on a deferred fetch for %s — dropping back to the "
+                "ordinary poll interval",
+                self.entry.entry_id,
+                self._pending_elapsed(),
+            )
+            return
+
+        async def _retry(_now: datetime) -> None:
+            self._pending_retry_unsub = None
+            await self.async_refresh()
+
+        self._pending_retry_unsub = async_call_later(self.hass, PENDING_RETRY_INTERVAL, _retry)
+
+    def cancel_pending_retry(self) -> None:
+        """Cancel any armed deferred-fetch retry. Called on success and on entry unload."""
+        if self._pending_retry_unsub is not None:
+            self._pending_retry_unsub()
+            self._pending_retry_unsub = None
 
     def _published_min(self, now: datetime) -> datetime:
         """Return the `published_min` value to send on the next /proxy/usage call.

@@ -56,12 +56,14 @@ DEFAULT_DAILY_POLL_TIME = "06:00:00"
 # server_base_url in entry.data.
 DEFAULT_SERVER_BASE_URL = "https://api.opengreenbutton.org"
 
-# GitHub issue tracking "background data loads". Some utilities answer the initial request
-# asynchronously (ESPI async batch: HTTP 202 "data is being collected, available later") when
-# the dataset is very large. We don't implement that Notification/BatchList retrieval flow
-# yet, so when the integration hits a 202 it raises a repair issue linking here and asks the
-# affected user to comment with their utility + details — so we can implement and verify the
-# flow against a real dataset rather than speculatively. See coordinator background-load issue.
+# GitHub issue tracking "background data loads": utilities that answer a data request
+# asynchronously (ESPI async batch — HTTP 202 "data is being collected, available later") rather
+# than returning the feed. Rendered as the repair issue's "Learn more" link.
+#
+# Deliberately the general tracking issue rather than any one user's report, since this is what
+# every affected user is pointed at. It should carry the current state of the investigation —
+# notably that a 202 is a custodian's normal mode and not a dataset-size threshold, which is what
+# the Alectra case (issues/10) established.
 BACKGROUND_LOAD_ISSUE_URL = (
     "https://github.com/rocketraman/open-green-button-homeassistant/issues/1"
 )
@@ -101,6 +103,41 @@ CONF_POLL_INTERVAL_SECONDS = "poll_interval_seconds"
 # poll when it appears; the cost importer distributes it over the period's already-recorded usage,
 # so no separate cost cursor is needed.
 CONF_LAST_FETCHED_AT = "last_fetched_at"
+
+# The exact `published-min`/`published-max` (UTC ISO 8601) of a fetch the utility answered with
+# HTTP 202 — "I'm preparing that dataset out of band". Set when a poll hits 202, replayed verbatim
+# by every retry, cleared on the first success.
+#
+# Load-bearing, not bookkeeping. A custodian doing ESPI asynchronous batch delivery prepares the
+# dataset under the URL it was ASKED for, so it can only hand that dataset back to a request that
+# asks the same way. Recomputing the window from `now` on each retry — which is what every other
+# poll does — moves both bounds every time, so each retry enqueues a *fresh* job and gets a fresh
+# 202, forever. That is the Alectra failure in issues/10: hours of 600-second retries, none of
+# which could ever have matched. Freezing the window is what makes retry N+1 able to collect what
+# retry N started. (The proxy additionally canonicalizes the values per-utility — see
+# UtilityQuirks.dateFilterFormat server-side — but that only stabilizes the format, not the
+# instant, so both halves are needed.)
+CONF_PENDING_PUBLISHED_MIN = "pending_published_min"
+CONF_PENDING_PUBLISHED_MAX = "pending_published_max"
+
+# UTC ISO 8601 instant the current deferred (HTTP 202) fetch was first observed. Written with the
+# frozen window and cleared with it. Drives how long we keep re-attempting quickly, and whether
+# the repair issue reads as "in progress" or "stuck" — see PENDING_RETRY_INTERVAL and
+# PENDING_ESCALATE_AFTER.
+CONF_PENDING_SINCE = "pending_since"
+
+# How often to re-attempt while a utility is preparing a deferred batch. The ordinary poll cadence
+# is the utility's (a day, typically), which is the wrong scale entirely here: the one custodian
+# we've observed doing this posted its "ready" notification 60-90 seconds after the 202. Waiting a
+# day to collect something that landed in a minute is what makes an async batch feel broken. Five
+# minutes converges within a couple of attempts without hammering the resource server.
+PENDING_RETRY_INTERVAL = timedelta(minutes=5)
+
+# How long to keep up that fast cadence before concluding the batch is not coming. Past this the
+# entry drops back to its ordinary poll interval and the repair issue escalates from "your utility
+# is preparing this" to "this hasn't arrived, please report it". A day is deliberately generous:
+# a custodian with `SubscriptionFrequency=Daily` may genuinely only run its export once a day.
+PENDING_ESCALATE_AFTER = timedelta(hours=24)
 
 # Revision of the statistics *calculation* logic that produced this entry's stored rows.
 # Statistics are written once as they're fetched, so a fix that changes how usage or cost is

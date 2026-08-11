@@ -38,6 +38,8 @@ from custom_components.greenbutton.const import (
     CONF_ENCRYPTED_REFRESH_BLOB,
     CONF_IMPORT_LOGIC_REVISION,
     CONF_LAST_FETCHED_AT,
+    CONF_PENDING_PUBLISHED_MAX,
+    CONF_PENDING_PUBLISHED_MIN,
     CONF_POLL_INTERVAL_SECONDS,
     CONF_PROXY_TOKEN,
     CONF_UTILITY_ID,
@@ -219,10 +221,11 @@ async def test_rotated_credentials_persisted_on_upstream_error(hass: HomeAssista
 
 
 async def test_data_pending_raises_repair_issue_and_update_failed(hass: HomeAssistant) -> None:
-    """A 202 (async background load) → UpdateFailed + a non-fixable repair issue with the link.
+    """A fresh 202 → UpdateFailed, plus a *warning* repair issue that asks nothing of the user.
 
-    We don't support the ESPI async batch flow yet, so the only user-facing behaviour is a
-    repair issue pointing at the tracking GitHub issue; the entry then fails this refresh.
+    A custodian saying "collecting it now" is working as designed for some utilities — an error
+    there is a false alarm that makes a normal mode look like a broken integration. The refresh
+    still fails (there's no data to import), but the user-facing surface stays calm.
     """
     from homeassistant.helpers import issue_registry as ir
 
@@ -250,9 +253,166 @@ async def test_data_pending_raises_repair_issue_and_update_failed(hass: HomeAssi
     issue = ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}")
     assert issue is not None
     assert issue.is_fixable is False
-    assert issue.severity == ir.IssueSeverity.ERROR
+    assert issue.severity == ir.IssueSeverity.WARNING
+    assert issue.translation_key == "background_load_pending"
     assert issue.learn_more_url == BACKGROUND_LOAD_ISSUE_URL
     assert issue.translation_placeholders == {"utility": "Example Utility"}
+    coordinator.cancel_pending_retry()
+
+
+async def test_data_pending_escalates_to_an_error_after_a_day(hass: HomeAssistant) -> None:
+    """Once the wait passes PENDING_ESCALATE_AFTER the issue becomes an error worth reporting.
+
+    Same issue_id throughout, so the entry upgrades in place rather than showing two notices.
+    """
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.greenbutton.api import OpenGbDataPendingError
+    from custom_components.greenbutton.const import CONF_PENDING_SINCE, PENDING_ESCALATE_AFTER
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OpenGbDataPendingError("data pending (202)"),
+    )
+
+    entry = _entry(hass)
+    stale = datetime.now(UTC) - PENDING_ESCALATE_AFTER - timedelta(minutes=1)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_PENDING_PUBLISHED_MIN: "2024-08-06T20:19:00+00:00",
+            CONF_PENDING_PUBLISHED_MAX: "2026-08-06T20:19:00+00:00",
+            CONF_PENDING_SINCE: stale.isoformat(),
+        },
+    )
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator._async_update_data()
+
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}")
+    assert issue is not None
+    assert issue.severity == ir.IssueSeverity.ERROR
+    assert issue.translation_key == "background_load_stuck"
+    # Past the deadline we stop the five-minute cadence and let the ordinary poll timer carry it,
+    # so a custodian that never delivers isn't polled forever.
+    assert coordinator._pending_retry_unsub is None
+
+
+async def test_data_pending_freezes_the_window_and_retries_replay_it(
+    hass: HomeAssistant,
+) -> None:
+    """After a 202, every retry re-asks with the IDENTICAL window.
+
+    This is the Alectra bug in issues/10. A custodian doing ESPI asynchronous batch delivery
+    prepares the dataset under the URL it was asked for, so only an identical request can collect
+    it. The ordinary window is computed from `now`, so without the freeze each retry moves both
+    bounds, enqueues a fresh job, and gets a fresh 202 — forever.
+    """
+    from custom_components.greenbutton.api import OpenGbDataPendingError
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OpenGbDataPendingError("data pending (202)"),
+    )
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator._async_update_data()
+
+    first = api.fetch_usage.await_args.kwargs
+    assert entry.data[CONF_PENDING_PUBLISHED_MIN] == first["published_min"].isoformat()
+    assert entry.data[CONF_PENDING_PUBLISHED_MAX] == first["published_max"].isoformat()
+
+    # A later retry — wall-clock has moved on, so an unfrozen window would differ.
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator._async_update_data()
+
+    second = api.fetch_usage.await_args.kwargs
+    assert second["published_min"] == first["published_min"]
+    assert second["published_max"] == first["published_max"]
+
+
+async def test_successful_fetch_clears_the_frozen_pending_window(hass: HomeAssistant) -> None:
+    """Once the deferred batch lands, polling returns to a `now`-relative window."""
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_PENDING_PUBLISHED_MIN: "2024-08-06T20:19:00+00:00",
+            CONF_PENDING_PUBLISHED_MAX: "2026-08-06T20:19:00+00:00",
+        },
+    )
+    api = _api_returning(_empty_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    # The frozen window was replayed for the fetch that succeeded...
+    assert api.fetch_usage.await_args.kwargs["published_min"] == datetime(
+        2024, 8, 6, 20, 19, tzinfo=UTC
+    )
+    # ...and is gone afterwards, so the next poll asks for whatever is new.
+    assert CONF_PENDING_PUBLISHED_MIN not in entry.data
+    assert CONF_PENDING_PUBLISHED_MAX not in entry.data
+
+
+async def test_rebuild_ignores_a_frozen_pending_window(hass: HomeAssistant) -> None:
+    """A rebuild means "re-fetch everything", not "resume the deferred slice"."""
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_PENDING_PUBLISHED_MIN: "2024-08-06T20:19:00+00:00",
+            CONF_PENDING_PUBLISHED_MAX: "2026-08-06T20:19:00+00:00",
+        },
+    )
+    api = _api_returning(_empty_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        patch(
+            "custom_components.greenbutton.coordinator.async_clear_statistics_for_entry",
+            new=AsyncMock(return_value=[]),
+        ),
+    ):
+        await coordinator.async_rebuild_statistics(publish=False)
+
+    # The full-history window, not the frozen 2024-08-06 one.
+    assert api.fetch_usage.await_args.kwargs["published_min"] != datetime(
+        2024, 8, 6, 20, 19, tzinfo=UTC
+    )
 
 
 async def test_successful_refresh_clears_background_load_issue(hass: HomeAssistant) -> None:
