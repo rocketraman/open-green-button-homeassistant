@@ -149,8 +149,12 @@ If this integration is useful to you and you want to help keep it maintained and
 
 Suggested $5/month — covers proxy hosting plus time spent adding utilities and keeping up with Home Assistant changes.
 
-## License
+## Legal
 
-[MIT](LICENSE).
+Open Green Button is an open community project. It is not a legal entity, and it is not affiliated with or endorsed by any utility. This integration is free to use and is provided under the [MIT license](LICENSE), without warranty of any kind and with no liability to the authors or copyright holders.
+
+The hosted proxy at `https://api.opengreenbutton.org` is run by volunteers on a best-effort basis, with no uptime or support commitment, under those same terms. If you would rather not depend on it, the [server](https://github.com/rocketraman/open-green-button) is open source and can be [deployed by anyone](https://github.com/rocketraman/open-green-button/blob/master/docs/deployment.md).
+
+Registering as a third party with a utility is a separate matter, covered under [Legal](https://github.com/rocketraman/open-green-button#legal) in the main project README.
 
 "Green Button" is a trademark of the Green Button Alliance; this project uses the name in reference to the open data standard.
