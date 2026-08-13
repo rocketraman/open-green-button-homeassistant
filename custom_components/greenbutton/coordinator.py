@@ -44,6 +44,7 @@ from .const import (
     CONF_CUSTOMER_ACCOUNT_ID,
     CONF_CUSTOMER_ADDRESS,
     CONF_CUSTOMER_LABEL,
+    CONF_EMPTY_SINCE,
     CONF_ENCRYPTED_REFRESH_BLOB,
     CONF_IMPORT_LOGIC_REVISION,
     CONF_INITIAL_HISTORY_SECONDS,
@@ -56,6 +57,7 @@ from .const import (
     CONF_UTILITY_NAME,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    EMPTY_RETRY_INITIAL,
     IMPORT_LOGIC_REVISION,
     INITIAL_FETCH_LOOKBACK,
     LAST_FETCHED_OVERLAP,
@@ -218,10 +220,6 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             utility_display_name=self.entry.data.get(CONF_UTILITY_NAME, "Open Green Button"),
         )
 
-        # A successful fetch means we're no longer blocked on an async background load — clear
-        # any background-load repair issue raised by a previous poll (no-op if none exists).
-        self._async_clear_background_load_issue()
-
         # One-time: give the entry a human-distinguishable title from its customer data. Cheap
         # (guarded to run once) and best-effort — never lets a customer-fetch hiccup fail the poll.
         await self._async_ensure_customer_label()
@@ -229,6 +227,9 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         # Advance the incremental cursor. Done LAST so a partial failure (stats write throwing)
         # doesn't move it and leave a gap.
         self._advance_cursor(response)
+        # Then decide whether this account has anything at all yet — reads the cursor the line
+        # above may have just written, so it must follow it.
+        self._reconcile_data_availability()
         # A full-history rebuild has now landed; revert to incremental polling.
         self._force_full_history = False
 
@@ -445,6 +446,114 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             self.entry,
             data={**self.entry.data, CONF_LAST_FETCHED_AT: cursor_iso},
         )
+
+    def _reconcile_data_availability(self) -> None:
+        """Settle, after a successful fetch, whether this account has produced any data yet.
+
+        The cursor is the proof: [_advance_cursor] writes `CONF_LAST_FETCHED_AT` the first time a
+        response carries readings and never retreats, so its absence here means this entry has
+        never had a single reading — not from this poll, and not from any poll before it.
+
+        Two outcomes:
+
+          - **We have data.** Nothing is outstanding: drop the empty stamp, clear the repair issue
+            a previous poll may have raised (for either a 202 or an empty feed), and stand any fast
+            retry down. This is the steady state and costs one dict lookup.
+          - **We have none.** The fetch itself was clean, so this isn't a failure HA has any
+            vocabulary for — the entry is authorized, its credentials work, and the utility simply
+            answered with nothing. For a brand-new entry that is overwhelmingly "the custodian is
+            still assembling the data" (see CONF_EMPTY_SINCE), and the *only* thing that used to
+            happen next was the ordinary poll, a day later. So stamp when the wait began, tell the
+            user what's going on, and come back on a widening backoff.
+
+        Deliberately scoped to accounts with no data AT ALL. An established entry polling into a
+        quiet window — a utility that publishes weekly, or a poll that lands between publications —
+        returns empty all the time and must stay silent.
+        """
+        if CONF_LAST_FETCHED_AT in self.entry.data:
+            self._clear_empty_since()
+            self._async_clear_background_load_issue()
+            self.cancel_pending_retry()
+            return
+
+        first_time = CONF_EMPTY_SINCE not in self.entry.data
+        self._remember_empty_since()
+        # WARNING the first time, then DEBUG: the condition recurs on every retry, and a wait we
+        # have already explained (in the log and in a repair issue) shouldn't keep shouting. The
+        # first one is loud because "the Energy dashboard offers me no statistics" is otherwise
+        # indistinguishable from a broken install.
+        log = _LOGGER.warning if first_time else _LOGGER.debug
+        log(
+            "Entry %s: %s answered normally but has published no usage data at all yet, so there "
+            "is nothing to import and the Energy dashboard has no statistics to offer. Utilities "
+            "that assemble data on demand commonly do this right after authorization. Re-checking "
+            "on a widening backoff (first in %s); no action is needed",
+            self.entry.entry_id,
+            self.entry.data.get(CONF_UTILITY_NAME, "your utility"),
+            EMPTY_RETRY_INITIAL,
+        )
+        self._async_create_background_load_issue(deferred=False)
+        self._schedule_empty_retry()
+
+    def _remember_empty_since(self) -> None:
+        """Stamp when this entry's data-less wait began. No-op once stamped.
+
+        Must NOT restart on every empty poll — it's what decides both when to stop re-checking
+        quickly and how far apart the re-checks get.
+        """
+        if CONF_EMPTY_SINCE in self.entry.data:
+            return
+        self.hass.config_entries.async_update_entry(
+            self.entry,
+            data={**self.entry.data, CONF_EMPTY_SINCE: datetime.now(UTC).isoformat()},
+        )
+
+    def _clear_empty_since(self) -> None:
+        """Drop the data-less stamp once data has landed (no-op when none is set)."""
+        if CONF_EMPTY_SINCE not in self.entry.data:
+            return
+        data = {**self.entry.data}
+        data.pop(CONF_EMPTY_SINCE, None)
+        self.hass.config_entries.async_update_entry(self.entry, data=data)
+
+    def _schedule_empty_retry(self) -> None:
+        """Re-check sooner than the ordinary cadence for an account that has never had data.
+
+        The delay is "wait as long again as you've already waited", floored at
+        [EMPTY_RETRY_INITIAL] and capped at the entry's own poll interval — 5, 10, 20, 40 …
+        minutes, derived from `CONF_EMPTY_SINCE` rather than a persisted attempt counter, so it
+        survives a restart and can't drift out of step with the stamp that drives escalation.
+
+        Past PENDING_ESCALATE_AFTER we stop: the ordinary poll timer carries it from there, and a
+        utility that has published nothing in a day is not going to be shaken loose by a tenth
+        full-history query. Shares `_pending_retry_unsub` with the 202 path so one
+        [cancel_pending_retry] — and the entry-unload teardown wired in `async_setup_entry` —
+        tears down whichever is armed.
+        """
+        if self._pending_retry_unsub is not None:
+            return
+        elapsed = self._pending_elapsed()
+        if elapsed >= PENDING_ESCALATE_AFTER:
+            _LOGGER.debug(
+                "Entry %s has had no data for %s — dropping back to the ordinary poll interval",
+                self.entry.entry_id,
+                elapsed,
+            )
+            return
+        ceiling = self.update_interval or DEFAULT_SCAN_INTERVAL
+        delay = min(max(EMPTY_RETRY_INITIAL, elapsed), ceiling)
+
+        async def _retry(_now: datetime) -> None:
+            self._pending_retry_unsub = None
+            await self.async_refresh()
+
+        _LOGGER.debug(
+            "Entry %s: re-checking for first data in %s (waiting %s so far)",
+            self.entry.entry_id,
+            delay,
+            elapsed,
+        )
+        self._pending_retry_unsub = async_call_later(self.hass, delay, _retry)
 
     def _schedule_deferred_import_migration(
         self,
@@ -683,8 +792,8 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             utility_display_name=self.entry.data.get(CONF_UTILITY_NAME, "Open Green Button"),
             fresh=True,
         )
-        self._async_clear_background_load_issue()
         self._advance_cursor(response)
+        self._reconcile_data_availability()
         # Everything in the store was just computed by the current logic, so the entry is at the
         # current revision by construction — whether we got here from the `rebuild_statistics`
         # action or from the automatic repair in [_async_migrate_import].
@@ -701,28 +810,42 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         """Stable repair-issue id for this entry's async background-load condition."""
         return f"background_load_{self.entry.entry_id}"
 
-    def _async_create_background_load_issue(self) -> None:
-        """Raise (or update) the repair issue for a utility that's preparing data out of band.
+    def _async_create_background_load_issue(self, *, deferred: bool = True) -> None:
+        """Raise (or update) the repair issue for an account whose data hasn't arrived.
 
-        Severity tracks how long we've been waiting, because the two cases need opposite things
-        from the user. A utility that has just said "collecting it now" is working as designed and
-        the user should do *nothing* — an ERROR there is a false alarm that makes a normal mode
-        look like a broken integration. One that still hasn't delivered a day later is a real
-        problem we want reported.
+        Two axes, four messages:
 
-        Re-creating with the same issue_id updates the existing issue in place, so an entry that
-        crosses PENDING_ESCALATE_AFTER upgrades from one to the other rather than accumulating two.
+        [deferred] says how the utility told us. ``True`` is an explicit HTTP 202 — "collecting it
+        now, come back for it" — where we hold a frozen window and are collecting a batch the
+        custodian has already started. ``False`` is a clean HTTP 200 that simply carried nothing
+        for an account that has never had any data, where all we have is a well-founded suspicion
+        that it's coming. Conflating them would tell one set of users about a status code their
+        utility never sent.
+
+        Severity tracks how long we've been waiting, because the two ends need opposite things from
+        the user. A utility that has only just said "not yet" is working as designed and the user
+        should do *nothing* — an ERROR there is a false alarm that makes a normal mode look like a
+        broken integration. One that still has nothing a day later is a real problem we want
+        reported.
+
+        One issue id across all four: an entry can only be in one of these states at a time (a 202
+        raises before the empty check can run), and re-creating with the same id updates in place,
+        so an entry that crosses PENDING_ESCALATE_AFTER upgrades rather than accumulating a second.
         """
         from homeassistant.helpers import issue_registry as ir
 
         stuck = self._pending_elapsed() >= PENDING_ESCALATE_AFTER
+        if deferred:
+            translation_key = "background_load_stuck" if stuck else "background_load_pending"
+        else:
+            translation_key = "no_data_yet_stuck" if stuck else "no_data_yet"
         ir.async_create_issue(
             self.hass,
             DOMAIN,
             self._background_load_issue_id,
             is_fixable=False,
             severity=ir.IssueSeverity.ERROR if stuck else ir.IssueSeverity.WARNING,
-            translation_key="background_load_stuck" if stuck else "background_load_pending",
+            translation_key=translation_key,
             translation_placeholders={
                 "utility": self.entry.data.get(CONF_UTILITY_NAME, "your utility"),
             },
@@ -730,8 +853,15 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         )
 
     def _pending_elapsed(self) -> timedelta:
-        """How long the current deferred fetch has been outstanding (zero if it's brand new)."""
-        since = _parse_iso_or_none(self.entry.data.get(CONF_PENDING_SINCE))
+        """How long we've been waiting for data (zero if the wait is brand new).
+
+        Reads whichever stamp applies — the frozen 202's `CONF_PENDING_SINCE`, or the data-less
+        entry's `CONF_EMPTY_SINCE`. They're mutually exclusive in practice (a 202 raises before the
+        empty check runs, and a successful fetch clears the pending window), but the 202 is the
+        more specific condition so it wins if both are somehow set.
+        """
+        raw = self.entry.data.get(CONF_PENDING_SINCE) or self.entry.data.get(CONF_EMPTY_SINCE)
+        since = _parse_iso_or_none(raw)
         if since is None:
             return timedelta(0)
         return max(timedelta(0), datetime.now(UTC) - since)

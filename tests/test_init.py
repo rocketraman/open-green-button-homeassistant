@@ -28,7 +28,14 @@ from custom_components.greenbutton import (
     _configured_daily_poll_time,
     _previous_daily_occurrence,
 )
-from custom_components.greenbutton.api import CustomerResponse, UsageResponse
+from custom_components.greenbutton.api import (
+    CustomerResponse,
+    MeterReadingSeries,
+    NormalizedReadingType,
+    UsagePoint,
+    UsageReading,
+    UsageResponse,
+)
 from custom_components.greenbutton.const import (
     ATTR_CONFIG_ENTRY_ID,
     CONF_DAILY_POLL_TIME,
@@ -92,8 +99,33 @@ def _stub_network(fetch: AsyncMock) -> Iterator[None]:
 
 
 def _ok_fetch() -> AsyncMock:
-    empty = UsageResponse(updated=None, usage_points=[], new_credentials=None)
-    return AsyncMock(return_value=empty)
+    """A fetch that returns usable data.
+
+    It has to carry at least one reading, not just parse: an account that has never received a
+    single reading is now re-checked on its own backoff timer (see
+    [coordinator.GreenButtonCoordinator._reconcile_data_availability]), and that extra timer would
+    land inside the windows these scheduling tests advance through and be miscounted as a poll.
+    Which is the right behaviour to have — it just isn't what any test in this file is measuring.
+    """
+    reading_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="DELTA_DATA",
+        interval_length_seconds=3600,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=0,
+        currency_numeric_code=124,
+    )
+    reading = UsageReading(
+        start=datetime(2026, 7, 5, 5, tzinfo=UTC), duration_seconds=3600, value=1000.0
+    )
+    series = MeterReadingSeries(
+        meter_reading_id="mr1", reading_type=reading_type, readings=[reading]
+    )
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[series])
+    response = UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+    return AsyncMock(return_value=response)
 
 
 def _ago(**kwargs) -> str:

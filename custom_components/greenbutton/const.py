@@ -137,7 +137,33 @@ PENDING_RETRY_INTERVAL = timedelta(minutes=5)
 # entry drops back to its ordinary poll interval and the repair issue escalates from "your utility
 # is preparing this" to "this hasn't arrived, please report it". A day is deliberately generous:
 # a custodian with `SubscriptionFrequency=Daily` may genuinely only run its export once a day.
+# Shared with the empty-feed wait below, which is the same question asked a different way.
 PENDING_ESCALATE_AFTER = timedelta(hours=24)
+
+# UTC ISO 8601 instant of the first clean fetch that left this entry with no data at all. Written
+# only while the entry has never carried a single reading (no CONF_LAST_FETCHED_AT), and dropped
+# the moment one lands.
+#
+# The 202 path above is one way a utility says "not yet"; this is the other, and it used to have no
+# handling at all. A custodian that collects asynchronously (UtilityAPI, and every utility behind
+# it) answers the first request after authorization with a perfectly ordinary HTTP 200 carrying no
+# IntervalBlocks, and starts assembling the data in the background. Nothing is imported, so no
+# statistic metadata is registered, so the Energy dashboard's picker offers literally nothing —
+# and the next attempt was a full poll interval (a day) away, with no repair issue and nothing
+# above INFO in the log. Users reasonably read that as a broken integration and start deleting and
+# re-authorizing the entry; the re-add appears to "fix" it only because setup re-fetches, by which
+# time the utility has finished collecting. See issues/43.
+CONF_EMPTY_SINCE = "empty_since"
+
+# First re-attempt delay after a clean fetch that carried nothing, for an entry that has never had
+# any data. Each subsequent attempt waits as long again as we've already been waiting (5, 10, 20,
+# 40 … minutes), capped at the entry's ordinary poll interval and abandoned at
+# PENDING_ESCALATE_AFTER. The widening is the difference from the 202 path's flat cadence: there we
+# are collecting a batch the custodian has already prepared and told us about, so retrying every
+# five minutes for a day is proportionate. Here we only suspect the data is coming, and every
+# attempt re-asks for the entire initial-history window — a flat five minutes would mean ~288
+# full-history queries a day against a utility that may simply have nothing to give us.
+EMPTY_RETRY_INITIAL = timedelta(minutes=5)
 
 # Revision of the statistics *calculation* logic that produced this entry's stored rows.
 # Statistics are written once as they're fetched, so a fix that changes how usage or cost is

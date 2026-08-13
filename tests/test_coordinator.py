@@ -429,7 +429,11 @@ async def test_successful_refresh_clears_background_load_issue(hass: HomeAssista
         ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}") is not None
     )
 
-    coordinator.api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+    # A fetch that actually carries data — a *clean* fetch that carries nothing keeps the issue
+    # up (as `no_data_yet`), which is the whole point of the empty-feed path.
+    coordinator.api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        return_value=_response_with_readings(datetime(2026, 7, 5, 5, tzinfo=UTC))
+    )
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
         new=AsyncMock(),
@@ -437,6 +441,200 @@ async def test_successful_refresh_clears_background_load_issue(hass: HomeAssista
         await coordinator._async_update_data()
 
     assert ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}") is None
+
+
+async def test_clean_fetch_with_no_data_at_all_explains_itself_and_retries_soon(
+    hass: HomeAssistant,
+) -> None:
+    """A brand-new account whose utility returns nothing must not go quiet for a day.
+
+    The issues/43 report. A custodian that assembles data on demand (UtilityAPI, and everything
+    behind it) answers the first request after authorization with an ordinary HTTP 200 carrying no
+    readings. Nothing is imported, so no statistic metadata is registered, so the Energy dashboard
+    offers the user literally nothing — and the only thing that used to happen next was the
+    ordinary poll, a day later. The user reads that as a broken integration.
+    """
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.greenbutton.const import BACKGROUND_LOAD_ISSUE_URL, CONF_EMPTY_SINCE
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    # The fetch SUCCEEDED — this is not a failed refresh, and must not be reported as one.
+    assert coordinator.last_update_success is True
+    assert CONF_EMPTY_SINCE in entry.data
+
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}")
+    assert issue is not None
+    assert issue.severity == ir.IssueSeverity.WARNING
+    assert issue.translation_key == "no_data_yet"
+    assert issue.learn_more_url == BACKGROUND_LOAD_ISSUE_URL
+    assert issue.translation_placeholders == {"utility": "Example Utility"}
+
+    assert coordinator._pending_retry_unsub is not None
+    coordinator.cancel_pending_retry()
+
+
+async def test_empty_wait_widens_and_is_capped_by_the_poll_interval(hass: HomeAssistant) -> None:
+    """Each re-check waits as long again as we've already waited, up to the poll cadence.
+
+    Unlike the 202 path — where we're collecting a batch the custodian has already prepared and
+    told us about — every attempt here re-asks for the whole initial-history window on nothing more
+    than a suspicion. A flat five minutes would mean ~288 full-history queries a day against a
+    utility that may simply have nothing to give us.
+    """
+    from custom_components.greenbutton.const import CONF_EMPTY_SINCE, EMPTY_RETRY_INITIAL
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    async def _delay_for(
+        coord: GreenButtonCoordinator, target: MockConfigEntry, waited: timedelta | None
+    ) -> timedelta:
+        data = {**target.data}
+        data.pop(CONF_EMPTY_SINCE, None)
+        if waited is not None:
+            data[CONF_EMPTY_SINCE] = (datetime.now(UTC) - waited).isoformat()
+        hass.config_entries.async_update_entry(target, data=data)
+        coord.cancel_pending_retry()
+        with (
+            patch(
+                "custom_components.greenbutton.coordinator.import_usage_statistics",
+                new=AsyncMock(),
+            ),
+            patch("custom_components.greenbutton.coordinator.async_call_later") as call_later,
+        ):
+            await coord._async_update_data()
+        return call_later.call_args.args[1]
+
+    # First empty poll: the floor.
+    assert await _delay_for(coordinator, entry, None) == EMPTY_RETRY_INITIAL
+    # Mid-backoff: doubling falls out of "wait as long again", with no attempt counter to persist
+    # (so it survives a restart and can't drift out of step with the stamp driving escalation).
+    # Approximate because the elapsed time is read off the wall clock inside the call.
+    delay = await _delay_for(coordinator, entry, timedelta(minutes=40))
+    assert delay.total_seconds() == pytest.approx(2400, abs=5)
+
+    # Capped at the entry's own cadence: re-checking more slowly than the ordinary poll would be a
+    # regression, not a backoff. Only reachable on a utility whose server-supplied cadence is
+    # shorter than the wait — a daily cadence escalates out first.
+    fast_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={**entry.data, CONF_POLL_INTERVAL_SECONDS: 6 * 3600, CONF_CUSTOMER_LABEL: ""},
+    )
+    fast_entry.add_to_hass(hass)
+    fast = GreenButtonCoordinator(hass, api, fast_entry)
+    assert await _delay_for(fast, fast_entry, timedelta(hours=8)) == timedelta(hours=6)
+    fast.cancel_pending_retry()
+
+
+async def test_a_day_without_data_escalates_and_drops_the_fast_cadence(
+    hass: HomeAssistant,
+) -> None:
+    """Past PENDING_ESCALATE_AFTER: an error worth reporting, and no more extra polling."""
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.greenbutton.const import CONF_EMPTY_SINCE, PENDING_ESCALATE_AFTER
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+
+    entry = _entry(hass)
+    stale = datetime.now(UTC) - PENDING_ESCALATE_AFTER - timedelta(minutes=1)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_EMPTY_SINCE: stale.isoformat()}
+    )
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    # The stamp must NOT restart on every empty poll — it's what decides when to stop.
+    assert entry.data[CONF_EMPTY_SINCE] == stale.isoformat()
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}")
+    assert issue is not None
+    assert issue.severity == ir.IssueSeverity.ERROR
+    assert issue.translation_key == "no_data_yet_stuck"
+    assert coordinator._pending_retry_unsub is None
+
+
+async def test_first_data_clears_the_empty_wait(hass: HomeAssistant) -> None:
+    """The moment a reading lands, the stamp, the notice and the fast retry all go away."""
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.greenbutton.const import CONF_EMPTY_SINCE
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+        assert CONF_EMPTY_SINCE in entry.data
+
+        coordinator.api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+            return_value=_response_with_readings(datetime(2026, 7, 5, 5, tzinfo=UTC))
+        )
+        await coordinator._async_update_data()
+
+    assert CONF_EMPTY_SINCE not in entry.data
+    assert entry.data[CONF_LAST_FETCHED_AT] == "2026-07-05T05:00:00+00:00"
+    assert ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}") is None
+    assert coordinator._pending_retry_unsub is None
+
+
+async def test_an_established_entry_polling_into_a_quiet_window_stays_silent(
+    hass: HomeAssistant,
+) -> None:
+    """An empty poll is only remarkable for an account that has NEVER had data.
+
+    Utilities publish on a lag — weekly, or in batches — so an entry that already holds history
+    returns empty routinely. Warning about that, or re-polling it every few minutes, would turn
+    normal operation into a permanent repair notice.
+    """
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.greenbutton.const import CONF_EMPTY_SINCE
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(return_value=_empty_response())  # type: ignore[method-assign]
+
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_LAST_FETCHED_AT: "2026-07-04T05:00:00+00:00"}
+    )
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    assert CONF_EMPTY_SINCE not in entry.data
+    assert ir.async_get(hass).async_get_issue(DOMAIN, f"background_load_{entry.entry_id}") is None
+    assert coordinator._pending_retry_unsub is None
 
 
 async def test_rotated_credentials_are_persisted_before_stats_import(

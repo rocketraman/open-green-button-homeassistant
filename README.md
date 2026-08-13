@@ -33,6 +33,14 @@ Copy `custom_components/greenbutton/` into your Home Assistant config directory 
 
 The integration writes hourly consumption data into the HA Energy dashboard's long-term statistics.
 
+### If there's nothing to pick in the Energy dashboard yet
+
+Right after setup, **Settings → Dashboards → Energy** may say *no statistics available* when you try to add the account. That usually means your utility hasn't sent any data yet — plenty of them only start assembling your history once you authorize, which can take from a minute to a few hours. Until the first reading arrives there is nothing to put in the dashboard, so there is nothing to pick.
+
+Home Assistant will tell you when this is what's happening: look for a notice under **Settings → Repairs**. The integration re-checks on its own, first after a few minutes and then progressively less often, and the notice clears itself as soon as data lands. **You don't need to delete and re-add the integration** — that only appears to help because setting the account up again happens to trigger another fetch.
+
+If it's still empty a day later the notice changes to say so, and we'd like to hear about it — the link in the notice goes to the tracking issue.
+
 ## Recomputing statistics after an update
 
 Statistics are written once, as they're fetched — so if an update changes how usage or **cost** is calculated, rows already in the database keep their old values.
