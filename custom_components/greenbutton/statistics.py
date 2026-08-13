@@ -177,25 +177,75 @@ def response_has_multi_hour_readings(response: UsageResponse) -> bool:
     )
 
 
+def response_cost_may_be_missing_bills(response: UsageResponse) -> bool | None:
+    """Whether [response] shows this entry's *cost* rows were built from only some of its bills.
+
+    The revision-3 signal. A summary that overlapped one already costed used to be rejected
+    outright as a duplicate, on the belief that consecutive periods only touch at an instant. They
+    share a meter-read day, so roughly every other bill was discarded and the cost statistic was
+    built from about half the money — where a later bill now replaces the earlier one's hours
+    instead (see [_import_cost_summaries]).
+
+    Unlike revisions 1 and 2, this can't be recognized from the overlap itself. Those were
+    properties of the *series*, present in every poll that carries readings; bills appear only in
+    the poll that publishes them, and a monthly utility hands over one at a time — so a pair of
+    overlapping periods would essentially never be in one response, and an entry judged on that
+    would be stamped "unaffected" and never repaired. The signal has to be the thing that is
+    stably observable: does this account cost from ``UsageSummary`` at all?
+
+      - **True** — some usage point bills through summaries. Its stored cost is suspect, because
+        we can't see from here which bills the old rule dropped.
+      - **False** — every usage point itemizes per-interval ``<cost>`` (savagedata/Milton,
+        Elexicon). Summary selection never ran for it, so nothing is wrong.
+      - **None** — this poll showed neither, so it tells us nothing either way. The caller waits
+        rather than stamping the entry as unaffected on absent evidence. An account whose utility
+        publishes no cost of any kind stays undecided indefinitely and re-checks each poll —
+        cheap, and it has no cost rows to repair regardless.
+    """
+    verdicts: list[bool | None] = []
+    for up in response.usage_points:
+        if up.summaries and not _has_interval_cost(up):
+            return True
+        # Per-interval cost settles it without needing a summary in this particular poll, which
+        # matters: it's what lets a savagedata-family account be cleared on an ordinary poll
+        # instead of waiting for a billing month to turn over.
+        verdicts.append(False if _has_interval_cost(up) else None)
+    if verdicts and all(v is False for v in verdicts):
+        return False
+    return None
+
+
 # Recognition predicates keyed by the import-logic revision that fixed the bug. An entry stamped
 # at revision N is tested against every predicate for a revision > N — so a user who skipped a
 # release still gets each repair they're owed, in one rebuild rather than one per revision.
-_IMPORT_MIGRATION_CHECKS: dict[int, Callable[[UsageResponse], bool]] = {
+#
+# A predicate may return None for "this poll can't tell" — see [response_cost_may_be_missing_bills].
+_IMPORT_MIGRATION_CHECKS: dict[int, Callable[[UsageResponse], bool | None]] = {
     1: response_has_cumulative_series,
     2: response_has_multi_hour_readings,
+    3: response_cost_may_be_missing_bills,
 }
 
 
-def response_needs_import_migration(response: UsageResponse, stamped_revision: int) -> bool:
-    """True when [response]'s shape shows this entry's rows were produced by a since-fixed bug.
+def response_needs_import_migration(response: UsageResponse, stamped_revision: int) -> bool | None:
+    """Whether [response]'s shape shows this entry's rows were produced by a since-fixed bug.
 
     [stamped_revision] is the entry's ``CONF_IMPORT_LOGIC_REVISION`` (0 when never stamped).
+
+    Returns None when no predicate found an offending shape but at least one couldn't tell from
+    this response — "not yet", not "no". Stamping an entry as unaffected on that would close the
+    repair permanently, which is the one outcome none of this may produce.
     """
-    return any(
+    verdicts = [
         check(response)
         for revision, check in _IMPORT_MIGRATION_CHECKS.items()
         if revision > stamped_revision
-    )
+    ]
+    if any(v is True for v in verdicts):
+        return True
+    if any(v is None for v in verdicts):
+        return None
+    return False
 
 
 def _slugify(component: str) -> str:
@@ -653,58 +703,6 @@ def _stat_display_name(
     return f"{utility_display_name} · {up.service_kind.title()} {flow} ({short_id})"
 
 
-def _select_billing_summaries(summaries: list[BillingSummary]) -> list[BillingSummary]:
-    """Pick a non-overlapping, deduplicated set of summaries, in billing-period order.
-
-    A single ESPI feed frequently carries more than one ``UsageSummary`` covering the same
-    hours — exact duplicates repeated across the paginated feed, and/or rollup summaries at a
-    coarser granularity (e.g. a 12-month total alongside the per-bill totals). The cost
-    importer distributes each summary's *full* period total across its hours and **adds** the
-    result into one cumulative statistic, so any overlap multiplies the cost the Energy
-    dashboard shows for those hours (a single duplicated bill doubles it; a handful of
-    overlapping rollups can inflate it several-fold) while leaving energy untouched.
-
-    We defend against that here by choosing a maximal non-overlapping subset:
-
-      - Shortest duration first, so the summary most specific to a single bill wins over a
-        rollup that spans it.
-      - Higher total cost breaks ties, so a real bill beats a $0 placeholder for the same
-        period (test-lab feeds emit those).
-      - A summary is dropped when its ``[start, end)`` window overlaps one already kept.
-
-    Consecutive real billing periods share only their boundary instant, which is half-open
-    here, so they never collide — only genuine duplicates and coarser rollups get dropped.
-    """
-    # Shortest-first, then earliest, then most-expensive — see docstring for the rationale.
-    ordered = sorted(
-        summaries,
-        key=lambda s: (
-            s.billing_period_duration_seconds,
-            s.billing_period_start,
-            -s.total_cost,
-        ),
-    )
-    accepted: list[BillingSummary] = []
-    accepted_intervals: list[tuple[datetime, datetime]] = []
-    for summary in ordered:
-        start = summary.billing_period_start
-        end = start + timedelta(seconds=summary.billing_period_duration_seconds)
-        if any(start < a_end and a_start < end for a_start, a_end in accepted_intervals):
-            _LOGGER.debug(
-                "Dropping overlapping billing summary %s (+%ds, total_cost=%.2f) — its hours "
-                "are already costed by a more specific summary",
-                start.isoformat(),
-                summary.billing_period_duration_seconds,
-                summary.total_cost,
-            )
-            continue
-        accepted.append(summary)
-        accepted_intervals.append((start, end))
-
-    accepted.sort(key=lambda s: s.billing_period_start)
-    return accepted
-
-
 async def _recorded_forward_hours(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -780,6 +778,34 @@ async def _import_cost_summaries(
     read them back from the usage statistic ([_recorded_forward_hours]) to distribute over.
     This is why a plain published-min poll is enough to keep cost current — no reach-back needed.
 
+    **Overlapping periods: the later bill replaces the earlier one's hours, in full.** Feeds
+    routinely carry summaries covering hours another summary already covers. Consecutive bills
+    overlap by a meter-read day, because the period is inclusive of both reads — El Paso
+    Electric's twelve monthly bills each lap one day over the previous. Feeds also repeat exact
+    duplicates across pagination, and some publish a coarse rollup beside the per-bill totals.
+    Costing every one of them in full would charge the shared hours twice over.
+
+    So each summary prices every hour of its *own* period, and a summary applied later simply
+    overwrites what an earlier one wrote on any hour they share. Ordering is by period start, then
+    longest-first, then cheapest-first, so the most recent and most specific statement of an hour's
+    cost is the one that survives. Rollups lose every hour a real bill also covers and keep only
+    the gaps; exact duplicates rewrite identical values and change nothing.
+
+    The alternative — clipping a later summary's window to the hours nobody has claimed and
+    spreading its full total across what's left — was tried and is worse. A bill's ``total_cost``
+    is one number with no per-day breakdown, so there is no honest way to subtract the overlap
+    day's share from it: the clipped remainder gets charged the whole bill, and every hour in it
+    is overpriced by the ratio of what was trimmed. Replacing needs no such guess. It also matches
+    what a later bill *means*: when two statements cover the same hour, the more recent one is the
+    utility's correction, not a duplicate to be reconciled against the older one.
+
+    Note the replacement applies within an import, not retroactively across polls. An hour costed
+    by a poll weeks ago sits behind this statistic's resume point and is skipped rather than
+    revised — a cumulative-sum statistic can't have its middle rewritten without restating every
+    row after it. A full rebuild (`greenbutton.rebuild_statistics`, or the automatic repair in
+    [coordinator.GreenButtonCoordinator._async_migrate_import]) re-imports from a clean slate and
+    applies this to the whole history, which is how a feed imported under the old rule gets fixed.
+
     Skipped when the UsagePoint has no summaries (most utilities only attach UsageSummary
     to accounts they bill; meter-only test profiles often won't), or when the currency code
     isn't one we have an ISO 4217 alpha mapping for.
@@ -821,13 +847,25 @@ async def _import_cost_summaries(
         (0.0, None) if fresh else await _resume_point(hass, statistic_id)
     )
 
-    stats: list[StatisticData] = []
-    running = resume_from_sum
-    for summary in _select_billing_summaries(up.summaries):
+    # Periods we couldn't cost for want of usage to spread them over. Collected rather than logged
+    # per-period so the summary below can say how many, over what span — "why is there no cost
+    # statistic?" is otherwise unanswerable from the log at any level.
+    uncostable: list[datetime] = []
+    # Each summary prices every hour of its own period, and a later one simply replaces whatever
+    # an earlier one put on an hour they share — see the docstring on why replacing beats trimming.
+    cost_by_hour: dict[datetime, float] = {}
+    for summary in sorted(
+        up.summaries,
+        key=lambda s: (
+            s.billing_period_start,
+            -s.billing_period_duration_seconds,
+            s.total_cost,
+        ),
+    ):
         period_cost = summary.total_cost
         if period_cost == 0:
             # Test-lab fixtures often have $0 placeholders — skip rather than emit a
-            # cumulative-flat row across an entire month.
+            # cumulative-flat row across an entire month, or blank out a real bill's hours.
             continue
         period_start = summary.billing_period_start
         period_end = period_start + timedelta(seconds=summary.billing_period_duration_seconds)
@@ -839,19 +877,54 @@ async def _import_cost_summaries(
         if total_period_kwh <= 0:
             # No recorded usage for this period yet (e.g. a bill whose period predates our usage
             # backfill) — nothing to distribute the cost over; skip until/if the usage exists.
+            uncostable.append(period_start)
+            _LOGGER.debug(
+                "No recorded usage in %s → %s for usage point %s, so its %.2f bill can't be "
+                "distributed — skipping this period",
+                period_start.isoformat(),
+                period_end.isoformat(),
+                up.usage_point_id,
+                period_cost,
+            )
             continue
 
         # Per-hour cost = per-kWh TOU rate (zero if not a TOU bucket) + per-kWh non-TOU rate
         # for everything else (Delivery, Global Adjustment, rebates, etc.). Sum of all hourly
         # costs across the period equals the period's total bill — verified by construction.
-        cost_at_hour = _cost_distribution_for_period(summary, in_period, total_period_kwh)
-        for hour_start, _kwh in in_period:
-            if resume_after_epoch is not None and hour_start.timestamp() <= resume_after_epoch:
-                continue
-            running += cost_at_hour[hour_start]
-            stats.append(StatisticData(start=hour_start, state=running, sum=running))
+        cost_by_hour.update(_cost_distribution_for_period(summary, in_period, total_period_kwh))
+
+    # One pass, in time order, so the cumulative sum is monotonic no matter what order the feed
+    # listed its summaries in.
+    stats: list[StatisticData] = []
+    running = resume_from_sum
+    for hour_start in sorted(cost_by_hour):
+        if resume_after_epoch is not None and hour_start.timestamp() <= resume_after_epoch:
+            continue
+        running += cost_by_hour[hour_start]
+        stats.append(StatisticData(start=hour_start, state=running, sum=running))
 
     if not stats:
+        # No cost statistic gets registered at all in this case, so it's simply absent from the
+        # Energy dashboard's picker with nothing anywhere to say why. Name the reason: on a fresh
+        # account it's normally that the utility publishes bills going back further than the usage
+        # it will give us, which resolves itself as usage accumulates.
+        if uncostable:
+            _LOGGER.info(
+                "No cost statistic for usage point %s: %d billing period(s) between %s and %s "
+                "were published, but this entry has imported no usage inside any of them, so "
+                "there is nothing to distribute the bills across. Cost will appear once usage "
+                "exists for a billed period",
+                up.usage_point_id,
+                len(uncostable),
+                min(uncostable).date().isoformat(),
+                max(uncostable).date().isoformat(),
+            )
+        else:
+            _LOGGER.debug(
+                "No cost rows to write for usage point %s (every billing period was either a "
+                "zero-cost placeholder or already imported)",
+                up.usage_point_id,
+            )
         return
 
     _LOGGER.info(

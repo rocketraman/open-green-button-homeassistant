@@ -35,7 +35,6 @@ from custom_components.greenbutton.api import (
 from custom_components.greenbutton.const import DOMAIN
 from custom_components.greenbutton.statistics import (
     _recorded_forward_hours,
-    _select_billing_summaries,
     import_usage_statistics,
     statistic_id_for_series,
     statistic_id_prefix_for_entry,
@@ -808,11 +807,20 @@ async def test_summary_cost_distributes_over_recorded_usage(hass: HomeAssistant)
     assert [round(s["sum"], 2) for s in stats] == [10.0, 40.0]
 
 
-async def test_summary_cost_skipped_when_no_recorded_usage(hass: HomeAssistant) -> None:
-    """A bill whose period has no recorded usage yet (e.g. predates the backfill) writes nothing."""
+async def test_summary_cost_skipped_when_no_recorded_usage(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A bill whose period has no recorded usage yet (e.g. predates the backfill) writes nothing.
+
+    And says so. No cost statistic is registered at all in this case, so it's simply missing from
+    the Energy dashboard's picker — a user who asks why has nothing in the log to go on unless the
+    skip explains itself. This is the El Paso sandbox shape: a year of bills, one day of usage.
+    """
     entry = MagicMock()
     entry.entry_id = "01TESTENTRY"
     with (
+        caplog.at_level(logging.INFO, logger="custom_components.greenbutton.statistics"),
         patch(
             "custom_components.greenbutton.statistics._resume_point",
             new=AsyncMock(return_value=(0.0, None)),
@@ -829,6 +837,8 @@ async def test_summary_cost_skipped_when_no_recorded_usage(hass: HomeAssistant) 
 
     cost_calls = [c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")]
     assert not cost_calls
+    assert "No cost statistic for usage point" in caplog.text
+    assert "nothing to distribute the bills across" in caplog.text
 
 
 async def test_summary_cost_deferred_until_hass_started(hass: HomeAssistant) -> None:
@@ -949,51 +959,90 @@ def test_statistic_id_slugifies_real_world_ulid_and_uuid_inputs() -> None:
     assert sid.startswith(statistic_id_prefix_for_entry("01KT5B7TVYNVZY86P0PH0EPTAB"))
 
 
-def test_select_summaries_drops_exact_duplicate_period() -> None:
-    """A billing period repeated across the paginated feed must be costed once, not twice.
+async def _cost_sums(hass, summaries: list[BillingSummary]) -> list[float]:
+    """Import [summaries] against a synthetic 1 kWh/hour usage history; return the cost rows' sums.
 
-    Two identical summaries → keeping both would double that period's cost in the Energy
-    dashboard (the regression this guards against).
+    `_recorded_forward_hours` is stubbed to answer for whatever window it's asked about, so each
+    summary spreads its total evenly over its own hours and the arithmetic below is exact.
     """
-    a = _summary(_APR2, 32, 130.08)
-    b = _summary(_APR2, 32, 130.08)
-    selected = _select_billing_summaries([a, b])
-    assert len(selected) == 1
-    assert selected[0].total_cost == 130.08
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    up = UsagePoint(
+        usage_point_id="up1", service_kind="electricity", series=[], summaries=summaries
+    )
+    response = UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+    async def _hours(_hass, _entry, _up, period_start, period_end):
+        hours, hour = [], period_start
+        while hour < period_end:
+            hours.append((hour, 1.0))
+            hour += timedelta(hours=1)
+        return hours
+
+    with (
+        patch(
+            "custom_components.greenbutton.statistics._resume_point",
+            new=AsyncMock(return_value=(0.0, None)),
+        ),
+        patch("custom_components.greenbutton.statistics._recorded_forward_hours", new=_hours),
+        patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
+    ):
+        await import_usage_statistics(hass, entry, response, utility_display_name="X")
+
+    cost_calls = [c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")]
+    return [] if not cost_calls else [s["sum"] for s in cost_calls[0].args[2]]
 
 
-def test_select_summaries_drops_overlapping_rollup() -> None:
-    """A coarse rollup that spans a per-bill period is dropped in favor of the specific one.
+async def test_a_later_bill_replaces_an_earlier_ones_overlapping_hours(
+    hass: HomeAssistant,
+) -> None:
+    """Where two bills cover the same hour, the later one's price is what stands.
 
-    This is the multi-fold inflation case: a 12-month rollup laid over the current bill's
-    hours would add its whole total on top of the per-bill total.
+    Consecutive bills overlap by a meter-read day, because a billing period is inclusive of both
+    reads — every one of El Paso Electric's twelve monthly bills laps a day over the previous, and
+    Burlington and Elexicon are the same. Each bill prices all of its own hours, and the later
+    statement simply overwrites the shared ones. Nothing is dropped and nothing is guessed at.
+
+    Apr 1-3 at $48 over 48 h = $1/h. Apr 2-4 at $96 over 48 h = $2/h. The 24 hours of Apr 1 keep
+    $1; the 48 hours from Apr 2 on are restated at $2 → $24 + $96 = $120 across 72 hours.
     """
-    per_bill = _summary(_APR2, 32, 130.08)
-    rollup = _summary(datetime(2025, 6, 1, tzinfo=UTC), 365, 1500.0)
-    selected = _select_billing_summaries([rollup, per_bill])
-    assert selected == [per_bill]
+    first = _summary(datetime(2026, 4, 1, tzinfo=UTC), 2, 48.0)
+    later = _summary(datetime(2026, 4, 2, tzinfo=UTC), 2, 96.0)
+    sums = await _cost_sums(hass, [later, first])  # feed order must not matter
+
+    assert len(sums) == 72
+    assert round(sums[-1], 2) == 120.0
+    assert round(sums[23], 2) == 24.0  # Apr 1 costed at the first bill's rate throughout
 
 
-def test_select_summaries_keeps_consecutive_periods() -> None:
-    """Back-to-back real billing periods share only their boundary instant → both kept.
+async def test_an_exact_duplicate_bill_costs_the_period_once(hass: HomeAssistant) -> None:
+    """A period repeated across a paginated feed rewrites identical values, changing nothing.
 
-    The interval check is half-open, so May 4 belongs to the second period only and the two
-    never register as overlapping.
+    Under the old any-overlap-is-a-duplicate rule this needed detecting; replacing makes it a
+    no-op for free. Costing both would double the period in the Energy dashboard.
     """
-    first = _summary(_APR2, 32, 130.08)  # Apr 2 → May 4
-    second = _summary(_MAY4, 30, 118.0)  # May 4 → Jun 3
-    selected = _select_billing_summaries([second, first])
-    assert selected == [first, second]  # returned in billing-period order
+    bill = _summary(datetime(2026, 4, 1, tzinfo=UTC), 2, 48.0)
+    assert round((await _cost_sums(hass, [bill, bill]))[-1], 2) == 48.0
 
 
-def test_select_summaries_prefers_real_bill_over_zero_placeholder() -> None:
-    """When a $0 placeholder duplicates a real bill's period, keep the real one.
+async def test_a_rollup_only_prices_hours_no_bill_covers(hass: HomeAssistant) -> None:
+    """A coarse rollup published beside the per-bill totals loses every hour a bill also states.
 
-    Same period + same (shortest) duration → the tie is broken by higher total_cost so the
-    real bill wins and its cost isn't silently dropped.
+    It keeps the gaps, priced at its own average rate — no bill covers those hours, so its figure
+    is the only evidence there is for them. Apr 1-5 at $96 over 96 h = $1/h; the two days Apr 2-4
+    are restated by the $96/48 h = $2/h bill. So 24 h at $1 + 48 h at $2 + 24 h at $1 = $144.
     """
-    placeholder = _summary(_APR2, 32, 0.0)
-    real = _summary(_APR2, 32, 130.08)
-    selected = _select_billing_summaries([placeholder, real])
-    assert len(selected) == 1
-    assert selected[0].total_cost == 130.08
+    rollup = _summary(datetime(2026, 4, 1, tzinfo=UTC), 4, 96.0)
+    bill = _summary(datetime(2026, 4, 2, tzinfo=UTC), 2, 96.0)
+    sums = await _cost_sums(hass, [rollup, bill])
+
+    assert len(sums) == 96
+    assert round(sums[23], 2) == 24.0  # Apr 1 — rollup's rate, no bill covers it
+    assert round(sums[-1], 2) == 144.0
+
+
+async def test_a_zero_cost_placeholder_never_blanks_out_a_real_bill(hass: HomeAssistant) -> None:
+    """Test-lab feeds emit $0 summaries beside real ones; they must not overwrite anything."""
+    placeholder = _summary(datetime(2026, 4, 1, tzinfo=UTC), 2, 0.0)
+    real = _summary(datetime(2026, 4, 1, tzinfo=UTC), 2, 48.0)
+    assert round((await _cost_sums(hass, [real, placeholder]))[-1], 2) == 48.0

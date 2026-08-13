@@ -92,9 +92,11 @@ def _reading_type() -> NormalizedReadingType:
     )
 
 
-def _response_with_readings(*starts: datetime) -> UsageResponse:
+def _response_with_readings(*starts: datetime, cost: float | None = None) -> UsageResponse:
     """A UsageResponse carrying one FORWARD series with a reading at each given start."""
-    readings = [UsageReading(start=s, duration_seconds=3600, value=1000.0) for s in starts]
+    readings = [
+        UsageReading(start=s, duration_seconds=3600, value=1000.0, cost=cost) for s in starts
+    ]
     series = MeterReadingSeries(
         meter_reading_id="mr1", reading_type=_reading_type(), readings=readings
     )
@@ -1078,10 +1080,13 @@ def _response_with_cumulative_register() -> UsageResponse:
     logic — it's the series that used to be summed into consumption (#6) and whose `cost=0`
     hijacked cost-source selection (#7).
     """
+    # The hourly series itemizes per-interval <cost>, as savagedata really does. That's also what
+    # settles the revision-3 check for this feed without a UsageSummary in the poll: an account on
+    # the per-interval cost path never ran billing-summary selection, so it has nothing to repair.
     delta = MeterReadingSeries(
         meter_reading_id="hourly",
         reading_type=_reading_type(),
-        readings=[UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0)],
+        readings=[UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0, cost=0.21)],
     )
     bulk_type = NormalizedReadingType(
         commodity="ELECTRICITY_SECONDARY_METERED",
@@ -1143,17 +1148,99 @@ async def test_import_migration_rebuilds_entry_with_cumulative_register(
     assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
 
 
+def _summary_costed_response() -> UsageResponse:
+    """Burlington's shape: hourly readings with no per-interval cost, billed by UsageSummary."""
+    from custom_components.greenbutton.api import BillingSummary, CostDetail
+
+    series = MeterReadingSeries(
+        meter_reading_id="hourly",
+        reading_type=_reading_type(),
+        readings=[UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, 1000.0)],
+    )
+    summary = BillingSummary(
+        billing_period_start=datetime(2026, 6, 2, tzinfo=UTC),
+        billing_period_duration_seconds=30 * 86400,
+        bill_last_period_raw=None,
+        cost_additional_last_period_raw=0,
+        cost_details=[
+            CostDetail(amount_raw=18_773_000, note="Energy", item_kind=None, unit_cost_raw=0)
+        ],
+        currency_numeric_code=124,
+    )
+    up = UsagePoint(
+        usage_point_id="up1",
+        service_kind="electricity",
+        series=[series],
+        summaries=[summary],
+    )
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+async def test_import_migration_rebuilds_a_summary_costed_entry(hass: HomeAssistant) -> None:
+    """Revision 3: an account billed through UsageSummary repairs its cost without being asked.
+
+    Selection used to drop every bill that overlapped the previous one at the meter-read day,
+    which is most of them, so the cost statistic was built from about half the money. Nothing
+    about the stored rows looks wrong — cost is simply too low — so nobody would think to run
+    `rebuild_statistics`, which is exactly why this has to happen on its own.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, 2)  # current before this fix; only the revision-3 check should fire
+    api = _api_returning(_summary_costed_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    assert coordinator.last_exception is None
+    assert api.fetch_usage.await_count == 2  # the poll, then the rebuild's full-history re-fetch
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
+async def test_import_migration_will_not_clear_an_entry_it_could_not_judge(
+    hass: HomeAssistant,
+) -> None:
+    """A poll carrying no cost of any kind leaves the entry unstamped, not cleared.
+
+    The trap this guards. Bills only appear in the poll that publishes them, and a monthly utility
+    hands over one at a time — so most Burlington polls carry readings and no summary. Treating
+    that as "unaffected" would stamp the entry on the first poll after the update and close the
+    repair permanently, on evidence we never had. Not deciding costs one cheap re-check a day.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, 2)
+    api = _api_returning(_response_with_readings(datetime(2026, 7, 5, 5, tzinfo=UTC)))
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    api.fetch_usage.assert_awaited_once()  # no rebuild
+    clear_mock.assert_not_awaited()
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == 2  # still owed the check
+
+
 async def test_import_migration_skips_entry_without_cumulative_register(
     hass: HomeAssistant,
 ) -> None:
     """An unaffected feed is stamped in place — no full-history re-pull from its utility.
 
-    The whole point of gating on the feed's shape: a blanket rebuild would make every Burlington
-    and Elexicon user re-download their entire history to fix a bug they never had.
+    The whole point of gating on the feed's shape: a blanket rebuild would make every user
+    re-download their entire history to fix a bug they never had. The readings carry per-interval
+    cost so every check can reach a verdict from this one poll — see
+    [statistics.response_cost_may_be_missing_bills] for why an entry that can't be judged is left
+    unstamped rather than cleared.
     """
     hass.set_state(CoreState.running)
     entry = _entry(hass)
-    api = _api_returning(_response_with_readings(datetime(2026, 7, 5, 5, tzinfo=UTC)))
+    api = _api_returning(
+        _response_with_readings(datetime(2026, 7, 5, 5, tzinfo=UTC), cost=0.21),
+    )
     coordinator = GreenButtonCoordinator(hass, api, entry)
 
     has_stats, clear, _import = _migration_patches(had_statistics=True)

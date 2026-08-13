@@ -190,7 +190,15 @@ CONF_IMPORT_LOGIC_REVISION = "import_logic_revision"
 #       excluded them, so an affected entry's rebuild purged its rows and re-imported nothing.
 #       Those entries are stamped 1 and sitting on an EMPTY store with a cursor advanced past
 #       their data — nothing but this migration will ever re-import them.
-IMPORT_LOGIC_REVISION = 2
+#   3 — billing summaries that overlap at a meter-read day were taken for duplicates and dropped,
+#       so the cost statistic was built from roughly every other bill. A billing period is
+#       inclusive of both read dates, so this is the norm, not an edge case: all twelve bills in
+#       an El Paso Electric feed overlap the previous by exactly one day, and six were discarded
+#       — $27,615 of $58,335. Burlington and Elexicon have the same shape. Affects any account
+#       billed through UsageSummary; feeds that itemize per-interval <cost> never ran the
+#       selection and are stamped forward untouched. Usage rows are unaffected — the damage is
+#       cost, and it is damage by omission, which is why nobody reported it as wrong data.
+IMPORT_LOGIC_REVISION = 3
 
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see

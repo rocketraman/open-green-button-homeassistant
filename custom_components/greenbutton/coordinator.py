@@ -651,7 +651,18 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             )
             return None
 
-        if not response_needs_import_migration(response, stamped_revision):
+        verdict = response_needs_import_migration(response, stamped_revision)
+        if verdict is None:
+            # Undecidable from this poll — see [statistics.response_cost_may_be_missing_bills].
+            # Stamping here is the one thing we must not do: it would close the repair on evidence
+            # we never had.
+            _LOGGER.debug(
+                "Entry %s awaits an import-logic repair check, but this poll didn't carry what "
+                "the check needs to judge by — re-checking on the next poll",
+                self.entry.entry_id,
+            )
+            return None
+        if not verdict:
             _LOGGER.debug(
                 "Entry %s is unaffected by the import-logic changes since revision %d; marking "
                 "revision %d without a rebuild",
