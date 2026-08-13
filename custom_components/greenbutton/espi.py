@@ -178,16 +178,31 @@ def parse_usage_feed(source: IO[bytes] | bytes) -> tuple[datetime | None, list[U
     raw_interval_blocks: list[_RawIntervalBlock] = []
     raw_summaries: list[_RawUsageSummary] = []
 
-    seen_first_entry = False
+    # How many <entry> elements we're currently inside. Atom entries don't nest, so this is
+    # really a boolean — but tracking it as a depth keeps the increment and decrement symmetric
+    # around the start/end pair, which is what makes the feed-level test below hold no matter
+    # where in the feed the element sits.
+    entry_depth = 0
 
-    for _event, elem in _safe_iterparse(stream, events=("end",)):
-        if elem.tag == _TAG_UPDATED and not seen_first_entry:
-            # Feed-level <updated> appears in document order before any <entry>, so this
-            # captures it without ambiguity with per-entry <updated> elements.
+    # Both start and end events, deliberately. `<updated>` appears BOTH at feed level and on every
+    # entry, and the two are told apart only by whether we're inside an entry at the time. With
+    # end events alone there is no way to know: a child's end fires before its parent's, so the
+    # first entry's own `<updated>` closed while the "have we reached an entry yet" flag was still
+    # unset and silently overwrote the feed's. For Burlington that meant `UsageResponse.updated`
+    # reported its UsagePoint's 2004-06-18 in place of the real feed timestamp, which reads as a
+    # dead feed in diagnostics and cost one bug reporter a day of investigation (issues/42).
+    # The extra start events cost one string compare each next to a parse that is already
+    # allocating a dataclass per reading.
+    for event, elem in _safe_iterparse(stream, events=("start", "end")):
+        if event == "start":
+            if elem.tag == _TAG_ENTRY:
+                entry_depth += 1
+            continue
+        if elem.tag == _TAG_UPDATED and entry_depth == 0:
             feed_updated = _parse_iso(elem.text)
             elem.clear()
         elif elem.tag == _TAG_ENTRY:
-            seen_first_entry = True
+            entry_depth -= 1
             _classify_entry(
                 elem,
                 raw_usage_points,

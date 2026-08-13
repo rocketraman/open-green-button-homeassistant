@@ -194,6 +194,71 @@ def test_per_interval_cost_parsed_when_present_else_none() -> None:
     assert readings[1].cost is None  # second reading has no <cost>
 
 
+# Burlington-shaped feed: a feed-level <updated> AND an <updated> on every entry, which is what
+# real custodians emit (the synthetic fixtures above carry only the feed-level one). Burlington's
+# first entry is its UsagePoint, stamped 2004-06-18 — a resource-creation date that has nothing to
+# do with the freshness of the feed.
+_ENTRY_UPDATED_FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <id>urn:uuid:f</id>
+  <updated>2026-08-10T16:43:47Z</updated>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="self" href="https://bh/UsagePoint/UP1"/>
+    <updated>2004-06-18T00:00:00Z</updated>
+    <content><espi:UsagePoint><espi:ServiceCategory><espi:kind>0</espi:kind></espi:ServiceCategory></espi:UsagePoint></content>
+  </entry>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="self" href="https://bh/UsagePoint/UP1/MeterReading/MR1"/>
+    <updated>2026-08-10T08:40:36Z</updated>
+    <content><espi:MeterReading/></content>
+  </entry>
+</feed>"""
+
+
+def test_feed_updated_is_not_clobbered_by_the_first_entrys_updated() -> None:
+    """The feed-level <updated> survives entries that carry their own (issues/42).
+
+    iterparse fires a child's end event BEFORE its parent's, so a "have we reached an entry yet"
+    flag set on the <entry> end is still unset while the first entry's own <updated> closes — and
+    that stale per-resource timestamp overwrote the feed's. Burlington's first entry is a
+    UsagePoint stamped 2004-06-18, so diagnostics reported a feed 22 years out of date on an
+    account that was fetching fine, and the report it produced spent its length on a parser that
+    wasn't the problem.
+    """
+    updated, usage_points = parse_usage_feed(_ENTRY_UPDATED_FEED)
+    assert updated == datetime(2026, 8, 10, 16, 43, 47, tzinfo=UTC)
+    # …and the entries still classify — the fix changes which events we iterate, so this guards
+    # against fixing the timestamp by breaking the parse.
+    assert [up.usage_point_id for up in usage_points] == ["UP1"]
+    assert [s.meter_reading_id for s in usage_points[0].series] == ["MR1"]
+
+
+def test_feed_updated_ignores_entry_updated_regardless_of_document_order() -> None:
+    """Atom doesn't constrain the order of a feed's child elements.
+
+    "Feed metadata comes first" is exactly the assumption that produced the bug above, so the test
+    is which element the timestamp belongs to, not where it sits.
+    """
+    trailing = _ENTRY_UPDATED_FEED.replace(b"  <updated>2026-08-10T16:43:47Z</updated>\n", b"")
+    trailing = trailing.replace(b"</feed>", b"  <updated>2026-08-10T16:43:47Z</updated>\n</feed>")
+    updated, _usage_points = parse_usage_feed(trailing)
+    assert updated == datetime(2026, 8, 10, 16, 43, 47, tzinfo=UTC)
+
+
+def test_feed_without_its_own_updated_reports_none() -> None:
+    """No feed-level <updated> ⇒ None, never an entry's.
+
+    "Unknown" is a usable diagnostic; a resource-creation date presented as the feed timestamp is
+    an actively misleading one.
+    """
+    no_feed_updated = _ENTRY_UPDATED_FEED.replace(
+        b"  <updated>2026-08-10T16:43:47Z</updated>\n", b""
+    )
+    updated, usage_points = parse_usage_feed(no_feed_updated)
+    assert updated is None
+    assert len(usage_points) == 1  # the entries are still parsed
+
+
 # A RetailCustomer (customer-data) feed in the ESPI customer namespace — mirrors the real shape
 # (CustomerAccount/accountId + ServiceLocation/mainAddress) used to distinguish two accounts at
 # the same utility. Structure taken from an anonymized Green Button "Download My Data" feed.
