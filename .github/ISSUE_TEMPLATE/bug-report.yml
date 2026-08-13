@@ -1,0 +1,69 @@
+name: Bug Report
+description: Something isn't working
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Please update to the latest version before filing.** This project has no tagged
+        releases yet — HACS tracks the `master` branch directly, so "latest" moves often and
+        a bug you're hitting may already be fixed.
+
+  - type: input
+    id: version
+    attributes:
+      label: Installed version
+      description: |
+        The commit id HACS shows for this integration, e.g. `c05ffc5`.
+
+        **Where to find it:** HACS → search for **Open Green Button** → open it. The installed
+        version is shown on that page (and in the ⋮ → **Redownload** dialog). Because there are
+        no releases, this is a commit id rather than a version number — please paste it as-is
+        rather than the `0.1.0` that Home Assistant's integration page shows, which never changes.
+      placeholder: c05ffc5
+    validations:
+      required: true
+
+  - type: dropdown
+    id: updated
+    attributes:
+      label: Did you re-check on the latest version?
+      options:
+        - "Yes — the version above is current and the problem is still there"
+        - "No"
+    validations:
+      required: true
+
+  - type: input
+    id: utility
+    attributes:
+      label: Utility
+      placeholder: Consumers Energy
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Settings → System → Logs, filtered to `custom_components.greenbutton`. Redact
+        account numbers and usage point ids if you'd rather not post them.
+      render: text
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: |
+        Diagnostics (Settings → Devices & Services → Open Green Button → ⋮ → **Download
+        Diagnostics**) are very helpful for data problems. Note that with debug logging on,
+        the download includes your raw utility feed — check it over before attaching.
