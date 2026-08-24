@@ -1753,3 +1753,108 @@ async def test_a_future_published_max_is_frozen_clamped_to_now(hass: HomeAssista
     assert frozen_max < far_future
     assert frozen_max <= datetime.now(UTC)
     assert entry.data[CONF_PENDING_PUBLISHED_MIN] == published_min.isoformat()
+
+
+async def test_deferred_fetch_probes_the_customer_feed_once(hass: HomeAssistant) -> None:
+    """A 202 on usage still probes the customer feed — once per deferral, not per retry.
+
+    The customer resource lives on the same custodian under the same /Batch/ tree but is far
+    smaller, so its status answers what the usage endpoint cannot: whether this custodian defers
+    everything under /Batch/ or only the heavyweight usage export. That question decides how a
+    prepared batch can be collected at all (issues/10). It had never been asked, because labeling
+    only ever ran after a successful usage fetch — and a deferring entry never has one.
+    """
+    from custom_components.greenbutton.api import OpenGbDataPendingError
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OpenGbDataPendingError("data pending (202)"),
+    )
+    api.fetch_customer = AsyncMock(  # type: ignore[method-assign]
+        return_value=CustomerResponse(
+            customer=CustomerInfo(
+                account_id="100001-0000001",
+                service_address="123 EXAMPLE ST",
+                customer_name=None,
+            ),
+            new_credentials=None,
+        )
+    )
+
+    entry = _fresh_entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+        api.fetch_customer.assert_awaited_once()
+
+        # The retry replays the frozen window, so it is not a fresh deferral — and the label is
+        # resolved by now anyway. Either guard alone should stop a second probe; both must.
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+
+    api.fetch_customer.assert_awaited_once()
+    coordinator.cancel_pending_retry()
+
+
+async def test_a_deferred_customer_feed_is_reported_and_not_recorded(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 202 from the customer feed says the custodian's whole Batch tree is asynchronous.
+
+    Distinct from an ordinary transient failure, so it gets its own INFO line rather than a DEBUG
+    shrug — it is a fact about the platform, not a hiccup. No label is stored, so the probe runs
+    again rather than being written off as "this utility has no customer data".
+    """
+    from custom_components.greenbutton.api import OpenGbDataPendingError
+    from custom_components.greenbutton.const import CONF_CUSTOMER_LABEL as LABEL_KEY
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OpenGbDataPendingError("usage pending (202)"),
+    )
+    api.fetch_customer = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OpenGbDataPendingError("customer pending (202)"),
+    )
+
+    entry = _fresh_entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        caplog.at_level(logging.INFO, logger="custom_components.greenbutton"),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator._async_update_data()
+
+    api.fetch_customer.assert_awaited_once()
+    assert any(
+        "customer feed is deferred as well" in r.getMessage() and r.levelno == logging.INFO
+        for r in caplog.records
+    )
+    # Not written off — an unanswered probe must stay unanswered, not become "no customer data".
+    assert LABEL_KEY not in entry.data
+
+    # And the retry does NOT probe again. This is the case that isolates the once-per-deferral
+    # guard: no label was stored, so the "already resolved" early return cannot be what stops it.
+    # Without this, a five-minute retry loop would double every custodian's request volume for the
+    # whole 24 hours it runs.
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator._async_update_data()
+
+    api.fetch_customer.assert_awaited_once()
+    coordinator.cancel_pending_retry()

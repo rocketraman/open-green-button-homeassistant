@@ -323,6 +323,21 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             # Come back in minutes, not at the utility's daily cadence — the batch usually lands
             # within one interval. Ordered AFTER the window freeze so the retry replays it.
             self._schedule_pending_retry()
+            if first_deferral:
+                # Probe a DIFFERENT batch resource on the same custodian while this one is
+                # deferred. The customer feed lives at .../Batch/RetailCustomer/{sub} — same
+                # platform, same auth, much smaller payload — so its status answers a question the
+                # usage endpoint can't: is this custodian's WHOLE Batch tree asynchronous, or only
+                # the big usage export? A 200 here means small resources are served synchronously,
+                # which is what deciding how to collect a prepared batch turns on. Until now this
+                # was never exercised for a deferring entry: labeling runs after a successful
+                # usage fetch, and for these entries there has never been one.
+                #
+                # First 202 of a window only — not on every five-minute retry — so this costs one
+                # extra request per deferral episode, and it is already guarded to stop entirely
+                # once a label (or a permanent "none available") is recorded. Nothing it does can
+                # propagate: the call swallows every exception internally.
+                await self._async_ensure_customer_label()
             raise UpdateFailed(str(err)) from err
         except OpenGbApiError as err:
             # Crucial for one-time refresh tokens (savagedata/OpenIddict): the proxy may have
@@ -431,7 +446,9 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         Best-effort by design:
           - Runs only until a label is stored (``CONF_CUSTOMER_LABEL`` present — even as ``""``
             when the utility exposes no customer data — so we don't refetch every poll).
-          - Any fetch failure is swallowed (the usage refresh has already succeeded); rotated
+          - Also invoked from the deferred-fetch (HTTP 202) path, where it doubles as a probe of
+            whether the custodian defers every Batch resource or only the usage export.
+          - Any fetch failure is swallowed (labeling is never what a refresh turns on); rotated
             credentials from the attempt are still persisted, and we retry on the next poll —
             EXCEPT a permanent failure (``OpenGbPermanentError``: the proxy propagated the
             utility's 4xx — no customer resource advertised, or one our scope may not access such
@@ -459,10 +476,26 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             )
             self._store_customer_label(None, account_id=None, address=None)
             return
+        except OpenGbDataPendingError as err:
+            # The customer feed is deferred TOO — so this custodian defers its whole Batch tree,
+            # not just the heavyweight usage export. Called out separately from the transient
+            # branch below, and at INFO rather than DEBUG, because it is a fact about the platform
+            # rather than a hiccup: it decides whether a prepared batch can be collected by asking
+            # for a smaller resource, or whether nothing under /Batch/ answers synchronously and
+            # collection has to work another way entirely. Left unstored so it retries.
+            self._persist_rotated_credentials(err.new_credentials)
+            _LOGGER.info(
+                "Entry %s: the customer feed is deferred as well (HTTP 202) — this custodian "
+                "defers its whole Batch resource tree, not just the usage export: %s",
+                self.entry.entry_id,
+                err,
+            )
+            return
         except OpenGbApiError as err:
-            # Transient (auth-expired / 5xx / etc.) — the usage fetch already succeeded this poll,
-            # so a customer-fetch error is non-fatal here. Persist any rotated credentials so we
-            # don't burn a one-time refresh token, then retry the label on the next poll.
+            # Transient (auth-expired / 5xx / etc.) — a customer-fetch error is non-fatal: it is
+            # layered on a usage poll that either already succeeded or has already failed on its
+            # own terms. Persist any rotated credentials so we don't burn a one-time refresh
+            # token, then retry the label on the next poll.
             self._persist_rotated_credentials(err.new_credentials)
             _LOGGER.debug(
                 "Customer-data fetch failed for entry %s (will retry): %s",
@@ -483,6 +516,14 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
 
         self._persist_rotated_credentials(result.new_credentials)
         customer = result.customer
+        # Once per entry. Also the positive half of the probe described at the deferred-fetch call
+        # site: reaching here at all means the customer resource answered synchronously, which for
+        # an entry whose usage fetch is stuck on 202 is the informative outcome.
+        _LOGGER.info(
+            "Entry %s: customer feed answered (label=%s)",
+            self.entry.entry_id,
+            customer.label if customer else "<none advertised>",
+        )
         self._store_customer_label(
             customer.label if customer else None,
             account_id=customer.account_id if customer else None,
