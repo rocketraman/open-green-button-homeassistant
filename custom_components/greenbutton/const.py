@@ -104,6 +104,25 @@ CONF_POLL_INTERVAL_SECONDS = "poll_interval_seconds"
 # so no separate cost cursor is needed.
 CONF_LAST_FETCHED_AT = "last_fetched_at"
 
+# Per-meter incremental cursors: ``{usage_point_id: UTC ISO 8601 newest reading start}``.
+#
+# One UsagePoint is one physical meter, and a subscription can carry several — commonly a
+# different commodity each (electricity daily, gas or water often monthly or bi-monthly, on
+# separate meter-reading routes). Nothing in ESPI makes them publish on a shared schedule, so a
+# single frontier for the whole entry is driven by whichever meter runs furthest ahead and says
+# nothing about where the others actually are.
+#
+# The poll window is scoped to the OLDEST of these (see [GreenButtonCoordinator._published_min]):
+# the window has to reach back far enough for the most-behind meter, or a fast meter would drag
+# `published-min` past a slow one's not-yet-collected data.
+#
+# CONF_LAST_FETCHED_AT is still maintained alongside this as the entry-wide frontier — it answers
+# "has this entry ever imported a reading?" and drives the startup poll-due check, neither of which
+# is a per-meter question. An entry written before this key existed has no map; the fallback in
+# [_published_min] reads the scalar until the next successful fetch seeds the map, so no migration
+# step is needed.
+CONF_USAGE_POINT_CURSORS = "usage_point_cursors"
+
 # The exact `published-min`/`published-max` (UTC ISO 8601) of a fetch the utility answered with
 # HTTP 202 — "I'm preparing that dataset out of band". Set when a poll hits 202, replayed verbatim
 # by every retry, cleared on the first success.

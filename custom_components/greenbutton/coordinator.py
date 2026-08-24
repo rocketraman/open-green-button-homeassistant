@@ -54,6 +54,7 @@ from .const import (
     CONF_PENDING_SINCE,
     CONF_POLL_INTERVAL_SECONDS,
     CONF_PROXY_TOKEN,
+    CONF_USAGE_POINT_CURSORS,
     CONF_UTILITY_NAME,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
@@ -98,6 +99,23 @@ def _newest_reading_start(response: UsageResponse) -> datetime | None:
             for reading in series.readings:
                 if newest is None or reading.start > newest:
                     newest = reading.start
+    return newest
+
+
+def _newest_reading_start_by_usage_point(response: UsageResponse) -> dict[str, datetime]:
+    """Return the newest reading ``start`` per UsagePoint, skipping ones that carried none.
+
+    The per-meter counterpart of [_newest_reading_start]. A poll routinely returns data for some
+    meters and not others (they publish on their own cadences), and a meter absent from this
+    mapping must keep the cursor it already had rather than be reset or dropped.
+    """
+    newest: dict[str, datetime] = {}
+    for up in response.usage_points:
+        for series in up.series:
+            for reading in series.readings:
+                current = newest.get(up.usage_point_id)
+                if current is None or reading.start > current:
+                    newest[up.usage_point_id] = reading.start
     return newest
 
 
@@ -318,11 +336,69 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             raise UpdateFailed(f"network error talking to the proxy: {err}") from err
 
         self._persist_rotated_credentials(response.new_credentials)
+        self._log_window_compliance(response, published_min, published_max)
         # The deferred batch (if there was one) has landed — stop replaying its window and stand
         # the fast retry down, so the next poll goes back to asking for whatever is new.
         self._clear_pending_window()
         self.cancel_pending_retry()
         return response
+
+    def _log_window_compliance(
+        self,
+        response: UsageResponse,
+        published_min: datetime,
+        published_max: datetime,
+    ) -> None:
+        """Record what each meter returned against what we asked for.
+
+        This exists to settle an open question about asynchronous-batch custodians: whether the
+        per-UsagePoint batch URL honours `published-min`/`published-max` at all. Every notified
+        UsagePoint URL we have observed was bare (1622 of 1622), but that is what the custodian
+        chose to advertise, not what the endpoint accepts — the same custodians do parameterize
+        the subscription-level URLs they notify. So we ask WITH the filter and check the answer
+        here rather than assuming either way.
+
+        A single poll cannot settle it, and the reason is worth stating: `published-min` filters
+        by PUBLICATION date while readings are stamped with their own interval START. One
+        publication event legitimately carries years of readings — that is what a backfill is — so
+        "asked for a day, got two years" is not by itself proof the filter was ignored.
+
+        What IS diagnostic is the pattern across polls, which is why every field needed for the
+        comparison goes on one line per meter: an ignored filter shows up as successive polls with
+        ADVANCING windows returning identical counts and identical reading spans. That is exactly
+        the signature that caught Burlington's `updated-min` (a 4-day and a 2-year window both
+        returning 22,008 readings), and it is visible in an ordinary user's debug log without
+        anyone running a credentialed probe.
+        """
+        if not _LOGGER.isEnabledFor(logging.INFO):
+            return
+        for up in response.usage_points:
+            starts = [r.start for series in up.series for r in series.readings]
+            if not starts:
+                _LOGGER.info(
+                    "Window check entry=%s usage_point=%s requested=[%s, %s] readings=0",
+                    self.entry.entry_id,
+                    up.usage_point_id,
+                    published_min.isoformat(),
+                    published_max.isoformat(),
+                )
+                continue
+            earliest, latest = min(starts), max(starts)
+            before_window = sum(1 for start in starts if start < published_min)
+            _LOGGER.info(
+                "Window check entry=%s usage_point=%s requested=[%s, %s] readings=%d "
+                "span=[%s, %s] span_days=%d before_published_min=%d full_history=%s",
+                self.entry.entry_id,
+                up.usage_point_id,
+                published_min.isoformat(),
+                published_max.isoformat(),
+                len(starts),
+                earliest.isoformat(),
+                latest.isoformat(),
+                (latest - earliest).days,
+                before_window,
+                self._force_full_history,
+            )
 
     def _persist_rotated_credentials(self, new_credentials: NewCredentials | None) -> None:
         """Write rotated credentials into the config entry, if the proxy returned any.
@@ -441,11 +517,16 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
     def _advance_cursor(self, response: UsageResponse) -> None:
         """Persist the incremental cursor as the newest reading start we've imported.
 
-        The cursor only moves *forward*, and only when the response actually carried
-        readings. On an empty response it is left untouched — critical for a utility that
-        publishes on a multi-day lag: anchoring the cursor to the real data frontier (rather
-        than wall-clock ``now``) stops `published-min` from marching past the not-yet-
-        published data and starving every later poll. See [_published_min].
+        Writes BOTH the entry-wide frontier (`CONF_LAST_FETCHED_AT`) and the per-meter cursors
+        (`CONF_USAGE_POINT_CURSORS`). The entry-wide one answers "has this entry ever imported a
+        reading?" and drives the startup poll-due check; the per-meter map is what scopes the poll
+        window, because meters publish independently.
+
+        Cursors only move *forward*, and only when the response actually carried readings. On an
+        empty response nothing is touched — critical for a utility that publishes on a multi-day
+        lag: anchoring to the real data frontier (rather than wall-clock ``now``) stops
+        `published-min` from marching past the not-yet-published data and starving every later
+        poll. See [_published_min].
         """
         newest = _newest_reading_start(response)
         if newest is None:
@@ -454,11 +535,30 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         prior = _parse_iso_or_none(prior_raw)
         cursor = newest if prior is None else max(prior, newest)
         cursor_iso = cursor.isoformat()
-        if cursor_iso == prior_raw:
+
+        # Per-meter cursors, MERGED not replaced: a meter absent from this response keeps the
+        # cursor it already had. Meters publish on their own cadences (a monthly gas meter is
+        # silent through most of an electric meter's polls), so treating absence as "no data ever"
+        # would reset a slow meter's frontier and re-fetch its whole history on the next poll.
+        # Forward-only per meter, for the same reason the entry-wide cursor is.
+        prior_cursors = self._usage_point_cursors()
+        merged = dict(prior_cursors)
+        for up_id, up_newest in _newest_reading_start_by_usage_point(response).items():
+            known = prior_cursors.get(up_id)
+            if known is None or up_newest > known:
+                merged[up_id] = up_newest
+        merged_iso = {up_id: value.isoformat() for up_id, value in merged.items()}
+
+        stored_cursors = self.entry.data.get(CONF_USAGE_POINT_CURSORS)
+        if cursor_iso == prior_raw and merged_iso == stored_cursors:
             return  # No forward movement — avoid a no-op entry write (and its churn).
         self.hass.config_entries.async_update_entry(
             self.entry,
-            data={**self.entry.data, CONF_LAST_FETCHED_AT: cursor_iso},
+            data={
+                **self.entry.data,
+                CONF_LAST_FETCHED_AT: cursor_iso,
+                CONF_USAGE_POINT_CURSORS: merged_iso,
+            },
         )
 
     def _reconcile_data_availability(self) -> None:
@@ -1043,10 +1143,14 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         ask for the slice since the usage frontier, minus a small overlap that absorbs clock skew
         and any late-arriving corrections.
 
-        The usage frontier (`CONF_LAST_FETCHED_AT`) is the newest *reading* we've imported, NOT
-        wall-clock (see [_advance_cursor]). Anchoring to the data frontier is load-bearing:
-        utilities publish on a multi-day lag, so a wall-clock cursor would push `published-min`
-        past not-yet-published data and every later poll would come back empty.
+        A cursor is the newest *reading* we've imported for one meter, NOT wall-clock (see
+        [_advance_cursor]). Anchoring to the data frontier is load-bearing: utilities publish on a
+        multi-day lag, so a wall-clock cursor would push `published-min` past not-yet-published
+        data and every later poll would come back empty.
+
+        Cursors are per UsagePoint — per physical meter — and the window is scoped to the oldest
+        of them, since one request has to serve every meter on the subscription. See
+        CONF_USAGE_POINT_CURSORS for why a shared frontier isn't safe.
 
         A single tight window suffices for cost too: `published-min` filters by *publication* date,
         and a utility publishes a bill (per-interval `<cost>` or a monthly UsageSummary) with a
@@ -1056,6 +1160,18 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         """
         if self._force_full_history:
             return now - self._initial_lookback()
+
+        # The OLDEST per-meter cursor, not the newest: one window has to serve every meter on the
+        # subscription, and a meter that publishes monthly sits far behind one that publishes
+        # daily. Scoping to the newest would let the fast meter drag `published-min` past data the
+        # slow one has not delivered yet.
+        cursors = self._usage_point_cursors()
+        if cursors:
+            return min(cursors.values()) - LAST_FETCHED_OVERLAP
+
+        # No per-meter map yet: either a brand-new entry (fall through to full history) or one
+        # written before CONF_USAGE_POINT_CURSORS existed, whose entry-wide frontier still stands
+        # in until the next successful fetch seeds the map.
         raw = self.entry.data.get(CONF_LAST_FETCHED_AT)
         if raw is None:
             return now - self._initial_lookback()
@@ -1071,6 +1187,32 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             )
             return now - self._initial_lookback()
         return usage_frontier - LAST_FETCHED_OVERLAP
+
+    def _usage_point_cursors(self) -> dict[str, datetime]:
+        """Per-meter cursors from entry data, dropping any entry that won't parse.
+
+        Corrupt values are skipped rather than fatal: losing one meter's cursor costs a wider
+        window for that meter (the import is idempotent, so re-fetched readings are harmless),
+        whereas raising would take the whole entry down over one bad string. An empty result is
+        indistinguishable from "never written", which is exactly the fallback [_published_min]
+        wants for a pre-upgrade entry.
+        """
+        stored = self.entry.data.get(CONF_USAGE_POINT_CURSORS)
+        if not isinstance(stored, dict):
+            return {}
+        cursors: dict[str, datetime] = {}
+        for up_id, raw in stored.items():
+            parsed = _parse_iso_or_none(raw)
+            if parsed is None:
+                _LOGGER.warning(
+                    "Entry %s: cursor for usage point %s is unparseable (%r); widening its window",
+                    self.entry.entry_id,
+                    up_id,
+                    raw,
+                )
+                continue
+            cursors[up_id] = parsed
+        return cursors
 
     def _initial_lookback(self) -> timedelta:
         """How far back to backfill on the first fetch.

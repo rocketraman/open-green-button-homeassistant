@@ -43,6 +43,7 @@ from custom_components.greenbutton.const import (
     CONF_PENDING_PUBLISHED_MIN,
     CONF_POLL_INTERVAL_SECONDS,
     CONF_PROXY_TOKEN,
+    CONF_USAGE_POINT_CURSORS,
     CONF_UTILITY_ID,
     CONF_UTILITY_NAME,
     DEFAULT_SCAN_INTERVAL,
@@ -103,6 +104,28 @@ def _response_with_readings(*starts: datetime, cost: float | None = None) -> Usa
     )
     up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[series])
     return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+def _response_with_meters(meters: dict[str, list[datetime]]) -> UsageResponse:
+    """A UsageResponse carrying one FORWARD series per named UsagePoint (one meter each)."""
+    usage_points = [
+        UsagePoint(
+            usage_point_id=up_id,
+            service_kind="electricity",
+            series=[
+                MeterReadingSeries(
+                    meter_reading_id=f"mr-{up_id}",
+                    reading_type=_reading_type(),
+                    readings=[
+                        UsageReading(start=s, duration_seconds=3600, value=1000.0, cost=None)
+                        for s in starts
+                    ],
+                )
+            ],
+        )
+        for up_id, starts in meters.items()
+    ]
+    return UsageResponse(updated=None, usage_points=usage_points, new_credentials=None)
 
 
 async def test_first_refresh_calls_api_and_imports_stats(hass: HomeAssistant) -> None:
@@ -1499,3 +1522,213 @@ async def test_import_migration_deferred_until_hass_started(hass: HomeAssistant)
         clear_mock.assert_awaited_once_with(hass, entry.entry_id)
         assert api.fetch_usage.await_count == 2
         assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
+async def test_advance_cursor_writes_one_cursor_per_meter(hass: HomeAssistant) -> None:
+    """Each UsagePoint gets its own cursor, anchored to that meter's own newest reading.
+
+    A subscription can carry several meters — commonly different commodities on entirely
+    different reading cadences — so one frontier for the whole entry only ever describes
+    whichever meter runs furthest ahead.
+    """
+    fast = datetime(2026, 6, 3, 12, tzinfo=UTC)
+    slow = datetime(2026, 4, 1, 0, tzinfo=UTC)
+    api = _api_returning(_response_with_meters({"electric": [fast], "gas": [slow]}))
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    assert entry.data[CONF_USAGE_POINT_CURSORS] == {
+        "electric": fast.isoformat(),
+        "gas": slow.isoformat(),
+    }
+    # The entry-wide frontier still tracks the newest across meters: it answers "has this entry
+    # ever imported anything", which is not a per-meter question.
+    assert entry.data[CONF_LAST_FETCHED_AT] == fast.isoformat()
+
+
+async def test_window_scopes_to_the_furthest_behind_meter(hass: HomeAssistant) -> None:
+    """`published_min` follows the OLDEST cursor, not the newest.
+
+    One request serves every meter on the subscription. Scoping to the newest would let a daily
+    electric meter drag the window past a monthly gas meter's not-yet-published data, and the
+    gas readings would never be asked for again.
+    """
+    fast = datetime(2026, 6, 3, 12, tzinfo=UTC)
+    slow = datetime(2026, 4, 1, 0, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_LAST_FETCHED_AT: fast.isoformat(),
+            CONF_USAGE_POINT_CURSORS: {
+                "electric": fast.isoformat(),
+                "gas": slow.isoformat(),
+            },
+        },
+    )
+    api = _api_returning(_empty_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    assert api.fetch_usage.await_args.kwargs["published_min"] == slow - LAST_FETCHED_OVERLAP
+
+
+async def test_a_silent_meter_keeps_its_cursor(hass: HomeAssistant) -> None:
+    """A meter absent from a response keeps the cursor it had — absence is not "no data ever".
+
+    A monthly gas meter is silent through most of an electric meter's polls. Dropping or
+    resetting its cursor would re-fetch its entire history on the very next poll.
+    """
+    electric_first = datetime(2026, 6, 1, tzinfo=UTC)
+    gas = datetime(2026, 4, 1, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_USAGE_POINT_CURSORS: {
+                "electric": electric_first.isoformat(),
+                "gas": gas.isoformat(),
+            },
+        },
+    )
+
+    electric_next = datetime(2026, 6, 2, tzinfo=UTC)
+    api = _api_returning(_response_with_meters({"electric": [electric_next]}))
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    assert entry.data[CONF_USAGE_POINT_CURSORS] == {
+        "electric": electric_next.isoformat(),
+        "gas": gas.isoformat(),
+    }
+
+
+async def test_meter_cursors_never_retreat(hass: HomeAssistant) -> None:
+    """A response carrying older readings for a meter leaves that meter's cursor alone."""
+    ahead = datetime(2026, 6, 10, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={**entry.data, CONF_USAGE_POINT_CURSORS: {"electric": ahead.isoformat()}},
+    )
+
+    api = _api_returning(_response_with_meters({"electric": [datetime(2026, 5, 1, tzinfo=UTC)]}))
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    assert entry.data[CONF_USAGE_POINT_CURSORS] == {"electric": ahead.isoformat()}
+
+
+async def test_entry_written_before_per_meter_cursors_uses_the_old_frontier(
+    hass: HomeAssistant,
+) -> None:
+    """An entry with only the entry-wide frontier keeps polling incrementally.
+
+    The scalar stands in until the next successful fetch seeds the per-meter map, so upgrading
+    costs no migration step and — importantly — no accidental full-history refetch.
+    """
+    frontier = datetime(2026, 6, 1, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={**entry.data, CONF_LAST_FETCHED_AT: frontier.isoformat()},
+    )
+    api = _api_returning(_empty_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    assert api.fetch_usage.await_args.kwargs["published_min"] == frontier - LAST_FETCHED_OVERLAP
+
+
+async def test_unparseable_meter_cursor_is_skipped_not_fatal(hass: HomeAssistant) -> None:
+    """One corrupt cursor widens that meter's window instead of taking the entry down.
+
+    Re-fetched readings are harmless (the import is idempotent on (statistic_id, hour)), so
+    skipping is strictly cheaper than failing the refresh.
+    """
+    good = datetime(2026, 6, 1, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_USAGE_POINT_CURSORS: {"electric": good.isoformat(), "gas": "not-a-timestamp"},
+        },
+    )
+    api = _api_returning(_empty_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    # The surviving cursor still scopes the window — the corrupt one is simply ignored.
+    assert api.fetch_usage.await_args.kwargs["published_min"] == good - LAST_FETCHED_OVERLAP
+
+
+async def test_window_compliance_is_logged_per_meter(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every field needed to tell an honoured date filter from an ignored one, per meter.
+
+    Whether an async-batch custodian's per-UsagePoint URL honours `published-min` is unsettled,
+    and one poll cannot settle it: `published-min` filters by PUBLICATION date while readings
+    carry their own interval start, so a single publication legitimately holds years of data. The
+    signature of an ignored filter is only visible across polls — advancing windows returning
+    identical counts and spans — so each poll must record the whole comparison.
+    """
+    api = _api_returning(
+        _response_with_meters(
+            {
+                "electric": [datetime(2026, 6, 1, tzinfo=UTC), datetime(2026, 6, 2, tzinfo=UTC)],
+                "gas": [datetime(2024, 1, 1, tzinfo=UTC)],
+            }
+        )
+    )
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        caplog.at_level(logging.INFO, logger="custom_components.greenbutton"),
+    ):
+        await coordinator._async_update_data()
+
+    lines = [r.getMessage() for r in caplog.records if "Window check" in r.getMessage()]
+    assert len(lines) == 2
+    electric = next(line for line in lines if "usage_point=electric" in line)
+    assert "readings=2" in electric
+    assert "span=[2026-06-01T00:00:00+00:00, 2026-06-02T00:00:00+00:00]" in electric
+    # The gas meter's lone reading predates a 2-year initial window, which is exactly the kind of
+    # divergence the comparison exists to surface.
+    gas = next(line for line in lines if "usage_point=gas" in line)
+    assert "readings=1" in gas
+    assert "before_published_min=1" in gas
