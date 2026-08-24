@@ -340,21 +340,31 @@ async def test_data_pending_freezes_the_window_and_retries_replay_it(
 
     first = api.fetch_usage.await_args.kwargs
     assert entry.data[CONF_PENDING_PUBLISHED_MIN] == first["published_min"].isoformat()
-    assert entry.data[CONF_PENDING_PUBLISHED_MAX] == first["published_max"].isoformat()
 
-    # A later retry — wall-clock has moved on, so an unfrozen window would differ.
-    with (
-        patch(
-            "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
-        ),
-        pytest.raises(UpdateFailed),
-    ):
-        await coordinator._async_update_data()
+    # `published_max` is frozen CLAMPED TO NOW, not as we sent it. We send `now +
+    # PUBLISHED_MAX_LOOKAHEAD`; the proxy clamps a future `published-max` down to its own `now`
+    # before it reaches the custodian, so freezing the raw future value lets that clamp rewrite it
+    # to a fresh `now` on every retry — pinning `published-min` while the custodian still sees a
+    # brand-new URL every time. A frozen value already in the past makes the clamp a no-op.
+    frozen_max = datetime.fromisoformat(entry.data[CONF_PENDING_PUBLISHED_MAX])
+    assert frozen_max < first["published_max"]
+    assert frozen_max <= datetime.now(UTC)
 
-    second = api.fetch_usage.await_args.kwargs
-    assert second["published_min"] == first["published_min"]
-    assert second["published_max"] == first["published_max"]
+    # Two more retries — wall-clock moves on, so an unfrozen window would differ each time.
+    for _ in range(2):
+        with (
+            patch(
+                "custom_components.greenbutton.coordinator.import_usage_statistics",
+                new=AsyncMock(),
+            ),
+            pytest.raises(UpdateFailed),
+        ):
+            await coordinator._async_update_data()
+
+        retry = api.fetch_usage.await_args.kwargs
+        assert retry["published_min"] == first["published_min"]
+        # Identical AND not in the future: the value the proxy forwards is the value we sent.
+        assert retry["published_max"] == frozen_max
 
 
 async def test_data_pending_logs_the_custodian_detail(

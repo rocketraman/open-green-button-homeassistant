@@ -951,18 +951,34 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
     def _remember_pending_window(self, published_min: datetime, published_max: datetime) -> None:
         """Freeze the window a 202 was returned for, so every retry re-asks identically.
 
-        Also stamps when the wait started, the first time. Both are no-ops once frozen: the stamp
-        must NOT restart on every retry (it's what decides when to stop waiting), and rewriting
-        unchanged values would churn the config entry every few minutes.
+        `published_max` is frozen CLAMPED TO NOW, not as we sent it. We send `now +
+        PUBLISHED_MAX_LOOKAHEAD`, and the proxy clamps any future `published-max` down to its own
+        `now` before it reaches the custodian (see UsageClient in the server repo). Freezing the
+        raw future value means the clamp rewrites it to a fresh `now` on every single retry — the
+        window looks frozen from here while the custodian sees a brand-new URL each time, which
+        for an asynchronous-batch custodian enqueues a new job instead of collecting the finished
+        one. That is the whole failure this freeze exists to prevent. Observed live: entries whose
+        `published-min` was pinned to one value still produced ~175 distinct `published-max`
+        values over ~175 polls. A frozen value that is already in the past makes the clamp a
+        no-op, so what we send is what the custodian sees.
+
+        The very first replay still differs slightly from the original request (the custodian saw
+        the proxy's clamp instant; we freeze ours, a round-trip later). Every replay after that is
+        identical, which is what collecting a prepared batch needs.
+
+        Also stamps when the wait started, the first time. All of it is a no-op once frozen: the
+        stamp must NOT restart on every retry (it's what decides when to stop waiting), and
+        rewriting unchanged values would churn the config entry every few minutes.
         """
-        if self._pending_window() == (published_min, published_max):
+        effective_max = min(published_max, datetime.now(UTC))
+        if self._pending_window() == (published_min, effective_max):
             return
         self.hass.config_entries.async_update_entry(
             self.entry,
             data={
                 **self.entry.data,
                 CONF_PENDING_PUBLISHED_MIN: published_min.isoformat(),
-                CONF_PENDING_PUBLISHED_MAX: published_max.isoformat(),
+                CONF_PENDING_PUBLISHED_MAX: effective_max.isoformat(),
                 CONF_PENDING_SINCE: datetime.now(UTC).isoformat(),
             },
         )
