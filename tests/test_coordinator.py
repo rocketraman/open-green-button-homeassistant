@@ -151,14 +151,13 @@ async def test_first_refresh_calls_api_and_imports_stats(hass: HomeAssistant) ->
     assert call.kwargs["encrypted_refresh_blob"] == "original_blob"
     assert call.kwargs["proxy_token"] == "original_token"  # noqa: S105
 
-    from custom_components.greenbutton.const import (
-        INITIAL_FETCH_LOOKBACK,
-        PUBLISHED_MAX_LOOKAHEAD,
-    )
+    from custom_components.greenbutton.const import INITIAL_FETCH_LOOKBACK
 
     now = datetime.now(UTC)
     expected_min = now - INITIAL_FETCH_LOOKBACK
-    expected_max = now + PUBLISHED_MAX_LOOKAHEAD
+    # `published_max` is plain `now` — no forward buffer. A future bound never survived the proxy's
+    # clamp anyway, and savagedata rejects one outright.
+    expected_max = now
     # Tolerate the few seconds of clock drift between the coordinator and the assertion.
     assert abs((call.kwargs["published_min"] - expected_min).total_seconds()) < 60
     assert abs((call.kwargs["published_max"] - expected_max).total_seconds()) < 60
@@ -364,13 +363,12 @@ async def test_data_pending_freezes_the_window_and_retries_replay_it(
     first = api.fetch_usage.await_args.kwargs
     assert entry.data[CONF_PENDING_PUBLISHED_MIN] == first["published_min"].isoformat()
 
-    # `published_max` is frozen CLAMPED TO NOW, not as we sent it. We send `now +
-    # PUBLISHED_MAX_LOOKAHEAD`; the proxy clamps a future `published-max` down to its own `now`
-    # before it reaches the custodian, so freezing the raw future value lets that clamp rewrite it
-    # to a fresh `now` on every retry — pinning `published-min` while the custodian still sees a
-    # brand-new URL every time. A frozen value already in the past makes the clamp a no-op.
+    # What we sent is what gets frozen, and it is never in the future — the proxy clamps a future
+    # `published-max` down to its own `now`, so a forward-dated bound would be rewritten to a fresh
+    # instant on every retry, pinning `published-min` while the custodian still sees a brand-new
+    # URL each time. See test_a_future_published_max_is_frozen_clamped_to_now.
     frozen_max = datetime.fromisoformat(entry.data[CONF_PENDING_PUBLISHED_MAX])
-    assert frozen_max < first["published_max"]
+    assert frozen_max == first["published_max"]
     assert frozen_max <= datetime.now(UTC)
 
     # Two more retries — wall-clock moves on, so an unfrozen window would differ each time.
@@ -1732,3 +1730,26 @@ async def test_window_compliance_is_logged_per_meter(
     gas = next(line for line in lines if "usage_point=gas" in line)
     assert "readings=1" in gas
     assert "before_published_min=1" in gas
+
+
+async def test_a_future_published_max_is_frozen_clamped_to_now(hass: HomeAssistant) -> None:
+    """A forward-dated `published_max` is stored clamped, never as given.
+
+    The client no longer sends a future bound, so this is defence in depth — and a regression
+    guard. The proxy clamps a future `published-max` down to its own `now` before the request
+    reaches the custodian, so freezing one would have the clamp rewrite it to a fresh instant on
+    every retry: the window looks frozen here while the custodian sees a brand-new URL each time,
+    which is exactly what a deferring custodian answers with another 202. Re-introducing any
+    forward buffer must not silently defeat the freeze again.
+    """
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, _api_returning(_empty_response()), entry)
+
+    published_min = datetime(2026, 6, 1, tzinfo=UTC)
+    far_future = datetime.now(UTC) + timedelta(days=1)
+    coordinator._remember_pending_window(published_min, far_future)
+
+    frozen_max = datetime.fromisoformat(entry.data[CONF_PENDING_PUBLISHED_MAX])
+    assert frozen_max < far_future
+    assert frozen_max <= datetime.now(UTC)
+    assert entry.data[CONF_PENDING_PUBLISHED_MIN] == published_min.isoformat()

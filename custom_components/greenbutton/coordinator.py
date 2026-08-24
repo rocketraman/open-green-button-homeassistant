@@ -64,7 +64,6 @@ from .const import (
     LAST_FETCHED_OVERLAP,
     PENDING_ESCALATE_AFTER,
     PENDING_RETRY_INTERVAL,
-    PUBLISHED_MAX_LOOKAHEAD,
     SERVICE_REBUILD_STATISTICS,
 )
 from .statistics import (
@@ -1038,7 +1037,7 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
                     pending[1].isoformat(),
                 )
                 return pending
-        return self._published_min(now), now + PUBLISHED_MAX_LOOKAHEAD
+        return self._published_min(now), now
 
     def _pending_window(self) -> tuple[datetime, datetime] | None:
         """The frozen window of an outstanding 202, or None. Unparseable values are discarded."""
@@ -1051,10 +1050,9 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
     def _remember_pending_window(self, published_min: datetime, published_max: datetime) -> None:
         """Freeze the window a 202 was returned for, so every retry re-asks identically.
 
-        `published_max` is frozen CLAMPED TO NOW, not as we sent it. We send `now +
-        PUBLISHED_MAX_LOOKAHEAD`, and the proxy clamps any future `published-max` down to its own
-        `now` before it reaches the custodian (see UsageClient in the server repo). Freezing the
-        raw future value means the clamp rewrites it to a fresh `now` on every single retry — the
+        `published_max` is frozen CLAMPED TO NOW. The proxy clamps any future `published-max` down
+        to its own `now` before it reaches the custodian (see UsageClient in the server repo), so a
+        frozen bound in the future gets rewritten to a fresh instant on every single retry — the
         window looks frozen from here while the custodian sees a brand-new URL each time, which
         for an asynchronous-batch custodian enqueues a new job instead of collecting the finished
         one. That is the whole failure this freeze exists to prevent. Observed live: entries whose

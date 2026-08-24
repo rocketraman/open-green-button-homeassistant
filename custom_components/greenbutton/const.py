@@ -27,10 +27,14 @@ LAST_FETCHED_OVERLAP = timedelta(days=1)
 # the backfill window isn't configured in two places.
 INITIAL_FETCH_LOOKBACK = timedelta(days=2 * 365)
 
-# Small forward buffer added to `published_max` to absorb clock skew between us and the
-# utility — a meter reading published at `now()` on the utility's clock might be a few
-# minutes in our future, and we don't want to miss it on the next sliding-window poll.
-PUBLISHED_MAX_LOOKAHEAD = timedelta(days=1)
+# NOTE: there is deliberately no forward buffer on `published_max`. A one-day lookahead used to be
+# added here to absorb clock skew against the utility, and it was doing nothing but harm: the proxy
+# clamps a future `published-max` down to its own `now` before the request leaves (savagedata
+# rejects a future bound outright with a bare 400), so the margin never reached any custodian, and
+# it silently defeated the deferred-fetch window freeze by rewriting the "frozen" bound on every
+# retry. Nor was the margin load-bearing — `published-min` is anchored to the data frontier (see
+# CONF_USAGE_POINT_CURSORS), so a reading excluded at the tail of one window is still inside the
+# next one. A tail miss costs one poll of latency, never data.
 
 # The default cadence at which the DataUpdateCoordinator polls the proxy for new usage data.
 # The authoritative, per-utility value comes from the server in the claim response and is stored
