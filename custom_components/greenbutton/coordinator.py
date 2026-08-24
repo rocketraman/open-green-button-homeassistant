@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import CoreState
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -318,6 +318,17 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
                 self.entry.entry_id,
                 err,
             )
+            collected = await self._async_collect_deferred_batch(published_min, published_max)
+            if collected is not None:
+                # The prepared batch was there after all. Fall through to the success tail below,
+                # which clears the frozen window, stands the fast retry down and hands the data to
+                # the importer exactly as an ordinary fetch would.
+                response = collected
+                self._log_window_compliance(response, published_min, published_max)
+                self._async_clear_background_load_issue()
+                self._clear_pending_window()
+                self.cancel_pending_retry()
+                return response
             self._remember_pending_window(published_min, published_max)
             self._async_create_background_load_issue()
             # Come back in minutes, not at the utility's daily cadence — the batch usually lands
@@ -413,6 +424,148 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
                 before_window,
                 self._force_full_history,
             )
+
+    async def _async_collect_deferred_batch(
+        self,
+        published_min: datetime,
+        published_max: datetime,
+    ) -> UsageResponse | None:
+        """Try to collect a batch the custodian prepared out of band. None if we couldn't.
+
+        The subscription-level batch URL is an ENQUEUE endpoint on the custodians that behave this
+        way: it answers 202 to every request and never serves the dataset, no matter how exactly
+        the URL is repeated (issues/10 — 252 byte-identical requests over 33 hours, all 202). What
+        it does do is prepare the batch, which the custodian then notifies at a per-UsagePoint URL
+        beneath that same subscription. Those notifications go to the proxy, which is stateless and
+        discards them; but the URL they name is derivable — subscription URI + `UsagePoint/{id}` —
+        so we can ask for it directly instead of waiting to be told.
+
+        Best-effort by design: every failure here returns None and leaves the caller's ordinary
+        deferred-fetch handling (freeze the window, raise the repair issue, retry soon) exactly as
+        it was. This can only turn a failed poll into a successful one, never the reverse.
+
+        A meter that fails while others succeed does NOT sink the collection — the successful ones
+        are imported and only their cursors advance, which is safe precisely because cursors are
+        per meter (see CONF_USAGE_POINT_CURSORS). The failed meter keeps its old cursor and its
+        window simply stays open until it answers.
+        """
+        usage_point_ids = await self._async_discover_usage_points(published_min, published_max)
+        if isinstance(usage_point_ids, UsageResponse):
+            return usage_point_ids  # The listing carried the data itself — nothing left to ask.
+        if not usage_point_ids:
+            return None
+
+        collected: list[Any] = []
+        updated: datetime | None = None
+        for usage_point_id in usage_point_ids:
+            response = await self._async_fetch_resource(
+                f"UsagePoint/{usage_point_id}", published_min, published_max
+            )
+            if response is None:
+                continue
+            collected.extend(response.usage_points)
+            if response.updated is not None and (updated is None or response.updated > updated):
+                updated = response.updated
+
+        if not collected:
+            _LOGGER.debug(
+                "Entry %s: no meter answered the prepared-batch collection (%d attempted)",
+                self.entry.entry_id,
+                len(usage_point_ids),
+            )
+            return None
+
+        _LOGGER.info(
+            "Entry %s: collected a deferred batch from %d of %d usage point(s)",
+            self.entry.entry_id,
+            len(collected),
+            len(usage_point_ids),
+        )
+        return UsageResponse(updated=updated, usage_points=collected, new_credentials=None)
+
+    async def _async_discover_usage_points(
+        self,
+        published_min: datetime,
+        published_max: datetime,
+    ) -> list[str] | UsageResponse:
+        """The meters to collect from — or the whole feed, if the listing simply returned it.
+
+        Prefers the meters we already know: the per-meter cursor map is keyed by usage point id,
+        so any entry that has ever imported can skip the extra request entirely. That also covers
+        a custodian which used to answer synchronously and later starts deferring (Elexicon looks
+        like this — it has served data fine in the past and now defers a two-year backfill).
+
+        Only an entry that has NEVER imported has to ask, which is the case that matters: a first
+        sync against a deferring custodian, exactly issues/10. Whether a UsagePoint listing exists
+        at all is unverified — no notification has ever named a collection URL, so this is
+        inference from REST convention, and its outcome is logged either way.
+        """
+        known = sorted(self._usage_point_cursors())
+        if known:
+            return known
+
+        listing = await self._async_fetch_resource("UsagePoint", published_min, published_max)
+        if listing is None:
+            return []
+        # A listing that came back carrying readings IS the batch — some custodians may serve the
+        # collection rather than just enumerate it. Use it and skip the per-meter round trips.
+        if _newest_reading_start(listing) is not None:
+            _LOGGER.info(
+                "Entry %s: the UsagePoint listing carried readings directly for %d usage point(s)",
+                self.entry.entry_id,
+                len(listing.usage_points),
+            )
+            return listing
+        discovered = [up.usage_point_id for up in listing.usage_points]
+        _LOGGER.info(
+            "Entry %s: UsagePoint listing named %d usage point(s): %s",
+            self.entry.entry_id,
+            len(discovered),
+            ", ".join(discovered) or "<none>",
+        )
+        return discovered
+
+    async def _async_fetch_resource(
+        self,
+        resource_path: str,
+        published_min: datetime,
+        published_max: datetime,
+    ) -> UsageResponse | None:
+        """GET one ESPI resource beneath our subscription. None on any failure, never raises.
+
+        Rotated credentials are persisted on both outcomes — a one-time refresh token is redeemed
+        during the proxy's refresh, so dropping the rotated blob on a failed collection would
+        strand the entry with a dead token and force a spurious reauth.
+        """
+        try:
+            response = await self.api.fetch_usage(
+                encrypted_refresh_blob=self.entry.data[CONF_ENCRYPTED_REFRESH_BLOB],
+                proxy_token=self.entry.data[CONF_PROXY_TOKEN],
+                published_min=published_min,
+                published_max=published_max,
+                resource_path=resource_path,
+            )
+        except OpenGbApiError as err:
+            self._persist_rotated_credentials(err.new_credentials)
+            # DEBUG, not WARNING: this whole path is opportunistic, and its failure changes
+            # nothing about the outcome the caller was already headed for.
+            _LOGGER.debug(
+                "Entry %s: resource %s did not answer: %s",
+                self.entry.entry_id,
+                resource_path,
+                err,
+            )
+            return None
+        except Exception as err:  # noqa: BLE001
+            # Deliberately broad, same reasoning as the customer-label probe: an opportunistic
+            # extra request must never be what fails a refresh.
+            _LOGGER.debug(
+                "Entry %s: resource %s errored: %s", self.entry.entry_id, resource_path, err
+            )
+            return None
+
+        self._persist_rotated_credentials(response.new_credentials)
+        return response
 
     def _persist_rotated_credentials(self, new_credentials: NewCredentials | None) -> None:
         """Write rotated credentials into the config entry, if the proxy returned any.

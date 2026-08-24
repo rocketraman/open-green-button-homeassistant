@@ -421,14 +421,19 @@ async def test_data_pending_logs_the_custodian_detail(
         with pytest.raises(UpdateFailed):
             await coordinator._async_update_data()
 
-        first_records = [r for r in caplog.records if detail in r.getMessage()]
+        # Match the deferral line specifically: the opportunistic batch-collection attempt also
+        # fails with this same exception and logs its own (DEBUG) line carrying the same text.
+        first_records = [
+            r for r in caplog.records if "utility deferred the fetch" in r.getMessage()
+        ]
         assert [r.levelno for r in first_records] == [logging.INFO]
+        assert detail in first_records[0].getMessage()
 
         caplog.clear()
         with pytest.raises(UpdateFailed):
             await coordinator._async_update_data()
 
-    retry_records = [r for r in caplog.records if detail in r.getMessage()]
+    retry_records = [r for r in caplog.records if "utility deferred the fetch" in r.getMessage()]
     assert [r.levelno for r in retry_records] == [logging.DEBUG]
     coordinator.cancel_pending_retry()
 
@@ -1857,4 +1862,177 @@ async def test_a_deferred_customer_feed_is_reported_and_not_recorded(
         await coordinator._async_update_data()
 
     api.fetch_customer.assert_awaited_once()
+    coordinator.cancel_pending_retry()
+
+
+def _deferring_api(
+    listing: UsageResponse | None = None,
+    per_meter: dict[str, UsageResponse] | None = None,
+) -> OpenGbApi:
+    """An API whose subscription-level fetch always defers, but whose resources may answer.
+
+    Mirrors the custodians in issues/10: `Batch/Subscription/{sub}` is an enqueue endpoint that
+    answers 202 forever, while the batch it prepares is readable underneath it.
+    """
+    from custom_components.greenbutton.api import OpenGbDataPendingError
+
+    async def _fetch(**kwargs: object) -> UsageResponse:
+        path = kwargs.get("resource_path")
+        if path is None:
+            raise OpenGbDataPendingError("data pending (202)")
+        if path == "UsagePoint":
+            if listing is None:
+                raise OpenGbDataPendingError("listing pending (202)")
+            return listing
+        assert isinstance(path, str)
+        found = (per_meter or {}).get(path.removeprefix("UsagePoint/"))
+        if found is None:
+            raise OpenGbApiError(f"no such resource: {path}")
+        return found
+
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(side_effect=_fetch)  # type: ignore[method-assign]
+    return api
+
+
+async def test_a_deferred_batch_is_collected_from_its_usage_points(
+    hass: HomeAssistant,
+) -> None:
+    """A 202 turns into a successful poll by reading the batch the custodian prepared.
+
+    The subscription-level URL is an enqueue endpoint: it answers 202 to every request and never
+    serves the dataset, however exactly the URL is repeated (issues/10 — 252 byte-identical
+    requests, all 202). The data it prepares is readable at a per-UsagePoint URL underneath it,
+    which is derivable rather than something we must be told.
+    """
+    reading = datetime(2026, 6, 1, tzinfo=UTC)
+    api = _deferring_api(
+        listing=_response_with_meters({"up1": [], "up2": []}),
+        per_meter={
+            "up1": _response_with_meters({"up1": [reading]}),
+            "up2": _response_with_meters({"up2": [reading]}),
+        },
+    )
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ) as import_mock:
+        response = await coordinator._async_update_data()
+
+    # The poll SUCCEEDED — no UpdateFailed — and both meters' data reached the importer.
+    assert {up.usage_point_id for up in response.usage_points} == {"up1", "up2"}
+    import_mock.assert_awaited_once()
+    assert entry.data[CONF_USAGE_POINT_CURSORS] == {
+        "up1": reading.isoformat(),
+        "up2": reading.isoformat(),
+    }
+    # Nothing is left pending: the batch landed, so no frozen window and no fast retry.
+    assert CONF_PENDING_PUBLISHED_MIN not in entry.data
+    coordinator.cancel_pending_retry()
+
+
+async def test_known_meters_are_collected_without_a_listing_request(
+    hass: HomeAssistant,
+) -> None:
+    """An entry that has imported before skips discovery — its cursor map already names its meters.
+
+    That also covers a custodian which used to answer synchronously and starts deferring later,
+    where a listing endpoint may not exist to ask.
+    """
+    reading = datetime(2026, 6, 2, tzinfo=UTC)
+    api = _deferring_api(per_meter={"up1": _response_with_meters({"up1": [reading]})})
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_USAGE_POINT_CURSORS: {"up1": datetime(2026, 6, 1, tzinfo=UTC).isoformat()},
+        },
+    )
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    requested = [c.kwargs.get("resource_path") for c in api.fetch_usage.await_args_list]
+    assert "UsagePoint" not in requested, "asked for a listing despite already knowing the meters"
+    assert "UsagePoint/up1" in requested
+    coordinator.cancel_pending_retry()
+
+
+async def test_one_failing_meter_does_not_sink_the_others(hass: HomeAssistant) -> None:
+    """Meters are collected independently — a failure costs that meter, not the poll.
+
+    Safe precisely because cursors are per meter: the meters that answered advance, and the one
+    that didn't keeps its old cursor, so its window simply stays open until it does.
+    """
+    reading = datetime(2026, 6, 3, tzinfo=UTC)
+    api = _deferring_api(
+        listing=_response_with_meters({"good": [], "bad": []}),
+        per_meter={"good": _response_with_meters({"good": [reading]})},  # "bad" errors
+    )
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        response = await coordinator._async_update_data()
+
+    assert {up.usage_point_id for up in response.usage_points} == {"good"}
+    assert entry.data[CONF_USAGE_POINT_CURSORS] == {"good": reading.isoformat()}
+    coordinator.cancel_pending_retry()
+
+
+async def test_a_listing_that_carries_readings_is_used_directly(hass: HomeAssistant) -> None:
+    """If the listing returns the data itself, take it and skip the per-meter round trips."""
+    reading = datetime(2026, 6, 4, tzinfo=UTC)
+    api = _deferring_api(listing=_response_with_meters({"up1": [reading]}))
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        response = await coordinator._async_update_data()
+
+    assert {up.usage_point_id for up in response.usage_points} == {"up1"}
+    requested = [c.kwargs.get("resource_path") for c in api.fetch_usage.await_args_list]
+    assert "UsagePoint/up1" not in requested
+    coordinator.cancel_pending_retry()
+
+
+async def test_a_failed_collection_leaves_the_deferred_handling_untouched(
+    hass: HomeAssistant,
+) -> None:
+    """When nothing can be collected, the poll behaves exactly as it did before.
+
+    The collection attempt is opportunistic: it can turn a failed poll into a successful one, and
+    must never do the reverse. So a custodian that defers everything still gets the frozen window,
+    the repair issue and the short retry.
+    """
+    api = _deferring_api()  # listing defers too, so nothing is collectable
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator._async_update_data()
+
+    assert CONF_PENDING_PUBLISHED_MIN in entry.data
+    assert CONF_USAGE_POINT_CURSORS not in entry.data
     coordinator.cancel_pending_retry()
