@@ -287,6 +287,20 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             # Then raise a repair issue and fail this refresh. Must be caught BEFORE
             # OpenGbApiError, of which it is a subclass.
             self._persist_rotated_credentials(err.new_credentials)
+            # Nothing downstream ever prints this exception: setup logs its own generic line, and
+            # HA's coordinator only logs an UpdateFailed message on a success→failure transition —
+            # which a 202-before-first-success never produces. So this is the one place the
+            # custodian's raw 202 response (status, Location/Retry-After headers, body — forwarded
+            # verbatim in the proxy's `message`, see [api.fetch_usage]) can reach the user's log,
+            # and that log is the only way to collect it (issues/10). INFO for the first 202 of a
+            # window; the every-few-minutes retries repeat it at DEBUG.
+            first_deferral = self._pending_window() != (published_min, published_max)
+            _LOGGER.log(
+                logging.INFO if first_deferral else logging.DEBUG,
+                "Entry %s: utility deferred the fetch: %s",
+                self.entry.entry_id,
+                err,
+            )
             self._remember_pending_window(published_min, published_max)
             self._async_create_background_load_issue()
             # Come back in minutes, not at the utility's daily cadence — the batch usually lands

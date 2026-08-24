@@ -8,6 +8,7 @@ mode, when to persist rotated credentials, etc.).
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
@@ -354,6 +355,51 @@ async def test_data_pending_freezes_the_window_and_retries_replay_it(
     second = api.fetch_usage.await_args.kwargs
     assert second["published_min"] == first["published_min"]
     assert second["published_max"] == first["published_max"]
+
+
+async def test_data_pending_logs_the_custodian_detail(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The 202's forwarded detail reaches the log: INFO on the first, DEBUG on retries.
+
+    Nothing downstream prints the exception — setup logs its own generic line, and HA's
+    coordinator only logs UpdateFailed on a success→failure transition, which a 202 before any
+    success never produces. Issues/10 went two weeks without the custodian's response headers
+    because of exactly that. The affected user's HA log is the only place this detail can be
+    collected from, so losing it means losing the investigation.
+    """
+    from custom_components.greenbutton.api import OpenGbDataPendingError
+
+    detail = "data pending (202) (response-headers: [X-Powered-By: ASP.NET])"
+    api = OpenGbApi(session=None, server_base_url="http://test")  # type: ignore[arg-type]
+    api.fetch_usage = AsyncMock(  # type: ignore[method-assign]
+        side_effect=OpenGbDataPendingError(detail),
+    )
+
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+        caplog.at_level(logging.DEBUG, logger="custom_components.greenbutton"),
+    ):
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+
+        first_records = [r for r in caplog.records if detail in r.getMessage()]
+        assert [r.levelno for r in first_records] == [logging.INFO]
+
+        caplog.clear()
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+
+    retry_records = [r for r in caplog.records if detail in r.getMessage()]
+    assert [r.levelno for r in retry_records] == [logging.DEBUG]
+    coordinator.cancel_pending_retry()
 
 
 async def test_successful_fetch_clears_the_frozen_pending_window(hass: HomeAssistant) -> None:
