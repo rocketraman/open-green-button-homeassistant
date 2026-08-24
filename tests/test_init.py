@@ -177,14 +177,19 @@ async def test_setup_completes_when_the_utility_is_still_preparing_data(
     with _stub_network(fetch):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-        assert fetch.await_count == 1
+        # Each deferred poll is the subscription fetch plus one attempt to collect the prepared
+        # batch (here: the UsagePoint listing, which this stub also defers), so count polls by
+        # the calls that carry no resource_path rather than by the raw total.
+        polls = [c for c in fetch.await_args_list if c.kwargs.get("resource_path") is None]
+        assert len(polls) == 1
 
         # Far short of DEFAULT_SCAN_INTERVAL — only the pending-retry timer can fire here.
         async_fire_time_changed(
             hass, dt_util.utcnow() + PENDING_RETRY_INTERVAL + timedelta(seconds=30)
         )
         await hass.async_block_till_done()
-        assert fetch.await_count == 2, "deferred fetch was not re-attempted on the short timer"
+        polls = [c for c in fetch.await_args_list if c.kwargs.get("resource_path") is None]
+        assert len(polls) == 2, "deferred fetch was not re-attempted on the short timer"
 
     await hass.config_entries.async_unload(entry.entry_id)
 

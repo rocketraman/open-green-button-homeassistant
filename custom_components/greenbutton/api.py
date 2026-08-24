@@ -420,6 +420,7 @@ class OpenGbApi:
         published_min: datetime | None = None,
         published_max: datetime | None = None,
         raw_xml_sink: RawXmlSink | None = None,
+        resource_path: str | None = None,
     ) -> UsageResponse:
         """Pull a window of usage data from the proxy.
 
@@ -434,6 +435,13 @@ class OpenGbApi:
                 Serialized to ISO 8601 with `Z` suffix on the wire (the format
                 the Green Button test-lab harness requires).
             published_max: optional ESPI `published-max` filter — same constraints.
+            resource_path: optional RELATIVE ESPI resource suffix to fetch instead of the
+                subscription itself — e.g. ``UsagePoint`` or ``UsagePoint/{id}``. The proxy
+                joins it beneath the subscription URI held in our blob; it rejects anything
+                that isn't a plain relative suffix, since it attaches the utility access
+                token to whatever it fetches. Used to collect an asynchronous batch, which a
+                custodian prepares under a per-UsagePoint URL and never serves from the
+                subscription-level one.
             raw_xml_sink: optional async callback invoked with the raw response body
                 bytes between the read and the parse. Used by the coordinator to persist
                 the body to disk for diagnostics — passed in (instead of returned on
@@ -456,6 +464,8 @@ class OpenGbApi:
             body["publishedMin"] = _to_iso_z(published_min)
         if published_max is not None:
             body["publishedMax"] = _to_iso_z(published_max)
+        if resource_path is not None:
+            body["resourcePath"] = resource_path
 
         headers = {**self.headers, "Authorization": f"Bearer {proxy_token}"}
         async with self._session.post(url, headers=headers, json=body) as resp:

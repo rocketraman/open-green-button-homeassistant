@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import CoreState
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -54,6 +54,7 @@ from .const import (
     CONF_PENDING_SINCE,
     CONF_POLL_INTERVAL_SECONDS,
     CONF_PROXY_TOKEN,
+    CONF_USAGE_POINT_CURSORS,
     CONF_UTILITY_NAME,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
@@ -63,7 +64,6 @@ from .const import (
     LAST_FETCHED_OVERLAP,
     PENDING_ESCALATE_AFTER,
     PENDING_RETRY_INTERVAL,
-    PUBLISHED_MAX_LOOKAHEAD,
     SERVICE_REBUILD_STATISTICS,
 )
 from .statistics import (
@@ -98,6 +98,23 @@ def _newest_reading_start(response: UsageResponse) -> datetime | None:
             for reading in series.readings:
                 if newest is None or reading.start > newest:
                     newest = reading.start
+    return newest
+
+
+def _newest_reading_start_by_usage_point(response: UsageResponse) -> dict[str, datetime]:
+    """Return the newest reading ``start`` per UsagePoint, skipping ones that carried none.
+
+    The per-meter counterpart of [_newest_reading_start]. A poll routinely returns data for some
+    meters and not others (they publish on their own cadences), and a meter absent from this
+    mapping must keep the cursor it already had rather than be reset or dropped.
+    """
+    newest: dict[str, datetime] = {}
+    for up in response.usage_points:
+        for series in up.series:
+            for reading in series.readings:
+                current = newest.get(up.usage_point_id)
+                if current is None or reading.start > current:
+                    newest[up.usage_point_id] = reading.start
     return newest
 
 
@@ -287,11 +304,51 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             # Then raise a repair issue and fail this refresh. Must be caught BEFORE
             # OpenGbApiError, of which it is a subclass.
             self._persist_rotated_credentials(err.new_credentials)
+            # Nothing downstream ever prints this exception: setup logs its own generic line, and
+            # HA's coordinator only logs an UpdateFailed message on a success→failure transition —
+            # which a 202-before-first-success never produces. So this is the one place the
+            # custodian's raw 202 response (status, Location/Retry-After headers, body — forwarded
+            # verbatim in the proxy's `message`, see [api.fetch_usage]) can reach the user's log,
+            # and that log is the only way to collect it (issues/10). INFO for the first 202 of a
+            # window; the every-few-minutes retries repeat it at DEBUG.
+            first_deferral = self._pending_window() != (published_min, published_max)
+            _LOGGER.log(
+                logging.INFO if first_deferral else logging.DEBUG,
+                "Entry %s: utility deferred the fetch: %s",
+                self.entry.entry_id,
+                err,
+            )
+            collected = await self._async_collect_deferred_batch(published_min, published_max)
+            if collected is not None:
+                # The prepared batch was there after all. Fall through to the success tail below,
+                # which clears the frozen window, stands the fast retry down and hands the data to
+                # the importer exactly as an ordinary fetch would.
+                response = collected
+                self._log_window_compliance(response, published_min, published_max)
+                self._async_clear_background_load_issue()
+                self._clear_pending_window()
+                self.cancel_pending_retry()
+                return response
             self._remember_pending_window(published_min, published_max)
             self._async_create_background_load_issue()
             # Come back in minutes, not at the utility's daily cadence — the batch usually lands
             # within one interval. Ordered AFTER the window freeze so the retry replays it.
             self._schedule_pending_retry()
+            if first_deferral:
+                # Probe a DIFFERENT batch resource on the same custodian while this one is
+                # deferred. The customer feed lives at .../Batch/RetailCustomer/{sub} — same
+                # platform, same auth, much smaller payload — so its status answers a question the
+                # usage endpoint can't: is this custodian's WHOLE Batch tree asynchronous, or only
+                # the big usage export? A 200 here means small resources are served synchronously,
+                # which is what deciding how to collect a prepared batch turns on. Until now this
+                # was never exercised for a deferring entry: labeling runs after a successful
+                # usage fetch, and for these entries there has never been one.
+                #
+                # First 202 of a window only — not on every five-minute retry — so this costs one
+                # extra request per deferral episode, and it is already guarded to stop entirely
+                # once a label (or a permanent "none available") is recorded. Nothing it does can
+                # propagate: the call swallows every exception internally.
+                await self._async_ensure_customer_label()
             raise UpdateFailed(str(err)) from err
         except OpenGbApiError as err:
             # Crucial for one-time refresh tokens (savagedata/OpenIddict): the proxy may have
@@ -304,10 +361,210 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             raise UpdateFailed(f"network error talking to the proxy: {err}") from err
 
         self._persist_rotated_credentials(response.new_credentials)
+        self._log_window_compliance(response, published_min, published_max)
         # The deferred batch (if there was one) has landed — stop replaying its window and stand
         # the fast retry down, so the next poll goes back to asking for whatever is new.
         self._clear_pending_window()
         self.cancel_pending_retry()
+        return response
+
+    def _log_window_compliance(
+        self,
+        response: UsageResponse,
+        published_min: datetime,
+        published_max: datetime,
+    ) -> None:
+        """Record what each meter returned against what we asked for.
+
+        This exists to settle an open question about asynchronous-batch custodians: whether the
+        per-UsagePoint batch URL honours `published-min`/`published-max` at all. Every notified
+        UsagePoint URL we have observed was bare (1622 of 1622), but that is what the custodian
+        chose to advertise, not what the endpoint accepts — the same custodians do parameterize
+        the subscription-level URLs they notify. So we ask WITH the filter and check the answer
+        here rather than assuming either way.
+
+        A single poll cannot settle it, and the reason is worth stating: `published-min` filters
+        by PUBLICATION date while readings are stamped with their own interval START. One
+        publication event legitimately carries years of readings — that is what a backfill is — so
+        "asked for a day, got two years" is not by itself proof the filter was ignored.
+
+        What IS diagnostic is the pattern across polls, which is why every field needed for the
+        comparison goes on one line per meter: an ignored filter shows up as successive polls with
+        ADVANCING windows returning identical counts and identical reading spans. That is exactly
+        the signature that caught Burlington's `updated-min` (a 4-day and a 2-year window both
+        returning 22,008 readings), and it is visible in an ordinary user's debug log without
+        anyone running a credentialed probe.
+        """
+        if not _LOGGER.isEnabledFor(logging.INFO):
+            return
+        for up in response.usage_points:
+            starts = [r.start for series in up.series for r in series.readings]
+            if not starts:
+                _LOGGER.info(
+                    "Window check entry=%s usage_point=%s requested=[%s, %s] readings=0",
+                    self.entry.entry_id,
+                    up.usage_point_id,
+                    published_min.isoformat(),
+                    published_max.isoformat(),
+                )
+                continue
+            earliest, latest = min(starts), max(starts)
+            before_window = sum(1 for start in starts if start < published_min)
+            _LOGGER.info(
+                "Window check entry=%s usage_point=%s requested=[%s, %s] readings=%d "
+                "span=[%s, %s] span_days=%d before_published_min=%d full_history=%s",
+                self.entry.entry_id,
+                up.usage_point_id,
+                published_min.isoformat(),
+                published_max.isoformat(),
+                len(starts),
+                earliest.isoformat(),
+                latest.isoformat(),
+                (latest - earliest).days,
+                before_window,
+                self._force_full_history,
+            )
+
+    async def _async_collect_deferred_batch(
+        self,
+        published_min: datetime,
+        published_max: datetime,
+    ) -> UsageResponse | None:
+        """Try to collect a batch the custodian prepared out of band. None if we couldn't.
+
+        The subscription-level batch URL is an ENQUEUE endpoint on the custodians that behave this
+        way: it answers 202 to every request and never serves the dataset, no matter how exactly
+        the URL is repeated (issues/10 — 252 byte-identical requests over 33 hours, all 202). What
+        it does do is prepare the batch, which the custodian then notifies at a per-UsagePoint URL
+        beneath that same subscription. Those notifications go to the proxy, which is stateless and
+        discards them; but the URL they name is derivable — subscription URI + `UsagePoint/{id}` —
+        so we can ask for it directly instead of waiting to be told.
+
+        Best-effort by design: every failure here returns None and leaves the caller's ordinary
+        deferred-fetch handling (freeze the window, raise the repair issue, retry soon) exactly as
+        it was. This can only turn a failed poll into a successful one, never the reverse.
+
+        A meter that fails while others succeed does NOT sink the collection — the successful ones
+        are imported and only their cursors advance, which is safe precisely because cursors are
+        per meter (see CONF_USAGE_POINT_CURSORS). The failed meter keeps its old cursor and its
+        window simply stays open until it answers.
+        """
+        usage_point_ids = await self._async_discover_usage_points(published_min, published_max)
+        if isinstance(usage_point_ids, UsageResponse):
+            return usage_point_ids  # The listing carried the data itself — nothing left to ask.
+        if not usage_point_ids:
+            return None
+
+        collected: list[Any] = []
+        updated: datetime | None = None
+        for usage_point_id in usage_point_ids:
+            response = await self._async_fetch_resource(
+                f"UsagePoint/{usage_point_id}", published_min, published_max
+            )
+            if response is None:
+                continue
+            collected.extend(response.usage_points)
+            if response.updated is not None and (updated is None or response.updated > updated):
+                updated = response.updated
+
+        if not collected:
+            _LOGGER.debug(
+                "Entry %s: no meter answered the prepared-batch collection (%d attempted)",
+                self.entry.entry_id,
+                len(usage_point_ids),
+            )
+            return None
+
+        _LOGGER.info(
+            "Entry %s: collected a deferred batch from %d of %d usage point(s)",
+            self.entry.entry_id,
+            len(collected),
+            len(usage_point_ids),
+        )
+        return UsageResponse(updated=updated, usage_points=collected, new_credentials=None)
+
+    async def _async_discover_usage_points(
+        self,
+        published_min: datetime,
+        published_max: datetime,
+    ) -> list[str] | UsageResponse:
+        """The meters to collect from — or the whole feed, if the listing simply returned it.
+
+        Prefers the meters we already know: the per-meter cursor map is keyed by usage point id,
+        so any entry that has ever imported can skip the extra request entirely. That also covers
+        a custodian which used to answer synchronously and later starts deferring (Elexicon looks
+        like this — it has served data fine in the past and now defers a two-year backfill).
+
+        Only an entry that has NEVER imported has to ask, which is the case that matters: a first
+        sync against a deferring custodian, exactly issues/10. Whether a UsagePoint listing exists
+        at all is unverified — no notification has ever named a collection URL, so this is
+        inference from REST convention, and its outcome is logged either way.
+        """
+        known = sorted(self._usage_point_cursors())
+        if known:
+            return known
+
+        listing = await self._async_fetch_resource("UsagePoint", published_min, published_max)
+        if listing is None:
+            return []
+        # A listing that came back carrying readings IS the batch — some custodians may serve the
+        # collection rather than just enumerate it. Use it and skip the per-meter round trips.
+        if _newest_reading_start(listing) is not None:
+            _LOGGER.info(
+                "Entry %s: the UsagePoint listing carried readings directly for %d usage point(s)",
+                self.entry.entry_id,
+                len(listing.usage_points),
+            )
+            return listing
+        discovered = [up.usage_point_id for up in listing.usage_points]
+        _LOGGER.info(
+            "Entry %s: UsagePoint listing named %d usage point(s): %s",
+            self.entry.entry_id,
+            len(discovered),
+            ", ".join(discovered) or "<none>",
+        )
+        return discovered
+
+    async def _async_fetch_resource(
+        self,
+        resource_path: str,
+        published_min: datetime,
+        published_max: datetime,
+    ) -> UsageResponse | None:
+        """GET one ESPI resource beneath our subscription. None on any failure, never raises.
+
+        Rotated credentials are persisted on both outcomes — a one-time refresh token is redeemed
+        during the proxy's refresh, so dropping the rotated blob on a failed collection would
+        strand the entry with a dead token and force a spurious reauth.
+        """
+        try:
+            response = await self.api.fetch_usage(
+                encrypted_refresh_blob=self.entry.data[CONF_ENCRYPTED_REFRESH_BLOB],
+                proxy_token=self.entry.data[CONF_PROXY_TOKEN],
+                published_min=published_min,
+                published_max=published_max,
+                resource_path=resource_path,
+            )
+        except OpenGbApiError as err:
+            self._persist_rotated_credentials(err.new_credentials)
+            # DEBUG, not WARNING: this whole path is opportunistic, and its failure changes
+            # nothing about the outcome the caller was already headed for.
+            _LOGGER.debug(
+                "Entry %s: resource %s did not answer: %s",
+                self.entry.entry_id,
+                resource_path,
+                err,
+            )
+            return None
+        except Exception as err:  # noqa: BLE001
+            # Deliberately broad, same reasoning as the customer-label probe: an opportunistic
+            # extra request must never be what fails a refresh.
+            _LOGGER.debug(
+                "Entry %s: resource %s errored: %s", self.entry.entry_id, resource_path, err
+            )
+            return None
+
+        self._persist_rotated_credentials(response.new_credentials)
         return response
 
     def _persist_rotated_credentials(self, new_credentials: NewCredentials | None) -> None:
@@ -342,7 +599,9 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         Best-effort by design:
           - Runs only until a label is stored (``CONF_CUSTOMER_LABEL`` present — even as ``""``
             when the utility exposes no customer data — so we don't refetch every poll).
-          - Any fetch failure is swallowed (the usage refresh has already succeeded); rotated
+          - Also invoked from the deferred-fetch (HTTP 202) path, where it doubles as a probe of
+            whether the custodian defers every Batch resource or only the usage export.
+          - Any fetch failure is swallowed (labeling is never what a refresh turns on); rotated
             credentials from the attempt are still persisted, and we retry on the next poll —
             EXCEPT a permanent failure (``OpenGbPermanentError``: the proxy propagated the
             utility's 4xx — no customer resource advertised, or one our scope may not access such
@@ -370,10 +629,26 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             )
             self._store_customer_label(None, account_id=None, address=None)
             return
+        except OpenGbDataPendingError as err:
+            # The customer feed is deferred TOO — so this custodian defers its whole Batch tree,
+            # not just the heavyweight usage export. Called out separately from the transient
+            # branch below, and at INFO rather than DEBUG, because it is a fact about the platform
+            # rather than a hiccup: it decides whether a prepared batch can be collected by asking
+            # for a smaller resource, or whether nothing under /Batch/ answers synchronously and
+            # collection has to work another way entirely. Left unstored so it retries.
+            self._persist_rotated_credentials(err.new_credentials)
+            _LOGGER.info(
+                "Entry %s: the customer feed is deferred as well (HTTP 202) — this custodian "
+                "defers its whole Batch resource tree, not just the usage export: %s",
+                self.entry.entry_id,
+                err,
+            )
+            return
         except OpenGbApiError as err:
-            # Transient (auth-expired / 5xx / etc.) — the usage fetch already succeeded this poll,
-            # so a customer-fetch error is non-fatal here. Persist any rotated credentials so we
-            # don't burn a one-time refresh token, then retry the label on the next poll.
+            # Transient (auth-expired / 5xx / etc.) — a customer-fetch error is non-fatal: it is
+            # layered on a usage poll that either already succeeded or has already failed on its
+            # own terms. Persist any rotated credentials so we don't burn a one-time refresh
+            # token, then retry the label on the next poll.
             self._persist_rotated_credentials(err.new_credentials)
             _LOGGER.debug(
                 "Customer-data fetch failed for entry %s (will retry): %s",
@@ -394,6 +669,14 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
 
         self._persist_rotated_credentials(result.new_credentials)
         customer = result.customer
+        # Once per entry. Also the positive half of the probe described at the deferred-fetch call
+        # site: reaching here at all means the customer resource answered synchronously, which for
+        # an entry whose usage fetch is stuck on 202 is the informative outcome.
+        _LOGGER.info(
+            "Entry %s: customer feed answered (label=%s)",
+            self.entry.entry_id,
+            customer.label if customer else "<none advertised>",
+        )
         self._store_customer_label(
             customer.label if customer else None,
             account_id=customer.account_id if customer else None,
@@ -427,11 +710,16 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
     def _advance_cursor(self, response: UsageResponse) -> None:
         """Persist the incremental cursor as the newest reading start we've imported.
 
-        The cursor only moves *forward*, and only when the response actually carried
-        readings. On an empty response it is left untouched — critical for a utility that
-        publishes on a multi-day lag: anchoring the cursor to the real data frontier (rather
-        than wall-clock ``now``) stops `published-min` from marching past the not-yet-
-        published data and starving every later poll. See [_published_min].
+        Writes BOTH the entry-wide frontier (`CONF_LAST_FETCHED_AT`) and the per-meter cursors
+        (`CONF_USAGE_POINT_CURSORS`). The entry-wide one answers "has this entry ever imported a
+        reading?" and drives the startup poll-due check; the per-meter map is what scopes the poll
+        window, because meters publish independently.
+
+        Cursors only move *forward*, and only when the response actually carried readings. On an
+        empty response nothing is touched — critical for a utility that publishes on a multi-day
+        lag: anchoring to the real data frontier (rather than wall-clock ``now``) stops
+        `published-min` from marching past the not-yet-published data and starving every later
+        poll. See [_published_min].
         """
         newest = _newest_reading_start(response)
         if newest is None:
@@ -440,11 +728,30 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         prior = _parse_iso_or_none(prior_raw)
         cursor = newest if prior is None else max(prior, newest)
         cursor_iso = cursor.isoformat()
-        if cursor_iso == prior_raw:
+
+        # Per-meter cursors, MERGED not replaced: a meter absent from this response keeps the
+        # cursor it already had. Meters publish on their own cadences (a monthly gas meter is
+        # silent through most of an electric meter's polls), so treating absence as "no data ever"
+        # would reset a slow meter's frontier and re-fetch its whole history on the next poll.
+        # Forward-only per meter, for the same reason the entry-wide cursor is.
+        prior_cursors = self._usage_point_cursors()
+        merged = dict(prior_cursors)
+        for up_id, up_newest in _newest_reading_start_by_usage_point(response).items():
+            known = prior_cursors.get(up_id)
+            if known is None or up_newest > known:
+                merged[up_id] = up_newest
+        merged_iso = {up_id: value.isoformat() for up_id, value in merged.items()}
+
+        stored_cursors = self.entry.data.get(CONF_USAGE_POINT_CURSORS)
+        if cursor_iso == prior_raw and merged_iso == stored_cursors:
             return  # No forward movement — avoid a no-op entry write (and its churn).
         self.hass.config_entries.async_update_entry(
             self.entry,
-            data={**self.entry.data, CONF_LAST_FETCHED_AT: cursor_iso},
+            data={
+                **self.entry.data,
+                CONF_LAST_FETCHED_AT: cursor_iso,
+                CONF_USAGE_POINT_CURSORS: merged_iso,
+            },
         )
 
     def _reconcile_data_availability(self) -> None:
@@ -924,7 +1231,7 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
                     pending[1].isoformat(),
                 )
                 return pending
-        return self._published_min(now), now + PUBLISHED_MAX_LOOKAHEAD
+        return self._published_min(now), now
 
     def _pending_window(self) -> tuple[datetime, datetime] | None:
         """The frozen window of an outstanding 202, or None. Unparseable values are discarded."""
@@ -937,18 +1244,33 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
     def _remember_pending_window(self, published_min: datetime, published_max: datetime) -> None:
         """Freeze the window a 202 was returned for, so every retry re-asks identically.
 
-        Also stamps when the wait started, the first time. Both are no-ops once frozen: the stamp
-        must NOT restart on every retry (it's what decides when to stop waiting), and rewriting
-        unchanged values would churn the config entry every few minutes.
+        `published_max` is frozen CLAMPED TO NOW. The proxy clamps any future `published-max` down
+        to its own `now` before it reaches the custodian (see UsageClient in the server repo), so a
+        frozen bound in the future gets rewritten to a fresh instant on every single retry — the
+        window looks frozen from here while the custodian sees a brand-new URL each time, which
+        for an asynchronous-batch custodian enqueues a new job instead of collecting the finished
+        one. That is the whole failure this freeze exists to prevent. Observed live: entries whose
+        `published-min` was pinned to one value still produced ~175 distinct `published-max`
+        values over ~175 polls. A frozen value that is already in the past makes the clamp a
+        no-op, so what we send is what the custodian sees.
+
+        The very first replay still differs slightly from the original request (the custodian saw
+        the proxy's clamp instant; we freeze ours, a round-trip later). Every replay after that is
+        identical, which is what collecting a prepared batch needs.
+
+        Also stamps when the wait started, the first time. All of it is a no-op once frozen: the
+        stamp must NOT restart on every retry (it's what decides when to stop waiting), and
+        rewriting unchanged values would churn the config entry every few minutes.
         """
-        if self._pending_window() == (published_min, published_max):
+        effective_max = min(published_max, datetime.now(UTC))
+        if self._pending_window() == (published_min, effective_max):
             return
         self.hass.config_entries.async_update_entry(
             self.entry,
             data={
                 **self.entry.data,
                 CONF_PENDING_PUBLISHED_MIN: published_min.isoformat(),
-                CONF_PENDING_PUBLISHED_MAX: published_max.isoformat(),
+                CONF_PENDING_PUBLISHED_MAX: effective_max.isoformat(),
                 CONF_PENDING_SINCE: datetime.now(UTC).isoformat(),
             },
         )
@@ -1013,10 +1335,14 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         ask for the slice since the usage frontier, minus a small overlap that absorbs clock skew
         and any late-arriving corrections.
 
-        The usage frontier (`CONF_LAST_FETCHED_AT`) is the newest *reading* we've imported, NOT
-        wall-clock (see [_advance_cursor]). Anchoring to the data frontier is load-bearing:
-        utilities publish on a multi-day lag, so a wall-clock cursor would push `published-min`
-        past not-yet-published data and every later poll would come back empty.
+        A cursor is the newest *reading* we've imported for one meter, NOT wall-clock (see
+        [_advance_cursor]). Anchoring to the data frontier is load-bearing: utilities publish on a
+        multi-day lag, so a wall-clock cursor would push `published-min` past not-yet-published
+        data and every later poll would come back empty.
+
+        Cursors are per UsagePoint — per physical meter — and the window is scoped to the oldest
+        of them, since one request has to serve every meter on the subscription. See
+        CONF_USAGE_POINT_CURSORS for why a shared frontier isn't safe.
 
         A single tight window suffices for cost too: `published-min` filters by *publication* date,
         and a utility publishes a bill (per-interval `<cost>` or a monthly UsageSummary) with a
@@ -1026,6 +1352,18 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         """
         if self._force_full_history:
             return now - self._initial_lookback()
+
+        # The OLDEST per-meter cursor, not the newest: one window has to serve every meter on the
+        # subscription, and a meter that publishes monthly sits far behind one that publishes
+        # daily. Scoping to the newest would let the fast meter drag `published-min` past data the
+        # slow one has not delivered yet.
+        cursors = self._usage_point_cursors()
+        if cursors:
+            return min(cursors.values()) - LAST_FETCHED_OVERLAP
+
+        # No per-meter map yet: either a brand-new entry (fall through to full history) or one
+        # written before CONF_USAGE_POINT_CURSORS existed, whose entry-wide frontier still stands
+        # in until the next successful fetch seeds the map.
         raw = self.entry.data.get(CONF_LAST_FETCHED_AT)
         if raw is None:
             return now - self._initial_lookback()
@@ -1041,6 +1379,32 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             )
             return now - self._initial_lookback()
         return usage_frontier - LAST_FETCHED_OVERLAP
+
+    def _usage_point_cursors(self) -> dict[str, datetime]:
+        """Per-meter cursors from entry data, dropping any entry that won't parse.
+
+        Corrupt values are skipped rather than fatal: losing one meter's cursor costs a wider
+        window for that meter (the import is idempotent, so re-fetched readings are harmless),
+        whereas raising would take the whole entry down over one bad string. An empty result is
+        indistinguishable from "never written", which is exactly the fallback [_published_min]
+        wants for a pre-upgrade entry.
+        """
+        stored = self.entry.data.get(CONF_USAGE_POINT_CURSORS)
+        if not isinstance(stored, dict):
+            return {}
+        cursors: dict[str, datetime] = {}
+        for up_id, raw in stored.items():
+            parsed = _parse_iso_or_none(raw)
+            if parsed is None:
+                _LOGGER.warning(
+                    "Entry %s: cursor for usage point %s is unparseable (%r); widening its window",
+                    self.entry.entry_id,
+                    up_id,
+                    raw,
+                )
+                continue
+            cursors[up_id] = parsed
+        return cursors
 
     def _initial_lookback(self) -> timedelta:
         """How far back to backfill on the first fetch.

@@ -27,10 +27,14 @@ LAST_FETCHED_OVERLAP = timedelta(days=1)
 # the backfill window isn't configured in two places.
 INITIAL_FETCH_LOOKBACK = timedelta(days=2 * 365)
 
-# Small forward buffer added to `published_max` to absorb clock skew between us and the
-# utility — a meter reading published at `now()` on the utility's clock might be a few
-# minutes in our future, and we don't want to miss it on the next sliding-window poll.
-PUBLISHED_MAX_LOOKAHEAD = timedelta(days=1)
+# NOTE: there is deliberately no forward buffer on `published_max`. A one-day lookahead used to be
+# added here to absorb clock skew against the utility, and it was doing nothing but harm: the proxy
+# clamps a future `published-max` down to its own `now` before the request leaves (savagedata
+# rejects a future bound outright with a bare 400), so the margin never reached any custodian, and
+# it silently defeated the deferred-fetch window freeze by rewriting the "frozen" bound on every
+# retry. Nor was the margin load-bearing — `published-min` is anchored to the data frontier (see
+# CONF_USAGE_POINT_CURSORS), so a reading excluded at the tail of one window is still inside the
+# next one. A tail miss costs one poll of latency, never data.
 
 # The default cadence at which the DataUpdateCoordinator polls the proxy for new usage data.
 # The authoritative, per-utility value comes from the server in the claim response and is stored
@@ -103,6 +107,25 @@ CONF_POLL_INTERVAL_SECONDS = "poll_interval_seconds"
 # poll when it appears; the cost importer distributes it over the period's already-recorded usage,
 # so no separate cost cursor is needed.
 CONF_LAST_FETCHED_AT = "last_fetched_at"
+
+# Per-meter incremental cursors: ``{usage_point_id: UTC ISO 8601 newest reading start}``.
+#
+# One UsagePoint is one physical meter, and a subscription can carry several — commonly a
+# different commodity each (electricity daily, gas or water often monthly or bi-monthly, on
+# separate meter-reading routes). Nothing in ESPI makes them publish on a shared schedule, so a
+# single frontier for the whole entry is driven by whichever meter runs furthest ahead and says
+# nothing about where the others actually are.
+#
+# The poll window is scoped to the OLDEST of these (see [GreenButtonCoordinator._published_min]):
+# the window has to reach back far enough for the most-behind meter, or a fast meter would drag
+# `published-min` past a slow one's not-yet-collected data.
+#
+# CONF_LAST_FETCHED_AT is still maintained alongside this as the entry-wide frontier — it answers
+# "has this entry ever imported a reading?" and drives the startup poll-due check, neither of which
+# is a per-meter question. An entry written before this key existed has no map; the fallback in
+# [_published_min] reads the scalar until the next successful fetch seeds the map, so no migration
+# step is needed.
+CONF_USAGE_POINT_CURSORS = "usage_point_cursors"
 
 # The exact `published-min`/`published-max` (UTC ISO 8601) of a fetch the utility answered with
 # HTTP 202 — "I'm preparing that dataset out of band". Set when a poll hits 202, replayed verbatim
