@@ -5,31 +5,47 @@ body:
   - type: markdown
     attributes:
       value: |
-        **Please update to the latest version before filing.** This project has no tagged
-        releases yet — HACS tracks the `master` branch directly, so "latest" moves often and
-        a bug you're hitting may already be fixed.
+        **Please update to the latest release before filing** — the bug you're hitting may
+        already be fixed.
+
+        ⚠️ **If HACS shows you a commit id (like `3730b11`) instead of a version number**, you
+        installed before this project had tagged releases, and HACS will never offer you an
+        update — it compares the commit id against the release number and can conclude you're
+        already ahead. Use **HACS → Open Green Button → ⋮ → Redownload** and pick the newest
+        version. You only need to do this once.
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: |
+        **The single most useful thing you can attach.** Settings → Devices & Services →
+        **Open Green Button** → ⋮ → **Download Diagnostics**, then drag the file in here.
+
+        It records the integration version, your utility, and the state of the poll
+        automatically — which saves a round trip of questions. Note that with debug logging
+        enabled the download also contains your raw utility feed, so look it over first if
+        you'd rather not post it.
+
+        Skip this only if setup fails so early that no integration entry exists.
 
   - type: input
     id: version
     attributes:
       label: Installed version
       description: |
-        The commit id HACS shows for this integration, e.g. `c05ffc5`.
+        The version HACS shows for this integration, e.g. `0.2.0`. Found under
+        HACS → search for **Open Green Button** → open it.
 
-        **Where to find it:** HACS → search for **Open Green Button** → open it. The installed
-        version is shown on that page (and in the ⋮ → **Redownload** dialog). Because there are
-        no releases, this is a commit id rather than a version number — please paste it as-is
-        rather than the `0.1.0` that Home Assistant's integration page shows, which never changes.
-      placeholder: c05ffc5
-    validations:
-      required: true
+        If you're attaching diagnostics you can leave this blank — it's in there.
+      placeholder: 0.2.0
 
   - type: dropdown
     id: updated
     attributes:
-      label: Did you re-check on the latest version?
+      label: Did you re-check on the latest release?
       options:
-        - "Yes — the version above is current and the problem is still there"
+        - "Yes — I'm on the newest version and the problem is still there"
         - "No"
     validations:
       required: true
@@ -55,15 +71,16 @@ body:
     attributes:
       label: Logs
       description: |
-        Settings → System → Logs, filtered to `custom_components.greenbutton`. Redact
-        account numbers and usage point ids if you'd rather not post them.
+        Settings → System → Logs, filtered to `custom_components.greenbutton`.
+
+        For anything involving missing or delayed data, please turn on debug logging first
+        (Settings → Devices & Services → Open Green Button → **Enable debug logging**), let it
+        run through at least one poll, then copy the log. The debug output records what each
+        poll asked the utility for and what came back, which is usually what settles the
+        question. Redact account numbers and usage point ids if you'd rather not post them.
       render: text
 
   - type: textarea
     id: extra
     attributes:
       label: Anything else
-      description: |
-        Diagnostics (Settings → Devices & Services → Open Green Button → ⋮ → **Download
-        Diagnostics**) are very helpful for data problems. Note that with debug logging on,
-        the download includes your raw utility feed — check it over before attaching.

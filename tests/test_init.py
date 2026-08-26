@@ -7,6 +7,7 @@ selection and validation (the rebuild mechanics themselves live in test_coordina
 
 from __future__ import annotations
 
+import logging
 import zoneinfo
 from contextlib import contextmanager
 from datetime import UTC, datetime, time, timedelta
@@ -448,3 +449,42 @@ async def test_service_errors_when_no_entries_loaded(hass: HomeAssistant) -> Non
 
     with pytest.raises(ServiceValidationError):
         await hass.services.async_call(DOMAIN, SERVICE_REBUILD_STATISTICS, {}, blocking=True)
+
+
+async def test_setup_logs_the_integration_version(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The setup line names the running version.
+
+    A pasted log excerpt is the commonest thing a bug report carries, and on its own it doesn't
+    say which build produced it. In issues/10 the affected client version had to be inferred from
+    poll cadence in server-side logs, which cost days. Assert against manifest.json rather than a
+    literal so a release bump can't silently make the log disagree with what's installed.
+    """
+    import json
+    from pathlib import Path
+
+    manifest = json.loads(
+        (Path(__file__).parent.parent / "custom_components/greenbutton/manifest.json").read_text()
+    )
+
+    entry = _entry()
+    entry.add_to_hass(hass)
+
+    empty = UsageResponse(updated=None, usage_points=[], new_credentials=None)
+    fetch = AsyncMock(return_value=empty)
+    with (
+        _stub_network(fetch),
+        caplog.at_level(logging.INFO, logger="custom_components.greenbutton"),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    setup_lines = [
+        r.getMessage() for r in caplog.records if "Set up Open Green Button" in r.getMessage()
+    ]
+    assert setup_lines, "no setup line was logged"
+    assert manifest["version"] in setup_lines[0], setup_lines[0]
+
+    await hass.config_entries.async_unload(entry.entry_id)

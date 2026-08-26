@@ -28,6 +28,7 @@ from homeassistant.exceptions import ConfigEntryNotReady, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
+from homeassistant.loader import async_get_integration
 from homeassistant.util import dt as dt_util
 
 from .api import OpenGbApi
@@ -213,8 +214,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # OptionsFlowWithReload, which reloads only when the user saves the form — so nothing
     # here needs a reload on data change.
     _async_register_services(hass)
+    # Stamp the integration version into the log. A pasted log excerpt is the commonest thing a
+    # bug report carries, and without this it doesn't say which build produced it — issues/10 ran
+    # for two weeks partly because the affected version had to be inferred from poll cadence in
+    # server-side logs. HA reads this from manifest.json and refuses to load a custom integration
+    # without a valid one, so it is always present; the lookup is cached.
+    integration = await async_get_integration(hass, DOMAIN)
     _LOGGER.info(
-        "Set up Open Green Button entry %s for utility %s",
+        "Set up Open Green Button %s entry %s for utility %s",
+        integration.version,
         entry.entry_id,
         entry.data.get("utility_id"),
     )
