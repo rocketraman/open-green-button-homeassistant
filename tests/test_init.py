@@ -7,6 +7,7 @@ selection and validation (the rebuild mechanics themselves live in test_coordina
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import zoneinfo
 from contextlib import contextmanager
@@ -15,7 +16,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from homeassistant.config_entries import SOURCE_REAUTH
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntryState
 from homeassistant.core import CoreState
 from homeassistant.exceptions import ConfigEntryAuthFailed, ServiceValidationError
 from homeassistant.util import dt as dt_util
@@ -267,6 +268,83 @@ async def test_restart_after_a_missed_interval_fetches_and_surfaces_reauth(
         if flow["context"].get("source") == SOURCE_REAUTH
     ]
     assert len(reauths) == 1, "reauth did not surface at startup for a revoked token"
+
+
+async def test_a_slow_first_fetch_does_not_hold_setup_open(hass: HomeAssistant) -> None:
+    """Regression (issues/49): setup must not stay open for a minutes-long first fetch.
+
+    A first full-history pull against a slow custodian is a minutes-scale operation, but setup is
+    usually driven by a browser request (finishing the config flow, or Reload) that a reverse
+    proxy in front of HA abandons at its own read timeout — cancelling the setup task, and with it
+    anything setup is inline-awaiting. That leaves the entry in SETUP_ERROR, which is terminal: no
+    backoff, no retry. So setup waits only briefly, then completes and lets the fetch land later.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry()
+    entry.add_to_hass(hass)
+
+    released = asyncio.Event()
+    response = _ok_fetch().return_value
+
+    async def _slow_fetch(*_args, **_kwargs):
+        await released.wait()
+        return response
+
+    fetch = AsyncMock(side_effect=_slow_fetch)
+    with (
+        _stub_network(fetch),
+        patch("custom_components.greenbutton.FIRST_REFRESH_GRACE", timedelta(seconds=0.01)),
+    ):
+        # The timeout is the assertion: setup awaited the fetch inline before this fix, and
+        # `released` is only set below, so an inline await would hang here.
+        async with asyncio.timeout(10):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+        assert entry.state is ConfigEntryState.LOADED
+        # The poll timer is armed even though the first fetch hasn't landed.
+        assert entry.entry_id in hass.data[DOMAIN]
+
+        # ...and the fetch is still running, not cancelled by setup returning.
+        released.set()
+        await hass.async_block_till_done(wait_background_tasks=True)
+        fetch.assert_awaited_once()
+
+    await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_a_late_first_fetch_failure_still_surfaces_reauth(hass: HomeAssistant) -> None:
+    """A revoked token found after setup completed must still open a reauth flow.
+
+    `async_config_entry_first_refresh` re-raises ConfigEntryAuthFailed *instead of* starting the
+    reauth flow, on the assumption that config-entry setup will do it. Once setup has returned,
+    nothing else will — so the background task's done-callback has to.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry()
+    entry.add_to_hass(hass)
+
+    released = asyncio.Event()
+
+    async def _slow_failure(*_args, **_kwargs):
+        await released.wait()
+        raise ConfigEntryAuthFailed("revoked")
+
+    with (
+        _stub_network(AsyncMock(side_effect=_slow_failure)),
+        patch("custom_components.greenbutton.FIRST_REFRESH_GRACE", timedelta(seconds=0.01)),
+    ):
+        async with asyncio.timeout(10):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+        released.set()
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    reauths = [
+        flow
+        for flow in hass.config_entries.flow.async_progress()
+        if flow["context"].get("source") == SOURCE_REAUTH
+    ]
+    assert len(reauths) == 1, "reauth did not surface for a token revoked after setup completed"
+
+    await hass.config_entries.async_unload(entry.entry_id)
 
 
 async def test_manual_reload_always_fetches(hass: HomeAssistant) -> None:

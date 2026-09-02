@@ -38,6 +38,21 @@ _LOGGER = logging.getLogger(__name__)
 # so a tight cap hides the actual upstream reason (e.g. why a Data Custodian 400s a data request).
 _MAX_ERROR_CHARS = 1200
 
+# How long to let a usage fetch run before giving up on it.
+#
+# aiohttp's default is `total=300`, and that is NOT enough: a first, full-history pull answers
+# with a plain 200 — after four to seven minutes. Measured against Toronto Hydro (savagedata),
+# whose first 2-year pull returned 200 at 268 s, 269 s, 306 s and 409 s on four separate
+# attempts. The proxy's own cap on the utility call is 300 s (UTILITY_REQUEST_TIMEOUT_MS), but
+# the whole request is that plus the token refresh, so the client's bound has to sit above it
+# rather than at it. Nothing waits on this — it runs as a background task off the config-entry
+# setup path — so a generous bound costs a held connection, not a blocked integration.
+#
+# `sock_read` deliberately isn't set: the proxy sends NOTHING until the custodian answers (it
+# streams the feed straight through, so the response headers wait on upstream), and a read
+# timeout shorter than the total would fire during exactly the silence this is meant to allow.
+USAGE_FETCH_TIMEOUT = aiohttp.ClientTimeout(total=900, sock_connect=30)
+
 
 @dataclass(frozen=True, slots=True)
 class UtilitySummary:
@@ -468,7 +483,9 @@ class OpenGbApi:
             body["resourcePath"] = resource_path
 
         headers = {**self.headers, "Authorization": f"Bearer {proxy_token}"}
-        async with self._session.post(url, headers=headers, json=body) as resp:
+        async with self._session.post(
+            url, headers=headers, json=body, timeout=USAGE_FETCH_TIMEOUT
+        ) as resp:
             # Rotated credentials can accompany ANY response, not just 200. The proxy refreshes
             # the access token (and the utility may redeem a one-time refresh token) BEFORE the
             # resource fetch, so a subsequent upstream failure still carries a new blob we must

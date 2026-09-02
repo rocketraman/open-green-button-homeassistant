@@ -18,13 +18,18 @@ the same utility (sandbox / test account beside a real account, or multi-meter h
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, time, timedelta
 from typing import TYPE_CHECKING
 
 import voluptuous as vol
 from homeassistant.core import CoreState
-from homeassistant.exceptions import ConfigEntryNotReady, ServiceValidationError
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
+    ServiceValidationError,
+)
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
@@ -42,6 +47,7 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_SERVER_BASE_URL,
     DOMAIN,
+    FIRST_REFRESH_GRACE,
     SERVICE_REBUILD_STATISTICS,
 )
 from .coordinator import GreenButtonCoordinator
@@ -49,6 +55,8 @@ from .diagnostics import async_remove_xml_cache
 from .statistics import async_clear_statistics_for_entry
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant, ServiceCall
 
@@ -112,12 +120,61 @@ def _poll_is_due(entry: ConfigEntry, poll_interval: timedelta, daily_at: time | 
     return last_fetched < _previous_daily_occurrence(now, daily_at)
 
 
+def _make_late_first_refresh_handler(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> Callable[[asyncio.Task[None]], None]:
+    """Build the done-callback for a first refresh that outlived config-entry setup.
+
+    Setup has already returned True by the time this runs, so its outcome can no longer be
+    expressed as ConfigEntryNotReady / ConfigEntryAuthFailed — nothing is left to raise them to,
+    and an unretrieved task exception would surface as a bare "Task exception was never
+    retrieved" traceback. Translate instead:
+
+    * auth failure → start the reauth flow ourselves. `async_config_entry_first_refresh` re-raises
+      ConfigEntryAuthFailed *instead of* calling `async_start_reauth` (it expects setup to do it),
+      so nothing else would.
+    * anything else → log it. The entry stays loaded with `last_update_success` False, exactly as
+      a failed periodic poll leaves it, and the coordinator's own timers carry the retry: the
+      short pending-retry timer for a deferred (202) fetch, the poll timer otherwise.
+    """
+
+    def _handle(task: asyncio.Task[None]) -> None:
+        if task.cancelled():  # entry unloaded mid-fetch; nothing to report
+            return
+        err = task.exception()
+        if err is None:
+            _LOGGER.info("Entry %s: background first fetch completed", entry.entry_id)
+            return
+        if isinstance(err, ConfigEntryAuthFailed):
+            _LOGGER.warning(
+                "Entry %s: background first fetch needs re-authorization: %s",
+                entry.entry_id,
+                err,
+            )
+            entry.async_start_reauth(hass)
+            return
+        _LOGGER.warning(
+            "Entry %s: background first fetch failed (%s); retrying on the coordinator's own "
+            "schedule",
+            entry.entry_id,
+            err,
+        )
+
+    return _handle
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up an Open Green Button config entry.
 
     Creates a coordinator, fetches when the schedule says a fetch is owed (which will trigger
     reauth if the persisted refresh token has been revoked while HA was down), and stashes the
     coordinator in ``hass.data`` for diagnostics.
+
+    That fetch is started as a task the entry owns and only waited on for FIRST_REFRESH_GRACE:
+    it can legitimately run for minutes on a first, full-history pull, which is longer than
+    anything driving setup is willing to wait. Failures that arrive inside the grace period are
+    raised from here as they always were; later ones are handled by
+    [_make_late_first_refresh_handler].
     """
     api = OpenGbApi(
         session=async_get_clientsession(hass),
@@ -140,24 +197,47 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # the place a token revoked while HA was down still surfaces, and keeps the coordinator's
     # import-logic repair (CONF_IMPORT_LOGIC_REVISION) running at startup.
     if hass.state is CoreState.running or _poll_is_due(entry, poll_interval, daily_poll_time):
-        try:
-            await coordinator.async_config_entry_first_refresh()
-        except ConfigEntryNotReady:
-            # A utility preparing a deferred batch (HTTP 202) is NOT a failed setup. The entry is
-            # authorized, its credentials work, and the data is coming — it just isn't here yet,
-            # which for some custodians is the normal first-connection path. Refusing to finish
-            # setup for that would leave the entry showing as broken and, worse, would leave the
-            # poll timer below unarmed and the user's polling options inert, since HA never gets
-            # past this line. The coordinator raises a repair issue and re-attempts on its own
-            # short timer instead. Every other failure still means "can't start" — re-raise so
-            # HA retries with its own backoff.
-            if not coordinator.data_pending:
-                raise
+        # Run it as a task the ENTRY owns, not inline. A first, full-history pull can take
+        # minutes against a slow custodian, and setup is usually driven by a browser request
+        # (finishing the config flow, or Reload) that a reverse proxy in front of HA will
+        # abandon long before that — cancelling the setup task, and with it an inline await.
+        # A background task survives that, because nothing awaits it here. See FIRST_REFRESH_GRACE.
+        first_refresh = entry.async_create_background_task(
+            hass,
+            coordinator.async_config_entry_first_refresh(),
+            name=f"{DOMAIN} first refresh {entry.entry_id}",
+        )
+        # `asyncio.wait` never cancels what it waits on, on timeout or on being cancelled itself,
+        # so the fetch keeps running either way.
+        await asyncio.wait({first_refresh}, timeout=FIRST_REFRESH_GRACE.total_seconds())
+
+        if not first_refresh.done():
             _LOGGER.info(
-                "Entry %s: utility is still preparing the data (HTTP 202). Completing setup "
-                "anyway — the coordinator will keep re-attempting until it lands",
+                "Entry %s: first fetch is still running after %s — completing setup and letting "
+                "it finish in the background",
                 entry.entry_id,
+                FIRST_REFRESH_GRACE,
             )
+            first_refresh.add_done_callback(_make_late_first_refresh_handler(hass, entry))
+        else:
+            try:
+                first_refresh.result()
+            except ConfigEntryNotReady:
+                # A utility preparing a deferred batch (HTTP 202) is NOT a failed setup. The entry
+                # is authorized, its credentials work, and the data is coming — it just isn't here
+                # yet, which for some custodians is the normal first-connection path. Refusing to
+                # finish setup for that would leave the entry showing as broken and, worse, would
+                # leave the poll timer below unarmed and the user's polling options inert, since HA
+                # never gets past this line. The coordinator raises a repair issue and re-attempts
+                # on its own short timer instead. Every other failure still means "can't start" —
+                # re-raise so HA retries with its own backoff.
+                if not coordinator.data_pending:
+                    raise
+                _LOGGER.info(
+                    "Entry %s: utility is still preparing the data (HTTP 202). Completing setup "
+                    "anyway — the coordinator will keep re-attempting until it lands",
+                    entry.entry_id,
+                )
     else:
         _LOGGER.info(
             "Entry %s polled at %s, within its %s cadence — skipping the startup fetch and "

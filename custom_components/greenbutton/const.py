@@ -156,6 +156,23 @@ CONF_PENDING_SINCE = "pending_since"
 # minutes converges within a couple of attempts without hammering the resource server.
 PENDING_RETRY_INTERVAL = timedelta(minutes=5)
 
+# How long config-entry setup waits for the first fetch before completing anyway and letting that
+# fetch finish in the background.
+#
+# A first, full-history pull from a slow custodian is a minutes-scale operation: the proxy gives
+# the utility up to five minutes before the first byte because savagedata routinely needs tens of
+# seconds. Setup, though, is usually driven by an HTTP request the user's browser made — finishing
+# the config flow, or hitting Reload — and anything in front of HA that gives up on that request
+# (nginx's default proxy_read_timeout is 60s) cancels the setup task with it. That lands the entry
+# in SETUP_ERROR, which unlike ConfigEntryNotReady is terminal: no backoff, no retry, "unable to
+# create connection" until the user restarts HA. See issues/49.
+#
+# So bound the *waiting*, never the fetch. Short enough to stay well inside any such timeout, and
+# to keep a slow utility off HA's startup critical path; long enough that the failures worth
+# reporting as a failed setup (bad credentials, proxy down, DNS) still arrive in time to be
+# raised from here.
+FIRST_REFRESH_GRACE = timedelta(seconds=20)
+
 # How long to keep up that fast cadence before concluding the batch is not coming. Past this the
 # entry drops back to its ordinary poll interval and the repair issue escalates from "your utility
 # is preparing this" to "this hasn't arrived, please report it". A day is deliberately generous:
