@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-09-02
+
+Fixes a first connection that could never complete at a slow utility, where
+setup failed with "cancelled" and the entry stayed broken until Home Assistant
+was restarted
+([#49](https://github.com/rocketraman/open-green-button/issues/49)).
+
+### Fixed
+
+- Setup no longer stays open for the whole first fetch. A first, full-history
+  pull is minutes-scale work at some utilities — Toronto Hydro answered the same
+  2-year request after 268s, 269s, 306s and 409s on four attempts — but setup is
+  usually driven by a request from your browser, and anything in front of Home
+  Assistant that gives up on that request cancelled the setup with it. That left
+  the entry in a terminal error state: no retry, no backoff, "unable to create
+  connection" until a restart. Setup now waits 20 seconds and then completes,
+  letting the fetch finish in the background and import when it lands.
+- A knock-on effect of the above: because the config flow's own request was the
+  one being abandoned, a retry of it re-submitted the single-use claim code and
+  failed as "already used", so the real problem presented as a broken claim.
+- The usage request now has a 15-minute timeout rather than inheriting the HTTP
+  library's 5-minute default, which two of the four measured pulls exceeded.
+
 ## [0.2.0] - 2026-08-24
 
 Collects usage from utilities that prepare their data asynchronously — Alectra,
