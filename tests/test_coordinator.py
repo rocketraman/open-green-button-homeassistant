@@ -1189,6 +1189,32 @@ def _response_with_cumulative_register() -> UsageResponse:
     return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
 
 
+def _response_with_cumulative_register_only() -> UsageResponse:
+    """Milton's billing-boundary shape: only daily cumulative register snapshots."""
+    bulk_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="BULK_QUANTITY",
+        interval_length_seconds=86400,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=0,
+        currency_numeric_code=124,
+    )
+    register = MeterReadingSeries(
+        meter_reading_id="register",
+        reading_type=bulk_type,
+        readings=[
+            UsageReading(datetime(2026, 10, 4, tzinfo=UTC), 86400, 143_976_290.0),
+            UsageReading(datetime(2026, 10, 5, tzinfo=UTC), 86400, 143_990_216.0),
+            UsageReading(datetime(2026, 10, 6, tzinfo=UTC), 86400, 144_009_947.0),
+            UsageReading(datetime(2026, 10, 7, tzinfo=UTC), 86400, 144_028_369.0),
+        ],
+    )
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=[register])
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
 def _migration_patches(*, had_statistics: bool):
     """Patch the recorder boundary for a migration test; the decision logic stays real."""
     return (
@@ -1226,6 +1252,26 @@ async def test_import_migration_rebuilds_entry_with_cumulative_register(
 
     assert coordinator.last_exception is None
     assert api.fetch_usage.await_count == 2  # the poll, then the rebuild's full-history re-fetch
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
+async def test_import_migration_rebuilds_entry_with_register_only_response(
+    hass: HomeAssistant,
+) -> None:
+    """Revision 4 repairs a feed corrupted when its hourly sibling temporarily vanished."""
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, 3)
+    api = _api_returning(_response_with_cumulative_register_only())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    assert coordinator.last_exception is None
+    assert api.fetch_usage.await_count == 2
     clear_mock.assert_awaited_once_with(hass, entry.entry_id)
     assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
 
@@ -1553,6 +1599,57 @@ async def test_advance_cursor_writes_one_cursor_per_meter(hass: HomeAssistant) -
     # The entry-wide frontier still tracks the newest across meters: it answers "has this entry
     # ever imported anything", which is not a per-meter question.
     assert entry.data[CONF_LAST_FETCHED_AT] == fast.isoformat()
+
+
+async def test_register_only_response_does_not_advance_cursor(hass: HomeAssistant) -> None:
+    """A skipped cumulative register must not move the cursor past missing hourly data."""
+    prior = datetime(2026, 10, 5, 3, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_LAST_FETCHED_AT: prior.isoformat(),
+            CONF_USAGE_POINT_CURSORS: {"up1": prior.isoformat()},
+        },
+    )
+    register_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="BULK_QUANTITY",
+        interval_length_seconds=86400,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=-3,
+        currency_numeric_code=124,
+    )
+    register = MeterReadingSeries(
+        meter_reading_id="daily-register",
+        reading_type=register_type,
+        readings=[
+            UsageReading(datetime(2026, 10, day, 5, tzinfo=UTC), 86400, value)
+            for day, value in (
+                (5, 143_990_215_800.0),
+                (6, 144_009_946_800.0),
+                (7, 144_028_369_200.0),
+            )
+        ],
+    )
+    response = UsageResponse(
+        updated=None,
+        usage_points=[UsagePoint("up1", "electricity", [register])],
+        new_credentials=None,
+    )
+    coordinator = GreenButtonCoordinator(hass, _api_returning(response), entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    assert entry.data[CONF_LAST_FETCHED_AT] == prior.isoformat()
+    assert entry.data[CONF_USAGE_POINT_CURSORS] == {"up1": prior.isoformat()}
 
 
 async def test_window_scopes_to_the_furthest_behind_meter(hass: HomeAssistant) -> None:

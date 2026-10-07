@@ -238,7 +238,11 @@ CONF_IMPORT_LOGIC_REVISION = "import_logic_revision"
 #       billed through UsageSummary; feeds that itemize per-interval <cost> never ran the
 #       selection and are stamped forward untouched. Usage rows are unaffected — the damage is
 #       cost, and it is damage by omission, which is why nobody reported it as wrong data.
-IMPORT_LOGIC_REVISION = 3
+#   4 — an incremental Milton response containing only its daily cumulative register snapshots
+#       was imported as daily consumption because the hourly sibling used to identify the
+#       register was temporarily absent. The register also advanced the per-meter cursor past
+#       the missing hourly data. Affected rows must be rebuilt after the classifier fix.
+IMPORT_LOGIC_REVISION = 4
 
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see

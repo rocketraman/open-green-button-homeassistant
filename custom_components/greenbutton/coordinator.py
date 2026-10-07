@@ -70,6 +70,7 @@ from .statistics import (
     async_clear_statistics_for_entry,
     async_entry_has_statistics,
     import_usage_statistics,
+    is_interval_consumption_series,
     response_needs_import_migration,
 )
 from .storage import xml_cache_path
@@ -95,6 +96,8 @@ def _newest_reading_start(response: UsageResponse) -> datetime | None:
     newest: datetime | None = None
     for up in response.usage_points:
         for series in up.series:
+            if not is_interval_consumption_series(up, series):
+                continue
             for reading in series.readings:
                 if newest is None or reading.start > newest:
                     newest = reading.start
@@ -111,6 +114,8 @@ def _newest_reading_start_by_usage_point(response: UsageResponse) -> dict[str, d
     newest: dict[str, datetime] = {}
     for up in response.usage_points:
         for series in up.series:
+            if not is_interval_consumption_series(up, series):
+                continue
             for reading in series.readings:
                 current = newest.get(up.usage_point_id)
                 if current is None or reading.start > current:

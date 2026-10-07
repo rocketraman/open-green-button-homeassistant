@@ -224,6 +224,7 @@ _IMPORT_MIGRATION_CHECKS: dict[int, Callable[[UsageResponse], bool | None]] = {
     1: response_has_cumulative_series,
     2: response_has_multi_hour_readings,
     3: response_cost_may_be_missing_bills,
+    4: response_has_cumulative_series,
 }
 
 
@@ -447,25 +448,56 @@ def _is_interval_consumption_series(up: UsagePoint, series: MeterReadingSeries) 
     Energy dashboard, and (via [response_has_cumulative_series]) triggered a repair rebuild
     that purged the account's existing rows and re-imported nothing.
 
-    So a cumulative-named series is only excluded when this UsagePoint also carries a
-    non-cumulative series of the *same flow direction* — which is precisely the statistic_id
-    collision that motivated #6, and a strictly better source to resolve it in favour of. With
-    no such sibling the series is everything the utility publishes, and importing it is the
-    only way the account gets any energy at all. Flow direction matters: a FORWARD register
-    alongside a REVERSE delta series is not a collision, and excluding it would drop the only
-    consumption data there is.
+    A cumulative-named series is excluded when this UsagePoint also carries a non-cumulative
+    series of the *same flow direction* — which is precisely the statistic_id collision that
+    motivated #6, and a strictly better source to resolve it in favour of. Flow direction
+    matters: a FORWARD register alongside a REVERSE delta series is not a collision, and
+    excluding it would drop the only consumption data there is.
 
-    Testing the values for monotonicity instead does NOT work here: each Consumers Energy
-    MeterReading holds exactly one reading, and a one-element series is trivially
-    non-decreasing, so every one of them would still read as a register.
+    Milton can also publish an incremental response containing only several daily register
+    snapshots while its hourly series is temporarily absent (for example around a meter-read
+    or billing rollover). With no sibling, the old rule imported every meter-lifetime total as
+    one day's consumption and advanced the cursor past the missing hourly data. A multi-reading
+    daily series whose values are non-decreasing is self-identifying as a register and is
+    excluded even without a sibling.
+
+    A lone cumulative series that does not meet that narrow fingerprint still imports. That
+    preserves billing-period-only feeds whose genuine period consumption is mislabelled
+    ``BULK_QUANTITY``.
+
+    Consumers Energy remains safe because each MeterReading holds exactly one month-long
+    reading, not two or more daily snapshots.
     """
     if series.reading_type.accumulation_behaviour not in _CUMULATIVE_ACCUMULATION:
         return True
-    return not any(
+    if any(
         other.reading_type.accumulation_behaviour not in _CUMULATIVE_ACCUMULATION
         and other.reading_type.flow_direction == series.reading_type.flow_direction
         for other in up.series
+    ):
+        return False
+    return not _is_self_evident_daily_register(series)
+
+
+def _is_self_evident_daily_register(series: MeterReadingSeries) -> bool:
+    """True for a lone sequence of daily, non-decreasing cumulative snapshots.
+
+    Two readings are required so a one-reading billing-period feed is never classified from
+    monotonicity alone. Restricting the declaration to exactly one day keeps month-long
+    ``BULK_QUANTITY`` readings on their historical import path.
+    """
+    if series.reading_type.interval_length_seconds != 86400 or len(series.readings) < 2:
+        return False
+    values = [reading.value for reading in sorted(series.readings, key=lambda item: item.start)]
+    pairs = list(zip(values, values[1:], strict=False))
+    return any(current > previous for previous, current in pairs) and all(
+        current >= previous for previous, current in pairs
     )
+
+
+def is_interval_consumption_series(up: UsagePoint, series: MeterReadingSeries) -> bool:
+    """Public classifier shared with the coordinator's cursor calculation."""
+    return _is_interval_consumption_series(up, series)
 
 
 def _forward_interval_series(up: UsagePoint) -> list[MeterReadingSeries]:

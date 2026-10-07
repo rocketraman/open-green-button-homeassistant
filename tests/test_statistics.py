@@ -573,6 +573,7 @@ def _series(
     flow_direction: str = "FORWARD",
     *,
     meter_reading_id: str = "mr1",
+    interval_length_seconds: int = 3600,
     unit: str = "WATT_HOURS",
     readings: list[UsageReading] | None = None,
 ) -> MeterReadingSeries:
@@ -583,7 +584,7 @@ def _series(
             commodity="ELECTRICITY_SECONDARY_METERED",
             flow_direction=flow_direction,
             accumulation_behaviour=behaviour,
-            interval_length_seconds=3600,
+            interval_length_seconds=interval_length_seconds,
             unit_of_measure=unit,
             unit_of_measure_symbol="Wh",
             power_of_ten_multiplier=0,
@@ -691,6 +692,56 @@ async def test_lone_cumulative_series_still_imports(hass: HomeAssistant) -> None
         calls = await _import_and_collect_usage(hass, _accumulation_response(behaviour))
         assert len(calls) == 1, f"{behaviour} with no sibling must still import"
         assert [round(s["sum"], 3) for s in calls[0].args[2]] == [1.0, 2.5], behaviour
+
+
+async def test_lone_monotonic_daily_cumulative_series_is_excluded(
+    hass: HomeAssistant,
+) -> None:
+    """A Milton register-only incremental response must not become daily consumption.
+
+    Around a meter-read rollover Milton can omit the hourly DELTA_DATA sibling and return only
+    several daily BULK_QUANTITY snapshots. Their non-decreasing meter-lifetime values make the
+    series self-identifying even without the sibling that normally supersedes it.
+    """
+    start = datetime(2026, 10, 4, 5, tzinfo=UTC)
+    register = _series(
+        "BULK_QUANTITY",
+        interval_length_seconds=86400,
+        readings=[
+            UsageReading(start + timedelta(days=index), 86400, value)
+            for index, value in enumerate((143_970_484.8, 143_990_215.8, 144_009_946.8))
+        ],
+    )
+    response = UsageResponse(
+        updated=None,
+        usage_points=[UsagePoint("up1", "electricity", [register])],
+        new_credentials=None,
+    )
+
+    assert await _import_and_collect_usage(hass, response) == []
+
+
+async def test_lone_nonmonotonic_daily_cumulative_series_still_imports(
+    hass: HomeAssistant,
+) -> None:
+    """Do not drop a daily consumption feed merely because its behaviour is mislabelled."""
+    start = datetime(2026, 10, 4, 5, tzinfo=UTC)
+    series = _series(
+        "BULK_QUANTITY",
+        interval_length_seconds=86400,
+        readings=[
+            UsageReading(start + timedelta(days=index), 86400, value)
+            for index, value in enumerate((18_000.0, 12_000.0, 21_000.0))
+        ],
+    )
+    response = UsageResponse(
+        updated=None,
+        usage_points=[UsagePoint("up1", "electricity", [series])],
+        new_credentials=None,
+    )
+
+    calls = await _import_and_collect_usage(hass, response)
+    assert len(calls) == 1
 
 
 async def test_register_survives_a_sibling_of_the_other_flow_direction(
