@@ -1,7 +1,8 @@
 """Config-entry diagnostics for Open Green Button.
 
 Surfaced via **Settings → Devices & Services → Open Green Button → ⋮ → Download
-Diagnostics**. The output is a JSON file containing entry config (with secrets redacted),
+Diagnostics**. The output is a JSON file containing entry config (with secrets and the
+customer's address / account number redacted),
 coordinator state, the parsed shape of the last fetched ESPI feed, and — if debug logging
 has been enabled on the integration and a fetch has completed since then — the raw upstream
 XML inline. The XML is loaded from disk only when diagnostics is requested; we don't keep
@@ -22,12 +23,20 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.components.diagnostics import async_redact_data
+from homeassistant.components.diagnostics import REDACTED, async_redact_data
 
-from .const import CONF_ENCRYPTED_REFRESH_BLOB, CONF_PROXY_TOKEN, DOMAIN
+from .const import (
+    CONF_CUSTOMER_ACCOUNT_ID,
+    CONF_CUSTOMER_ADDRESS,
+    CONF_CUSTOMER_LABEL,
+    CONF_ENCRYPTED_REFRESH_BLOB,
+    CONF_PROXY_TOKEN,
+    DOMAIN,
+)
 from .storage import xml_cache_path
 
 if TYPE_CHECKING:
@@ -41,7 +50,16 @@ _LOGGER = logging.getLogger(__package__)
 
 # Encrypted but still sensitive — the blob is opaque to the recipient of a diagnostics
 # bundle but it's still a credential against the proxy server.
-REDACT_KEYS = {CONF_ENCRYPTED_REFRESH_BLOB, CONF_PROXY_TOKEN}
+#
+# The customer fields identify the end user: the service address, the utility account number,
+# and the label derived from one of them (see [api.CustomerInfo.label]). A diagnostics bundle
+# is routinely attached to a public issue, so none of them may leave in plain text.
+_CUSTOMER_KEYS = (CONF_CUSTOMER_LABEL, CONF_CUSTOMER_ADDRESS, CONF_CUSTOMER_ACCOUNT_ID)
+REDACT_KEYS = {CONF_ENCRYPTED_REFRESH_BLOB, CONF_PROXY_TOKEN, *_CUSTOMER_KEYS}
+
+# Atom `<title>` text in the raw feed. Custodians commonly put the service address in a
+# UsagePoint entry's title, and the parser never reads titles, so blanking them costs nothing.
+_ATOM_TITLE_RE = re.compile(r"(<(?:\w+:)?title\b[^>]*>)[^<]+(</(?:\w+:)?title>)")
 
 
 async def async_get_config_entry_diagnostics(
@@ -54,6 +72,7 @@ async def async_get_config_entry_diagnostics(
 
     raw_xml_path = xml_cache_path(hass, entry.entry_id)
     raw_xml_bytes, raw_xml_text = await _load_raw_xml(hass, raw_xml_path)
+    customer_values = _customer_values(entry)
 
     coord_state: dict[str, Any] = {"available": False}
     response_summary: dict[str, Any] | None = None
@@ -61,7 +80,7 @@ async def async_get_config_entry_diagnostics(
         coord_state = {
             "available": True,
             "last_update_success": coord.last_update_success,
-            "last_exception": _safe_str(coord.last_exception),
+            "last_exception": _scrub(_safe_str(coord.last_exception), customer_values),
             "update_interval_seconds": (
                 coord.update_interval.total_seconds() if coord.update_interval else None
             ),
@@ -71,7 +90,7 @@ async def async_get_config_entry_diagnostics(
     return {
         "entry": {
             "entry_id": entry.entry_id,
-            "title": entry.title,
+            "title": _scrub(entry.title, customer_values),
             "data": async_redact_data(dict(entry.data), REDACT_KEYS),
             "options": dict(entry.options),
         },
@@ -80,7 +99,7 @@ async def async_get_config_entry_diagnostics(
         "raw_xml_cached_bytes": raw_xml_bytes,
         "raw_xml_path": raw_xml_path,
         "raw_xml_debug_logging_enabled": debug_enabled,
-        "raw_xml": raw_xml_text,
+        "raw_xml": _redact_xml(raw_xml_text, customer_values),
     }
 
 
@@ -127,6 +146,29 @@ def _summarize_response(response: UsageResponse | None) -> dict[str, Any] | None
         ],
         "new_credentials_present": response.new_credentials is not None,
     }
+
+
+def _customer_values(entry: ConfigEntry) -> list[str]:
+    """The stored customer strings, longest first so a value containing another goes whole."""
+    values = {v for k in _CUSTOMER_KEYS if isinstance(v := entry.data.get(k), str) and v}
+    return sorted(values, key=len, reverse=True)
+
+
+def _scrub(text: str | None, customer_values: list[str]) -> str | None:
+    """Replace any verbatim occurrence of a customer value in free text (the entry title embeds
+    the label — see [coordinator.GreenButtonCoordinator._store_customer_label])."""
+    if text is None:
+        return None
+    for value in customer_values:
+        text = text.replace(value, REDACTED)
+    return text
+
+
+def _redact_xml(xml: str | None, customer_values: list[str]) -> str | None:
+    """Blank Atom titles and any verbatim customer value in the cached usage feed."""
+    if xml is None:
+        return None
+    return _scrub(_ATOM_TITLE_RE.sub(rf"\g<1>{REDACTED}\g<2>", xml), customer_values)
 
 
 async def _load_raw_xml(

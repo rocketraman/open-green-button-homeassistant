@@ -20,6 +20,9 @@ from custom_components.greenbutton.api import (
     UsageResponse,
 )
 from custom_components.greenbutton.const import (
+    CONF_CUSTOMER_ACCOUNT_ID,
+    CONF_CUSTOMER_ADDRESS,
+    CONF_CUSTOMER_LABEL,
     CONF_ENCRYPTED_REFRESH_BLOB,
     CONF_PROXY_TOKEN,
     CONF_UTILITY_ID,
@@ -120,6 +123,50 @@ async def test_diagnostics_redacts_credentials(hass: HomeAssistant) -> None:
     assert result["entry"]["data"][CONF_PROXY_TOKEN] != "secret_proxy_token_value"  # noqa: S105
     # Non-sensitive fields stay intact.
     assert result["entry"]["data"][CONF_UTILITY_ID] == "example_utility"
+
+
+async def test_diagnostics_redacts_customer_address(hass: HomeAssistant) -> None:
+    """The service address (and the account number) must not leave in a diagnostics bundle —
+    not from entry.data, not from the entry title the label is folded into, and not from the
+    raw feed, where custodians put the address in a UsagePoint entry's Atom title."""
+    address = "123 EXAMPLE ST, BURLINGTON ON, L0L 0L0"
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=f"Example Utility — {address}",
+        data={
+            CONF_UTILITY_ID: "example_utility",
+            CONF_UTILITY_NAME: "Example Utility",
+            CONF_CUSTOMER_LABEL: address,
+            CONF_CUSTOMER_ADDRESS: address,
+            CONF_CUSTOMER_ACCOUNT_ID: "ACCT-0012345",
+        },
+    )
+    entry.add_to_hass(hass)
+    coord = _stub_coordinator(_sample_response())
+    coord.last_exception = RuntimeError(f"no data for {address}")
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coord
+
+    path = xml_cache_path(hass, entry.entry_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(
+            b"<feed xmlns='http://www.w3.org/2005/Atom'><title>Green Button</title>"
+            b"<entry><title type='text'>123 Example St Unit 4</title>"
+            b"<content><UsagePoint/></content></entry></feed>"
+        )
+    try:
+        result = await async_get_config_entry_diagnostics(hass, entry)
+    finally:
+        os.remove(path)
+
+    text = json.dumps(result)
+    assert address not in text
+    assert "123 Example St" not in text
+    assert "ACCT-0012345" not in text
+    assert result["entry"]["title"] == "Example Utility — **REDACTED**"
+    assert result["entry"]["data"][CONF_UTILITY_NAME] == "Example Utility"
+    # Structure of the feed survives; only the title text is blanked.
+    assert "<title type='text'>**REDACTED**</title><content><UsagePoint/>" in result["raw_xml"]
 
 
 async def test_diagnostics_summarizes_response_with_cost_details(hass: HomeAssistant) -> None:
