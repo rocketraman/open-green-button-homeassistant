@@ -361,3 +361,30 @@ def test_parse_customer_feed_returns_none_when_nothing_recognizable() -> None:
   <entry><content><cust:LocalTimeParameters/></content></entry>
 </feed>"""
     assert parse_customer_feed(feed) is None
+
+
+def test_uom_codes_follow_the_espi_schema() -> None:
+    """ESPI 119 is cubic FEET (42 is cubic metres) — the two were once conflated, which
+    recorded a gas meter's ft³ as m³."""
+    from custom_components.greenbutton.espi import _commodity, _uom
+
+    assert _uom(42) == ("CUBIC_METERS", "m³")
+    assert _uom(119) == ("CUBIC_FEET", "ft³")
+    assert _uom(169)[0] == "THERMS"
+    assert _uom(128)[0] == "US_GALLONS"
+    assert _uom(130)[0] == "IMPERIAL_GALLONS"
+    assert _uom(72)[0] == "WATT_HOURS"
+    assert _uom(None)[0] == "OTHER"
+    assert _commodity(7) == "NATURAL_GAS"
+    assert _commodity(9) == "WATER"
+    assert _commodity(0) == "OTHER"
+
+
+def test_service_kind_codes_follow_the_espi_schema() -> None:
+    """ESPI ServiceKind 5 is refuse (it was once mislabelled COLD); 6 is sewerage."""
+    from custom_components.greenbutton.espi import _service_kind
+
+    assert _service_kind(0) == "ELECTRICITY"
+    assert _service_kind(5) == "REFUSE"
+    assert _service_kind(6) == "SEWERAGE"
+    assert _service_kind(None) == "UNKNOWN"

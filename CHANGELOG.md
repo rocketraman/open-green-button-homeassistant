@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Gas and water meters. Each gets its own statistic series
+  (`…_gas_forward`, `…_water_forward`), named for the commodity and offered in
+  the Energy dashboard's gas and water pickers. Electricity statistic ids are
+  unchanged.
+- More units: therms, BTU and joules (stored as kWh — Home Assistant has no
+  therm unit, and takes gas as either volume or energy), cubic feet, US gallons,
+  litres, and imperial gallons (stored as litres).
+
+### Fixed
+
+- Cubic feet were recorded as cubic metres. ESPI unit code 119 is ft³; m³ is 42.
+
+An account with a gas or water meter rebuilds its statistics once after
+updating, to move them to the new series and re-read history in units that used
+to be skipped. If you had already added such a meter's old statistic to the
+Energy dashboard, re-select the new one. Electricity-only accounts are not
+rebuilt.
+
 ## [0.2.1] - 2026-09-02
 
 Fixes a first connection that could never complete at a slow utility, where

@@ -58,15 +58,28 @@ except ImportError:  # pragma: no cover — older HA core, drop-through to has_m
 
 _LOGGER = logging.getLogger(__name__)
 
+# What a series measures, as far as statistic ids and labels care — see [_series_commodity].
+COMMODITY_ELECTRICITY = "electricity"
+COMMODITY_GAS = "gas"
+COMMODITY_WATER = "water"
+
 
 def statistic_id_for_series(
     entry_id: str,
     usage_point_id: str,
     flow_direction: str,
+    commodity: str | None = None,
 ) -> str:
-    """Return the canonical statistic_id for one (entry, usage_point, flow_direction) triple.
+    """Return the canonical statistic_id for one (entry, usage_point, commodity, flow) series.
 
-    Format: ``greenbutton:<entry_slug>_<usage_point_slug>_<flow_lower>``.
+    Format: ``greenbutton:<entry_slug>_<usage_point_slug>_<flow_lower>`` for electricity, and
+    ``greenbutton:<entry_slug>_<usage_point_slug>_<commodity>_<flow_lower>`` for gas and water
+    ([commodity] is ``COMMODITY_GAS`` / ``COMMODITY_WATER``; see [_series_commodity]).
+
+    Electricity keeps the bare form because that id is already in every existing user's Energy
+    dashboard config — renaming it would orphan their history. Gas and water get a series of
+    their own so a meter's gas can never be summed into the same statistic as its electricity,
+    and so each lands under a name and unit the dashboard's gas and water pickers will offer.
 
     The entry_id prefix is what scopes a test entry's stats apart from a real entry's stats
     on the same utility. Each id component is slugified — HA enforces that the part of a
@@ -74,7 +87,10 @@ def statistic_id_for_series(
     and our inputs (ULID entry_id with uppercase, UUID usage_point_id with hyphens) violate
     that as-is.
     """
-    return f"{DOMAIN}:{_slugify(entry_id)}_{_slugify(usage_point_id)}_{flow_direction.lower()}"
+    prefix = f"{DOMAIN}:{_slugify(entry_id)}_{_slugify(usage_point_id)}"
+    if commodity in (COMMODITY_GAS, COMMODITY_WATER):
+        return f"{prefix}_{commodity}_{flow_direction.lower()}"
+    return f"{prefix}_{flow_direction.lower()}"
 
 
 def statistic_id_for_cost(entry_id: str, usage_point_id: str) -> str:
@@ -215,6 +231,30 @@ def response_cost_may_be_missing_bills(response: UsageResponse) -> bool | None:
     return None
 
 
+def response_has_gas_or_water_series(response: UsageResponse) -> bool:
+    """True when [response] carries a series whose statistic changed with gas/water support.
+
+    The revision-4 signal. Before it, only watt-hours and "cubic metres" were importable, every
+    series went to the bare electricity-style statistic id, and ESPI uom 119 — cubic FEET — was
+    written as m³. An entry with such a feed needs a rebuild for three reasons at once: rows
+    stored under the old id have to move to the dedicated gas/water series, cubic-feet values
+    recorded as m³ are wrong by a factor of 35, and units that used to be skipped (therms,
+    gallons, ...) have history behind the poll cursor that only a full re-fetch will reach.
+
+    A feed that is watt-hours on a non-gas, non-water series throughout — every electricity
+    account — is untouched and stamped forward without a rebuild.
+    """
+    return any(
+        _UNIT_MAP.get(s.reading_type.unit_of_measure) is not None
+        and (
+            s.reading_type.unit_of_measure != "WATT_HOURS"
+            or _series_commodity(up, s) in (COMMODITY_GAS, COMMODITY_WATER)
+        )
+        for up in response.usage_points
+        for s in up.series
+    )
+
+
 # Recognition predicates keyed by the import-logic revision that fixed the bug. An entry stamped
 # at revision N is tested against every predicate for a revision > N — so a user who skipped a
 # release still gets each repair they're owed, in one rebuild rather than one per revision.
@@ -224,6 +264,7 @@ _IMPORT_MIGRATION_CHECKS: dict[int, Callable[[UsageResponse], bool | None]] = {
     1: response_has_cumulative_series,
     2: response_has_multi_hour_readings,
     3: response_cost_may_be_missing_bills,
+    4: response_has_gas_or_water_series,
 }
 
 
@@ -294,6 +335,18 @@ async def import_usage_statistics(
                     series.meter_reading_id,
                     up.usage_point_id,
                     series.reading_type.accumulation_behaviour,
+                )
+                continue
+            if _is_superseded_by_unit(up, series):
+                _warn_once(
+                    f"{entry.entry_id}:{up.usage_point_id}:{series.meter_reading_id}:unit-clash",
+                    "Skipping meter reading %s on usage point %s: it reports the same %s "
+                    "consumption as another series, in a different unit (%s). One statistic "
+                    "can only hold one unit, so the other series is imported instead",
+                    series.meter_reading_id,
+                    up.usage_point_id,
+                    _series_commodity(up, series) or "usage",
+                    series.reading_type.unit_of_measure,
                 )
                 continue
             # Call first, then OR — `or` short-circuits, and every series must be imported.
@@ -468,6 +521,74 @@ def _is_interval_consumption_series(up: UsagePoint, series: MeterReadingSeries) 
     )
 
 
+_COMMODITY_BY_READING_TYPE = {
+    "ELECTRICITY_SECONDARY_METERED": COMMODITY_ELECTRICITY,
+    "ELECTRICITY_PRIMARY_METERED": COMMODITY_ELECTRICITY,
+    "ELECTRICITY_TRANSMISSION_METERED": COMMODITY_ELECTRICITY,
+    "NATURAL_GAS": COMMODITY_GAS,
+    "PROPANE": COMMODITY_GAS,
+    "WATER": COMMODITY_WATER,
+    "NONPOTABLE_WATER": COMMODITY_WATER,
+}
+_COMMODITY_BY_SERVICE_KIND = {
+    "ELECTRICITY": COMMODITY_ELECTRICITY,
+    "GAS": COMMODITY_GAS,
+    "WATER": COMMODITY_WATER,
+}
+# Units only one commodity is ever metered in. Volumes other than gallons/litres are deliberately
+# absent: a cubic metre or cubic foot is as likely gas as water.
+_COMMODITY_BY_UNIT = {
+    "THERMS": COMMODITY_GAS,
+    "BTU": COMMODITY_GAS,
+    "US_GALLONS": COMMODITY_WATER,
+    "IMPERIAL_GALLONS": COMMODITY_WATER,
+    "LITRES": COMMODITY_WATER,
+}
+
+
+def _series_commodity(up: UsagePoint, series: MeterReadingSeries) -> str | None:
+    """What [series] measures: electricity, gas, water — or None when the feed doesn't say.
+
+    Most specific statement wins: the ReadingType's own ``commodity``, then the UsagePoint's
+    ``ServiceCategory``, then the unit where it is unambiguous. Feeds routinely omit the first
+    (and some the second), which is why one source isn't enough. None keeps the series on the
+    bare, pre-gas/water statistic id rather than guessing.
+    """
+    return (
+        _COMMODITY_BY_READING_TYPE.get(series.reading_type.commodity)
+        or _COMMODITY_BY_SERVICE_KIND.get(up.service_kind.upper())
+        or _COMMODITY_BY_UNIT.get(series.reading_type.unit_of_measure)
+    )
+
+
+def _is_superseded_by_unit(up: UsagePoint, series: MeterReadingSeries) -> bool:
+    """True when [series] shares a statistic with a sibling in a different unit, and loses.
+
+    A gas meter may publish the same consumption twice — once as a volume (ft³) and once as
+    billed energy (therms). Both are FORWARD gas, so both map to one [statistic_id_for_series];
+    summing them would add cubic feet to kilowatt-hours. The statistic takes one unit, chosen
+    from the series' ReadingTypes alone so the choice can't flip between polls: energy before
+    volume (it is what's billed, and what compares against electricity), then by unit name.
+
+    Series with no HA unit never win or lose here — [_import_series] skips those by itself.
+    """
+    mapping = _UNIT_MAP.get(series.reading_type.unit_of_measure)
+    if mapping is None:
+        return False
+    commodity = _series_commodity(up, series)
+    rivals = {
+        _UNIT_MAP[other.reading_type.unit_of_measure][:2]
+        for other in up.series
+        if other.reading_type.unit_of_measure in _UNIT_MAP
+        and other.reading_type.flow_direction == series.reading_type.flow_direction
+        and _series_commodity(up, other) == commodity
+        and _is_interval_consumption_series(up, other)
+    }
+    # Sort key: "energy" < "volume", then the unit string.
+    winner = min(rivals | {mapping[:2]}, key=lambda unit_and_class: unit_and_class[::-1])
+    return mapping[:2] != winner
+
+
 def _forward_interval_series(up: UsagePoint) -> list[MeterReadingSeries]:
     """The FORWARD per-interval consumption series on this UsagePoint — the basis for cost.
 
@@ -523,6 +644,7 @@ async def _import_series(
         entry.entry_id,
         up.usage_point_id,
         series.reading_type.flow_direction,
+        _series_commodity(up, series),
     )
     unit = _ha_unit_for(series.reading_type)
     if unit is None:
@@ -587,7 +709,7 @@ async def _import_series(
 
 
 def _hourly_totals(series: MeterReadingSeries) -> tuple[dict[datetime, float], dict[datetime, int]]:
-    """Fold a series' readings into ``(kwh_by_hour, covered_seconds_by_hour)``.
+    """Fold a series' readings into ``(quantity_by_hour, covered_seconds_by_hour)``.
 
     Aggregating to the hour *before* accumulating is load-bearing for any utility whose feed
     uses a sub-hourly ``intervalLength`` (15 or 30 minutes — none in scope today, but the ESPI
@@ -700,7 +822,30 @@ def _stat_display_name(
     raw; we truncate to 8 chars so users can disambiguate multi-meter setups by suffix."""
     short_id = up.usage_point_id[:8]
     flow = series.reading_type.flow_direction.title()
-    return f"{utility_display_name} · {up.service_kind.title()} {flow} ({short_id})"
+    # Name a gas or water series for what it measures even when that came from the ReadingType
+    # or the unit and the UsagePoint's own ServiceCategory is missing — "Unknown Forward" is no
+    # help in the dashboard's gas picker.
+    commodity = _series_commodity(up, series)
+    kind = commodity if commodity in (COMMODITY_GAS, COMMODITY_WATER) else up.service_kind
+    return f"{utility_display_name} · {kind.title()} {flow} ({short_id})"
+
+
+def _forward_statistic_id(entry: ConfigEntry, up: UsagePoint) -> str:
+    """The FORWARD usage statistic this UsagePoint's bills are distributed over.
+
+    Follows the series that [import_usage_statistics] actually writes, so a gas or water meter's
+    bill is spread over its own dedicated series. A poll that carries a bill but no series at all
+    (or none importable) falls back to the UsagePoint's ServiceCategory.
+    """
+    commodity = next(
+        (
+            _series_commodity(up, s)
+            for s in _forward_interval_series(up)
+            if _ha_unit_for(s.reading_type) is not None and not _is_superseded_by_unit(up, s)
+        ),
+        _COMMODITY_BY_SERVICE_KIND.get(up.service_kind.upper()),
+    )
+    return statistic_id_for_series(entry.entry_id, up.usage_point_id, "FORWARD", commodity)
 
 
 async def _recorded_forward_hours(
@@ -710,7 +855,11 @@ async def _recorded_forward_hours(
     period_start: datetime,
     period_end: datetime,
 ) -> list[tuple[datetime, float]]:
-    """Per-hour FORWARD consumption ``(hour, kWh)`` for ``[period_start, period_end)``.
+    """Per-hour FORWARD consumption ``(hour, quantity)`` for ``[period_start, period_end)``.
+
+    The quantity is in whatever unit the usage statistic is stored in — kWh for electricity,
+    ft³ or gallons for a gas or water meter. It only ever serves as a weight for spreading a
+    bill, so the unit doesn't matter as long as it's one unit throughout.
 
     Read from the recorder, not the response: a UsageSummary distributed here arrives long after
     its period, whose readings are already imported into the FORWARD usage statistic. We recover
@@ -720,7 +869,7 @@ async def _recorded_forward_hours(
     Hours with no forward movement (a gap, or a duplicate) are dropped; the result feeds only the
     proportional cost distribution, so approximate weights across a small gap are harmless.
     """
-    stat_id = statistic_id_for_series(entry.entry_id, up.usage_point_id, "FORWARD")
+    stat_id = _forward_statistic_id(entry, up)
     by_id = await get_instance(hass).async_add_executor_job(
         statistics_during_period,
         hass,
@@ -1095,44 +1244,59 @@ def _iso_4217_alpha(numeric_code: int | None) -> str | None:
     return _ISO_4217_ALPHA.get(numeric_code)
 
 
+# US therm, the one North American gas utilities bill in: 105,480,400 J.
+_KWH_PER_THERM = 105_480_400 / 3_600_000
+# International Table BTU: 1055.05585262 J.
+_KWH_PER_BTU = 1055.05585262 / 3_600_000
+
+# Normalized ESPI unit → (HA unit, HA unit_class, factor from the ESPI base unit to the HA unit).
+#
+# The unit class is the string on the matching `BaseUnitConverter` subclass's `UNIT_CLASS` in
+# `util.unit_conversion`; the recorder uses it to know which units the statistic can be shown in,
+# and omitting it is a deprecation that becomes a hard requirement in HA 2026.11.
+#
+# Every energy unit is stored as kWh. HA has no therm or BTU unit, and its Energy dashboard takes
+# gas either as a volume or as energy, so kWh is the only way a therm-billed gas meter can appear
+# there at all. Volumes keep the utility's own unit where HA has it (the UI converts for display);
+# imperial gallons, which HA lacks — its `gal` is the US gallon — are stored as litres.
+_UNIT_MAP: dict[str, tuple[str, str, float]] = {
+    "WATT_HOURS": (UnitOfEnergy.KILO_WATT_HOUR, "energy", 1 / 1000),
+    "JOULES": (UnitOfEnergy.KILO_WATT_HOUR, "energy", 1 / 3_600_000),
+    "THERMS": (UnitOfEnergy.KILO_WATT_HOUR, "energy", _KWH_PER_THERM),
+    "BTU": (UnitOfEnergy.KILO_WATT_HOUR, "energy", _KWH_PER_BTU),
+    "CUBIC_METERS": (UnitOfVolume.CUBIC_METERS, "volume", 1.0),
+    "CUBIC_FEET": (UnitOfVolume.CUBIC_FEET, "volume", 1.0),
+    "US_GALLONS": (UnitOfVolume.GALLONS, "volume", 1.0),
+    "IMPERIAL_GALLONS": (UnitOfVolume.LITERS, "volume", 4.54609),
+    "LITRES": (UnitOfVolume.LITERS, "volume", 1.0),
+}
+
+
 def _ha_unit_for(reading_type: NormalizedReadingType) -> str | None:
-    """Map the server's normalized unit name to the HA constant the Energy dashboard expects.
+    """Map the normalized unit name to the HA unit the Energy dashboard expects.
 
     Returns None for units we don't yet have a domain mapping for — the caller skips writing
     rather than guessing and confusing the dashboard.
     """
-    if reading_type.unit_of_measure == "WATT_HOURS":
-        return UnitOfEnergy.KILO_WATT_HOUR  # We convert Wh → kWh below.
-    if reading_type.unit_of_measure == "CUBIC_METERS":
-        return UnitOfVolume.CUBIC_METERS
-    return None
+    mapping = _UNIT_MAP.get(reading_type.unit_of_measure)
+    return mapping[0] if mapping else None
 
 
 def _ha_unit_class_for(reading_type: NormalizedReadingType) -> str | None:
-    """Return the HA `unit_class` matching the series's normalized unit.
-
-    HA's recorder uses unit_class to know which `BaseUnitConverter` family the statistic
-    belongs to (and therefore which units it can convert between in the UI). The class names
-    are the strings on each subclass's `UNIT_CLASS` attribute in `util.unit_conversion`.
-    Missing the field is a deprecation that becomes a hard requirement in 2026.11.
-    """
-    if reading_type.unit_of_measure == "WATT_HOURS":
-        return "energy"
-    if reading_type.unit_of_measure == "CUBIC_METERS":
-        return "volume"
-    return None
+    """Return the HA `unit_class` matching the series's normalized unit — see [_UNIT_MAP]."""
+    mapping = _UNIT_MAP.get(reading_type.unit_of_measure)
+    return mapping[1] if mapping else None
 
 
 def _to_ha_units(value: float, reading_type: NormalizedReadingType) -> float:
     """Apply the unit conversion implied by [_ha_unit_for].
 
-    ``value`` already arrives in the ReadingType's base unit (Wh, m³) — [espi._assemble] scales
-    each reading by the ESPI ``powerOfTenMultiplier`` as it builds the UsageReading, so this
-    must not apply it a second time.
+    ``value`` already arrives in the ReadingType's base unit (Wh, ft³, therms) —
+    [espi._assemble] scales each reading by the ESPI ``powerOfTenMultiplier`` as it builds the
+    UsageReading, so this must not apply it a second time.
     """
-    if reading_type.unit_of_measure == "WATT_HOURS":
-        return value / 1000.0
-    return value
+    mapping = _UNIT_MAP.get(reading_type.unit_of_measure)
+    return value * mapping[2] if mapping else value
 
 
 def _align_to_hour(start: datetime) -> datetime:

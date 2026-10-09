@@ -633,17 +633,29 @@ def _normalize_reading_type(rt: _RawReadingType | None) -> NormalizedReadingType
 
 
 def _service_kind(kind: int | None) -> str:
-    return {0: "ELECTRICITY", 1: "GAS", 2: "WATER", 4: "HEAT", 5: "COLD"}.get(
-        -1 if kind is None else kind, "UNKNOWN"
-    )
+    # NAESB ESPI ServiceKind. NOTE: 5 is refuse — this map previously had it as COLD.
+    return {
+        0: "ELECTRICITY",
+        1: "GAS",
+        2: "WATER",
+        4: "HEAT",
+        5: "REFUSE",
+        6: "SEWERAGE",
+    }.get(-1 if kind is None else kind, "UNKNOWN")
 
 
 def _commodity(c: int | None) -> str:
+    # NAESB ESPI CommodityKind. Only the commodities [statistics] gives a statistic series to;
+    # everything else (0 = not applicable, steam, emissions, ...) is "OTHER", and the series
+    # falls back to its UsagePoint's ServiceCategory to decide what it measures.
     return {
         1: "ELECTRICITY_SECONDARY_METERED",
         2: "ELECTRICITY_PRIMARY_METERED",
         7: "NATURAL_GAS",
+        8: "PROPANE",
         9: "WATER",
+        14: "NONPOTABLE_WATER",
+        26: "ELECTRICITY_TRANSMISSION_METERED",
     }.get(-1 if c is None else c, "OTHER")
 
 
@@ -676,10 +688,26 @@ def _accumulation(a: int | None) -> str:
 
 
 def _uom(u: int | None) -> tuple[str, str]:
+    # NAESB ESPI UnitSymbolKind (espi.xsd). NOTE: 119 is cubic FEET — this map previously had it
+    # as CUBIC_METERS, which is 42. The weather-compensated and uncompensated variants of a gas
+    # volume are folded onto the plain unit: they say how the meter arrived at the number, not
+    # what the number is a quantity of.
     return {
+        31: ("JOULES", "J"),
         38: ("WATTS", "W"),
+        42: ("CUBIC_METERS", "m³"),
         72: ("WATT_HOURS", "Wh"),
-        119: ("CUBIC_METERS", "m³"),
+        119: ("CUBIC_FEET", "ft³"),
+        120: ("CUBIC_FEET", "ft³"),
+        128: ("US_GALLONS", "gal"),
+        130: ("IMPERIAL_GALLONS", "imp gal"),
+        132: ("BTU", "BTU"),
+        134: ("LITRES", "L"),
+        156: ("LITRES", "L"),
+        157: ("LITRES", "L"),
+        166: ("CUBIC_METERS", "m³"),
+        167: ("CUBIC_METERS", "m³"),
+        169: ("THERMS", "thm"),
     }.get(-1 if u is None else u, ("OTHER", "?"))
 
 

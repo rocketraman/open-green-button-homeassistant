@@ -36,6 +36,7 @@ from custom_components.greenbutton.const import DOMAIN
 from custom_components.greenbutton.statistics import (
     _recorded_forward_hours,
     import_usage_statistics,
+    response_needs_import_migration,
     statistic_id_for_series,
     statistic_id_prefix_for_entry,
 )
@@ -1046,3 +1047,174 @@ async def test_a_zero_cost_placeholder_never_blanks_out_a_real_bill(hass: HomeAs
     placeholder = _summary(datetime(2026, 4, 1, tzinfo=UTC), 2, 0.0)
     real = _summary(datetime(2026, 4, 1, tzinfo=UTC), 2, 48.0)
     assert round((await _cost_sums(hass, [real, placeholder]))[-1], 2) == 48.0
+
+
+# --- gas & water -----------------------------------------------------------------------------
+
+
+def _commodity_series(
+    unit: str,
+    *,
+    commodity: str = "OTHER",
+    meter_reading_id: str = "mr1",
+    value: float = 2.0,
+) -> MeterReadingSeries:
+    """One FORWARD hourly series of a single reading, in an arbitrary unit and commodity."""
+    return MeterReadingSeries(
+        meter_reading_id=meter_reading_id,
+        reading_type=NormalizedReadingType(
+            commodity=commodity,
+            flow_direction="FORWARD",
+            accumulation_behaviour="DELTA_DATA",
+            interval_length_seconds=3600,
+            unit_of_measure=unit,
+            unit_of_measure_symbol="?",
+            power_of_ten_multiplier=0,
+            currency_numeric_code=840,
+        ),
+        readings=[UsageReading(datetime(2026, 7, 5, 5, tzinfo=UTC), 3600, value)],
+    )
+
+
+def _commodity_response(service_kind: str, *series: MeterReadingSeries) -> UsageResponse:
+    up = UsagePoint(usage_point_id="up1", service_kind=service_kind, series=list(series))
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+def test_statistic_id_gives_gas_and_water_their_own_series() -> None:
+    """Gas and water never share a statistic with electricity; electricity's id is unchanged.
+
+    The bare id is what existing Energy dashboard configs point at, so it must not move.
+    """
+    bare = statistic_id_for_series("entry_a", "up_1", "FORWARD")
+    assert statistic_id_for_series("entry_a", "up_1", "FORWARD", "electricity") == bare
+    assert statistic_id_for_series("entry_a", "up_1", "FORWARD", None) == bare
+    gas = statistic_id_for_series("entry_a", "up_1", "FORWARD", "gas")
+    water = statistic_id_for_series("entry_a", "up_1", "FORWARD", "water")
+    assert gas == "greenbutton:entry_a_up_1_gas_forward"
+    assert water == "greenbutton:entry_a_up_1_water_forward"
+    # Still caught by the remove-entry purge.
+    assert gas.startswith(statistic_id_prefix_for_entry("entry_a"))
+
+
+@pytest.mark.parametrize(
+    ("service_kind", "unit", "commodity", "suffix", "ha_unit", "unit_class", "expected"),
+    [
+        # Therms and BTU have no HA unit; both land as kWh so the gas picker accepts them.
+        ("GAS", "THERMS", "NATURAL_GAS", "_gas_forward", "kWh", "energy", 58.6002),
+        ("GAS", "BTU", "OTHER", "_gas_forward", "kWh", "energy", 0.00058614),
+        ("GAS", "CUBIC_FEET", "OTHER", "_gas_forward", "ft³", "volume", 2.0),
+        ("GAS", "CUBIC_METERS", "OTHER", "_gas_forward", "m³", "volume", 2.0),
+        ("WATER", "US_GALLONS", "WATER", "_water_forward", "gal", "volume", 2.0),
+        ("WATER", "IMPERIAL_GALLONS", "OTHER", "_water_forward", "L", "volume", 9.0922),
+        ("WATER", "CUBIC_FEET", "OTHER", "_water_forward", "ft³", "volume", 2.0),
+        # The ReadingType's commodity outranks the UsagePoint's service kind...
+        ("ELECTRICITY", "CUBIC_FEET", "NATURAL_GAS", "_gas_forward", "ft³", "volume", 2.0),
+        # ...and with neither stated, an unambiguous unit still identifies the commodity.
+        ("UNKNOWN", "THERMS", "OTHER", "_gas_forward", "kWh", "energy", 58.6002),
+        ("UNKNOWN", "LITRES", "OTHER", "_water_forward", "L", "volume", 2.0),
+        # A volume nobody labelled could be either; it stays on the bare id.
+        ("UNKNOWN", "CUBIC_METERS", "OTHER", "_up1_forward", "m³", "volume", 2.0),
+        ("ELECTRICITY", "WATT_HOURS", "OTHER", "_up1_forward", "kWh", "energy", 0.002),
+    ],
+)
+async def test_gas_and_water_series_import_in_their_own_unit(
+    hass: HomeAssistant,
+    service_kind: str,
+    unit: str,
+    commodity: str,
+    suffix: str,
+    ha_unit: str,
+    unit_class: str,
+    expected: float,
+) -> None:
+    response = _commodity_response(service_kind, _commodity_series(unit, commodity=commodity))
+    (call,) = await _import_and_collect_usage(hass, response)
+    metadata, rows = call.args[1], call.args[2]
+    assert metadata["statistic_id"].endswith(suffix)
+    assert metadata["unit_of_measurement"] == ha_unit
+    assert metadata["unit_class"] == unit_class
+    assert rows[0]["sum"] == pytest.approx(expected, rel=1e-4)
+
+
+async def test_gas_series_is_named_for_its_commodity(hass: HomeAssistant) -> None:
+    """The picker label says Gas even when only the ReadingType, not the UsagePoint, said so."""
+    response = _commodity_response(
+        "UNKNOWN", _commodity_series("CUBIC_FEET", commodity="NATURAL_GAS")
+    )
+    (call,) = await _import_and_collect_usage(hass, response)
+    assert call.args[1]["name"] == "X · Gas Forward (up1)"
+
+
+async def test_same_gas_in_two_units_imports_only_one(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A meter publishing gas as both volume and therms must not sum ft³ into kWh.
+
+    Both series are FORWARD gas, so both map to one statistic id. Energy wins, whichever order
+    the feed lists them in, and the loser is reported rather than silently dropped.
+    """
+    volume = _commodity_series("CUBIC_FEET", meter_reading_id="ccf", value=100.0)
+    therms = _commodity_series("THERMS", meter_reading_id="thm", value=1.0)
+    for order in ((volume, therms), (therms, volume)):
+        with caplog.at_level(logging.DEBUG, logger="custom_components.greenbutton.statistics"):
+            (call,) = await _import_and_collect_usage(hass, _commodity_response("GAS", *order))
+        assert call.args[1]["unit_of_measurement"] == "kWh"
+        assert call.args[2][0]["sum"] == pytest.approx(29.3001, rel=1e-4)
+    assert "Skipping meter reading ccf" in caplog.text
+
+
+async def test_gas_bill_is_distributed_over_the_gas_series(hass: HomeAssistant) -> None:
+    """A gas UsagePoint's bill reads its usage back from the dedicated gas statistic.
+
+    Reading the bare electricity-style id would find nothing, and the bill would never be costed.
+    """
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    up = UsagePoint(
+        usage_point_id="up1",
+        service_kind="GAS",
+        series=[_commodity_series("THERMS")],
+        summaries=[_summary(datetime(2026, 7, 1, tzinfo=UTC), 30, 40.0)],
+    )
+    asked: list[set[str]] = []
+
+    def _during_period(_hass, _start, _end, statistic_ids, *_args):  # noqa: ANN001, ANN002, ANN202
+        asked.append(statistic_ids)
+        return {}
+
+    with (
+        patch("custom_components.greenbutton.statistics.statistics_during_period", _during_period),
+    ):
+        await _recorded_forward_hours(
+            hass, entry, up, datetime(2026, 7, 1, tzinfo=UTC), datetime(2026, 7, 31, tzinfo=UTC)
+        )
+    assert asked == [{statistic_id_for_series("01TESTENTRY", "up1", "FORWARD", "gas")}]
+
+
+def test_migration_rebuilds_gas_and_water_feeds_only() -> None:
+    """Revision 4 rebuilds a feed whose series moved or became importable, and no other.
+
+    An electricity-only account must be stamped forward without re-pulling its history.
+    """
+    electricity = _commodity_response(
+        "ELECTRICITY", _commodity_series("WATT_HOURS", commodity="ELECTRICITY_SECONDARY_METERED")
+    )
+    assert response_needs_import_migration(electricity, 3) is False
+    # Was written as m³ under the bare id.
+    assert response_needs_import_migration(
+        _commodity_response("GAS", _commodity_series("CUBIC_FEET")), 3
+    )
+    # Was skipped outright; its history is behind the poll cursor.
+    assert response_needs_import_migration(
+        _commodity_response("UNKNOWN", _commodity_series("THERMS")), 3
+    )
+    # Was imported, but under the electricity-style id.
+    assert response_needs_import_migration(
+        _commodity_response("GAS", _commodity_series("WATT_HOURS")), 3
+    )
+    # Still unimportable, so there is nothing a rebuild would change.
+    assert (
+        response_needs_import_migration(_commodity_response("GAS", _commodity_series("OTHER")), 3)
+        is False
+    )
