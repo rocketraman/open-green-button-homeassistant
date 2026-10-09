@@ -1381,6 +1381,30 @@ async def test_import_migration_rebuilds_entry_whose_stored_sum_falls(hass: Home
     assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
 
 
+async def test_import_migration_repairs_a_falling_sum_on_an_empty_poll(hass: HomeAssistant) -> None:
+    """The stored-row check needs no readings, so an empty poll must not hold the repair back.
+
+    The first poll after an update is usually a slice the previous one already drained. Waiting
+    for a poll that carries readings would leave visibly wrong data in place for days.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, 3)
+    api = _api_returning(_empty_response())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    resets = patch(
+        "custom_components.greenbutton.coordinator.async_stored_usage_shows_resets",
+        new=AsyncMock(return_value=True),
+    )
+    with has_stats, clear as clear_mock, _import, resets:
+        await coordinator.async_refresh()
+
+    assert api.fetch_usage.await_count == 2  # the poll, then the rebuild's full-history re-fetch
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
+
+
 def _billing_period_response() -> UsageResponse:
     """Consumers Energy's shape: one month-long reading, mislabelled BULK_QUANTITY, no sibling."""
     reading_type = NormalizedReadingType(

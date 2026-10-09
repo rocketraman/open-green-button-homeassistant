@@ -43,6 +43,7 @@ from custom_components.greenbutton.const import (
     CONF_DAILY_POLL_TIME,
     CONF_DAILY_POLL_TIME_ENABLED,
     CONF_ENCRYPTED_REFRESH_BLOB,
+    CONF_IMPORT_LOGIC_REVISION,
     CONF_LAST_FETCHED_AT,
     CONF_POLL_INTERVAL_SECONDS,
     CONF_PROXY_TOKEN,
@@ -50,6 +51,7 @@ from custom_components.greenbutton.const import (
     CONF_UTILITY_NAME,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    IMPORT_LOGIC_REVISION,
     SERVICE_REBUILD_STATISTICS,
 )
 
@@ -75,6 +77,9 @@ def _entry(**extra_data) -> MockConfigEntry:
             CONF_UTILITY_NAME: "Example Utility",
             CONF_ENCRYPTED_REFRESH_BLOB: "blob",
             CONF_PROXY_TOKEN: "token",
+            # Up to date by default: an entry owed an import-logic repair always fetches at
+            # startup, which would mask the scheduling these tests measure.
+            CONF_IMPORT_LOGIC_REVISION: IMPORT_LOGIC_REVISION,
             **extra_data,
         },
         options=options or {},
@@ -246,6 +251,31 @@ async def test_restart_inside_a_polled_window_skips_the_startup_fetch(
         await hass.async_block_till_done()
 
     fetch.assert_not_awaited()
+
+
+async def test_restart_inside_a_polled_window_still_fetches_when_a_repair_is_owed(
+    hass: HomeAssistant,
+) -> None:
+    """Updating the integration restarts HA; that restart must not sit on the unrepaired rows.
+
+    The import-logic repair only runs as part of a poll, so skipping this fetch left the fix
+    unapplied until the next scheduled one — a day later on most utilities (issue #21).
+    """
+    hass.set_state(CoreState.starting)
+    entry = _entry(
+        **{
+            CONF_LAST_FETCHED_AT: _ago(hours=2),
+            CONF_IMPORT_LOGIC_REVISION: IMPORT_LOGIC_REVISION - 1,
+        }
+    )
+    entry.add_to_hass(hass)
+
+    fetch = _ok_fetch()
+    with _stub_network(fetch):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    fetch.assert_awaited_once()
 
 
 async def test_restart_after_a_missed_interval_fetches_and_surfaces_reauth(

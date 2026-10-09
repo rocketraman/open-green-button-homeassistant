@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Statistics repairs that an update brings now run on the restart that installs
+  it. They used to wait for the next scheduled poll when Home Assistant
+  restarted soon after the last one, so the negative bars fixed in 0.3.0 stayed
+  on screen for up to a day after updating
+  ([#21](https://github.com/rocketraman/open-green-button-homeassistant/issues/21)).
+- The repair for those negative bars no longer waits for a poll that returns new
+  readings; it is recognized from the stored data alone.
+
 ## [0.3.0] - 2026-10-09
 
 ### Added
