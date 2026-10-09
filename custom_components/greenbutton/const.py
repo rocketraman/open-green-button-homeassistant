@@ -243,7 +243,15 @@ CONF_IMPORT_LOGIC_REVISION = "import_logic_revision"
 #       water now get dedicated statistic series, in the right unit, with therms/BTU/gallons/
 #       litres importable. Affects any feed carrying a gas or water series or a non-watt-hour
 #       unit; electricity-only accounts are stamped forward untouched.
-IMPORT_LOGIC_REVISION = 4
+#   5 — series sharing one statistic (same usage point and flow direction) were each accumulated
+#       on their own rather than into one running sum. On a rebuild every series restarted from
+#       zero, so the stored sum fell at each boundary between them — a large negative bar in the
+#       Energy dashboard; on an ordinary poll a series older than one already written was dropped
+#       whole. Affects feeds that split one meter's history across several MeterReadings:
+#       UtilityAPI utilities (Consumers Energy, Eversource, El Paso Electric). Recognized from the
+#       stored rows as well as the feed, since one incremental poll rarely shows the shape.
+#       (issue #21)
+IMPORT_LOGIC_REVISION = 5
 
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see

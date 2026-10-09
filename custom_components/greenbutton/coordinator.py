@@ -69,6 +69,7 @@ from .const import (
 from .statistics import (
     async_clear_statistics_for_entry,
     async_entry_has_statistics,
+    async_stored_usage_shows_resets,
     import_usage_statistics,
     response_needs_import_migration,
 )
@@ -959,6 +960,12 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             return None
 
         verdict = response_needs_import_migration(response, stamped_revision)
+        # The one repair recognized from the stored rows instead of the feed, which also settles
+        # an otherwise undecidable poll.
+        if verdict is not True and await async_stored_usage_shows_resets(
+            self.hass, self.entry.entry_id, stamped_revision
+        ):
+            verdict = True
         if verdict is None:
             # Undecidable from this poll — see [statistics.response_cost_may_be_missing_bills].
             # Stamping here is the one thing we must not do: it would close the repair on evidence

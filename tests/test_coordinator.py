@@ -1356,6 +1356,31 @@ async def test_import_migration_skips_entry_with_no_prior_statistics(
     assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
 
 
+async def test_import_migration_rebuilds_entry_whose_stored_sum_falls(hass: HomeAssistant) -> None:
+    """Revision-5 damage is read from the recorder, so an ordinary-looking poll still repairs it.
+
+    A feed that splits one meter across MeterReadings usually shows just one of them in an
+    incremental window, which the feed-shape check alone would stamp as unaffected.
+    """
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, 4)
+    api = _api_returning(_response_with_readings(datetime(2026, 7, 5, 5, tzinfo=UTC), cost=0.21))
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    resets = patch(
+        "custom_components.greenbutton.coordinator.async_stored_usage_shows_resets",
+        new=AsyncMock(return_value=True),
+    )
+    with has_stats, clear as clear_mock, _import, resets:
+        await coordinator.async_refresh()
+
+    assert api.fetch_usage.await_count == 2  # the poll, then the rebuild's full-history re-fetch
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
 def _billing_period_response() -> UsageResponse:
     """Consumers Energy's shape: one month-long reading, mislabelled BULK_QUANTITY, no sibling."""
     reading_type = NormalizedReadingType(

@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Cubic feet were recorded as cubic metres. ESPI unit code 119 is ft³; m³ is 42.
+- Large negative bars in the Energy dashboard for utilities that publish one
+  meter's history as several separate readings, as UtilityAPI utilities such as
+  Consumers Energy do
+  ([#21](https://github.com/rocketraman/open-green-button-homeassistant/issues/21)).
+  Each piece kept its own running total, so the stored total fell back at every
+  boundary between them, and a piece older than one already imported could be
+  skipped altogether. They are now combined into a single total. Affected
+  accounts are detected and rebuilt automatically, once, on the next poll.
+- Where a utility reports the same period both as a bill-level total and as
+  hourly intervals, the hourly figures are used for the hours they cover instead
+  of both being counted.
 
 An account with a gas or water meter rebuilds its statistics once after
 updating, to move them to the new series and re-read history in units that used
