@@ -41,6 +41,7 @@ from .const import (
     ATTR_CONFIG_ENTRY_ID,
     CONF_DAILY_POLL_TIME,
     CONF_DAILY_POLL_TIME_ENABLED,
+    CONF_IMPORT_LOGIC_REVISION,
     CONF_LAST_FETCHED_AT,
     CONF_SERVER_BASE_URL,
     DAILY_CADENCE,
@@ -48,6 +49,7 @@ from .const import (
     DEFAULT_SERVER_BASE_URL,
     DOMAIN,
     FIRST_REFRESH_GRACE,
+    IMPORT_LOGIC_REVISION,
     SERVICE_REBUILD_STATISTICS,
 )
 from .coordinator import GreenButtonCoordinator
@@ -194,9 +196,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # what we just read, on the startup critical path. A first install and a manual reload run
     # with `hass` already running and always fetch; so does a restart after a poll was missed —
     # including one missed because HA was down at the daily wall-clock time. That keeps this
-    # the place a token revoked while HA was down still surfaces, and keeps the coordinator's
-    # import-logic repair (CONF_IMPORT_LOGIC_REVISION) running at startup.
-    if hass.state is CoreState.running or _poll_is_due(entry, poll_interval, daily_poll_time):
+    # the place a token revoked while HA was down still surfaces.
+    #
+    # An entry still owed an import-logic repair fetches regardless: the repair only runs as part
+    # of a poll, and the restart in question is usually the one that installed the update. Skipping
+    # it left a user looking at the very rows the update fixes until the next scheduled poll, a day
+    # later on most utilities (issue #21).
+    repair_pending = entry.data.get(CONF_IMPORT_LOGIC_REVISION) != IMPORT_LOGIC_REVISION
+    if (
+        hass.state is CoreState.running
+        or repair_pending
+        or _poll_is_due(entry, poll_interval, daily_poll_time)
+    ):
         # Run it as a task the ENTRY owns, not inline. A first, full-history pull can take
         # minutes against a slow custodian, and setup is usually driven by a browser request
         # (finishing the config flow, or Reload) that a reverse proxy in front of HA will

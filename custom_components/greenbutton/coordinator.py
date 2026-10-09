@@ -951,17 +951,15 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             self._store_import_logic_revision()
             return None
 
-        if not any(s.readings for up in response.usage_points for s in up.series):
-            _LOGGER.debug(
-                "Entry %s awaits an import-logic repair check, but this poll carried no "
-                "readings to judge the feed by — re-checking on the next poll",
-                self.entry.entry_id,
-            )
-            return None
-
-        verdict = response_needs_import_migration(response, stamped_revision)
+        # An empty poll says nothing about the feed's shape: "no offending series" may only mean
+        # the utility published nothing in this window.
+        has_readings = any(s.readings for up in response.usage_points for s in up.series)
+        verdict = (
+            response_needs_import_migration(response, stamped_revision) if has_readings else None
+        )
         # The one repair recognized from the stored rows instead of the feed, which also settles
-        # an otherwise undecidable poll.
+        # an otherwise undecidable poll — an empty one included. That matters right after an
+        # update: the poll that follows a restart is often a slice the last one already drained.
         if verdict is not True and await async_stored_usage_shows_resets(
             self.hass, self.entry.entry_id, stamped_revision
         ):
