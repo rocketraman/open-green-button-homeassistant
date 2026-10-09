@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-10-09
 
 ### Added
 
@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Where a utility reports the same period both as a bill-level total and as
   hourly intervals, the hourly figures are used for the hours they cover instead
   of both being counted.
+- Diagnostics downloads no longer include your service address or account
+  number
+  ([#20](https://github.com/rocketraman/open-green-button-homeassistant/issues/20)).
 
 An account with a gas or water meter rebuilds its statistics once after
 updating, to move them to the new series and re-read history in units that used
