@@ -33,7 +33,7 @@ Copy `custom_components/greenbutton/` into your Home Assistant config directory 
 
 The integration writes hourly consumption data into the HA Energy dashboard's long-term statistics.
 
-Gas and water meters on the same account are imported too, each as its own statistic — add them under **Gas consumption** and **Water consumption** in the Energy dashboard. Gas billed in therms or BTU is stored as kWh, since Home Assistant has no therm unit; volumes keep your utility's unit (ft³, m³, gal, L).
+Gas and water meters on the same account are imported too, each as its own statistic — add them under **Gas consumption** and **Water consumption** in the Energy dashboard. Gas billed in therms or BTU is stored as kWh, since Home Assistant has no therm unit; volumes keep your utility's unit (ft³, m³, gal, L). This only works where the utility includes them in its Green Button feed, and not all do — for example, utilities served by London Hydro [provide electricity only](https://github.com/rocketraman/open-green-button#water-data), even if they bill you for water.
 
 ### If there's nothing to pick in the Energy dashboard yet
 
