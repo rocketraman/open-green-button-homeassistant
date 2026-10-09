@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from custom_components.greenbutton.tou import (
     MID_PEAK,
     OFF_PEAK,
     ON_PEAK,
     cost_detail_tou_bucket,
+    ontario_holiday_pricing_dates,
     ontario_tou_bucket,
 )
 
@@ -69,3 +70,72 @@ def test_cost_detail_note_to_bucket() -> None:
     assert cost_detail_tou_bucket("Global Adjustment") is None
     assert cost_detail_tou_bucket("Ontario Electricity Rebate") is None
     assert cost_detail_tou_bucket(None) is None
+
+
+def test_2026_holiday_schedule_matches_oeb_table() -> None:
+    """The computed schedule must reproduce OEB's published 2026 table exactly.
+
+    Source: OEB "Holiday schedule - Time-of-Use and Ultra-Low Overnight". Note Boxing Day
+    2026-12-26 is a Saturday, so the OEB lists it observed on Monday 2026-12-28.
+    """
+    assert ontario_holiday_pricing_dates(2026) == frozenset(
+        {
+            date(2026, 1, 1),  # New Year's Day (Thu)
+            date(2026, 2, 16),  # Family Day (Mon)
+            date(2026, 4, 3),  # Good Friday (Fri)
+            date(2026, 5, 18),  # Victoria Day (Mon)
+            date(2026, 7, 1),  # Canada Day (Wed)
+            date(2026, 8, 3),  # Civic Holiday (Mon)
+            date(2026, 9, 7),  # Labour Day (Mon)
+            date(2026, 10, 12),  # Thanksgiving (Mon)
+            date(2026, 12, 25),  # Christmas Day (Fri)
+            date(2026, 12, 28),  # Boxing Day observed (Mon)
+        }
+    )
+
+
+def test_holiday_price_rolls_forward_off_a_weekend() -> None:
+    """A weekend holiday marks the following weekday; the weekend day itself is already
+    off-peak, so it is not what gets returned."""
+    prices_2026 = ontario_holiday_pricing_dates(2026)
+    assert date(2026, 12, 26) not in prices_2026  # Boxing Day, a Saturday
+    assert date(2026, 12, 28) in prices_2026  # observed the following Monday
+
+    # 2028-01-01 is a Saturday → observed Monday 2028-01-03 (skipping Sunday the 2nd).
+    prices_2028 = ontario_holiday_pricing_dates(2028)
+    assert date(2028, 1, 1) not in prices_2028
+    assert date(2028, 1, 3) in prices_2028
+
+
+def test_holiday_is_off_peak_all_day_summer() -> None:
+    """Canada Day 2026 (Wednesday) is off-peak for every hour — including hours that would
+    otherwise be mid-peak and on-peak."""
+    # 11:00 UTC = 07:00 EDT — mid-peak on an ordinary summer weekday
+    assert ontario_tou_bucket(datetime(2026, 7, 1, 11, 0, tzinfo=UTC)) == OFF_PEAK
+    # 15:00 UTC = 11:00 EDT — on-peak on an ordinary summer weekday
+    assert ontario_tou_bucket(datetime(2026, 7, 1, 15, 0, tzinfo=UTC)) == OFF_PEAK
+    # 19:00 UTC = 15:00 EDT — still on-peak at the far end of the afternoon
+    assert ontario_tou_bucket(datetime(2026, 7, 1, 19, 0, tzinfo=UTC)) == OFF_PEAK
+
+
+def test_holiday_is_off_peak_all_day_winter() -> None:
+    """Family Day 2026 (Monday) is off-peak all day; 07:00 EST is on-peak in winter."""
+    # 12:00 UTC = 07:00 EST
+    assert ontario_tou_bucket(datetime(2026, 2, 16, 12, 0, tzinfo=UTC)) == OFF_PEAK
+    # The very next day returns to the normal winter schedule — the check is date-scoped,
+    # not sticky across a boundary.
+    assert ontario_tou_bucket(datetime(2026, 2, 17, 12, 0, tzinfo=UTC)) == ON_PEAK
+
+
+def test_observed_holiday_on_a_weekday_is_off_peak() -> None:
+    """Boxing Day observed Monday 2026-12-28 carries holiday pricing even though the 28th
+    is not a calendar holiday in its own right."""
+    # 15:00 UTC = 10:00 EST — on-peak on an ordinary winter weekday
+    assert ontario_tou_bucket(datetime(2026, 12, 28, 15, 0, tzinfo=UTC)) == OFF_PEAK
+
+
+def test_non_tou_holidays_keep_normal_weekday_rates() -> None:
+    """Only OEB-listed days get holiday pricing — Remembrance Day is deliberately not one."""
+    # 2026-11-11 is a Wednesday; 15:00 UTC = 10:00 EST → normal winter on-peak.
+    assert date(2026, 11, 11) not in ontario_holiday_pricing_dates(2026)
+    assert ontario_tou_bucket(datetime(2026, 11, 11, 15, 0, tzinfo=UTC)) == ON_PEAK
