@@ -255,6 +255,73 @@ def response_has_gas_or_water_series(response: UsageResponse) -> bool:
     )
 
 
+def response_has_series_sharing_a_statistic(response: UsageResponse) -> bool:
+    """True when [response] carries two or more importable series bound for one statistic.
+
+    The revision-5 signal. Each such series used to be accumulated on its own instead of into
+    one running sum — see [_import_series_group] for what that did to the stored rows.
+
+    A single poll understates this: an incremental window often holds just the newest
+    MeterReading of a feed that splits its history into many. [async_stored_usage_shows_resets]
+    is the check that doesn't depend on what this poll happened to carry; the two are used
+    together.
+    """
+    for up in response.usage_points:
+        # (flow, commodity) is what [statistic_id_for_series] keys on.
+        targets = [
+            (s.reading_type.flow_direction, _series_commodity(up, s))
+            for s in up.series
+            if s.readings
+            and _is_interval_consumption_series(up, s)
+            and not _is_superseded_by_unit(up, s)
+        ]
+        if len(targets) != len(set(targets)):
+            return True
+    return False
+
+
+# The revision whose damage [async_stored_usage_shows_resets] recognizes.
+_SUM_RESET_REVISION = 5
+
+
+async def async_stored_usage_shows_resets(
+    hass: HomeAssistant, entry_id: str, stamped_revision: int
+) -> bool:
+    """Whether [entry_id]'s stored usage rows carry the revision-5 damage: a sum that falls.
+
+    Read from the recorder rather than recognized from the feed, because the feed shape that
+    caused it ([response_has_series_sharing_a_statistic]) is rarely visible in one incremental
+    poll, while the damage itself is unmistakable — a cumulative consumption sum never
+    legitimately decreases. Scans every hourly row the entry owns, which is why it is gated on
+    the stamp and so runs at most until the entry is next stamped.
+    """
+    if stamped_revision >= _SUM_RESET_REVISION:
+        return False
+    usage_ids = {
+        statistic_id
+        for statistic_id in await _async_statistic_ids_for_entry(hass, entry_id)
+        if not statistic_id.endswith("_cost")
+    }
+    if not usage_ids:
+        return False
+    by_id = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        datetime.fromtimestamp(0, tz=UTC),
+        None,
+        usage_ids,
+        "hour",
+        None,
+        {"sum"},
+    )
+    for rows in by_id.values():
+        sums = [row["sum"] for row in rows if row.get("sum") is not None]
+        # Tolerance well under any real reading, so float noise can't trigger a full re-fetch.
+        if any(later < earlier - 1e-6 for earlier, later in zip(sums, sums[1:], strict=False)):
+            return True
+    return False
+
+
 # Recognition predicates keyed by the import-logic revision that fixed the bug. An entry stamped
 # at revision N is tested against every predicate for a revision > N — so a user who skipped a
 # release still gets each repair they're owed, in one rebuild rather than one per revision.
@@ -265,6 +332,7 @@ _IMPORT_MIGRATION_CHECKS: dict[int, Callable[[UsageResponse], bool | None]] = {
     2: response_has_multi_hour_readings,
     3: response_cost_may_be_missing_bills,
     4: response_has_gas_or_water_series,
+    5: response_has_series_sharing_a_statistic,
 }
 
 
@@ -324,6 +392,9 @@ async def import_usage_statistics(
     """
     for up in response.usage_points:
         imported_any = False
+        # Keyed by (flow direction, commodity), which is what [statistic_id_for_series] keys on:
+        # every series in one group lands in the same statistic and has to be accumulated as one.
+        by_target: dict[tuple[str, str | None], list[MeterReadingSeries]] = {}
         for series in up.series:
             if not _is_interval_consumption_series(up, series):
                 _warn_once(
@@ -349,9 +420,12 @@ async def import_usage_statistics(
                     series.reading_type.unit_of_measure,
                 )
                 continue
-            # Call first, then OR — `or` short-circuits, and every series must be imported.
-            imported = await _import_series(
-                hass, entry, up, series, utility_display_name, fresh=fresh
+            target = (series.reading_type.flow_direction, _series_commodity(up, series))
+            by_target.setdefault(target, []).append(series)
+        for group in by_target.values():
+            # Call first, then OR — `or` short-circuits, and every group must be imported.
+            imported = await _import_series_group(
+                hass, entry, up, group, utility_display_name, fresh=fresh
             )
             imported_any = imported or imported_any
         if up.series and not imported_any:
@@ -463,6 +537,10 @@ _CUMULATIVE_ACCUMULATION = frozenset(
 # one second short of full. See [_drop_incomplete_trailing_hour].
 _HOUR_COVERAGE_SLACK = 1
 
+# How much coarser than the finest reading covering an hour another reading may be and still be
+# summed with it rather than superseded by it. See [_hourly_totals].
+_PEER_RESOLUTION_FACTOR = 2
+
 # Keys already logged at WARNING by [_warn_once], so a permanent condition doesn't repeat the
 # warning on every poll. Module-level (not per-entry) and never pruned: it holds a handful of
 # short strings for the lifetime of the process, and a full HA restart re-arms every warning.
@@ -570,7 +648,8 @@ def _is_superseded_by_unit(up: UsagePoint, series: MeterReadingSeries) -> bool:
     from the series' ReadingTypes alone so the choice can't flip between polls: energy before
     volume (it is what's billed, and what compares against electricity), then by unit name.
 
-    Series with no HA unit never win or lose here — [_import_series] skips those by itself.
+    Series with no HA unit never win or lose here — [_import_series_group] skips those by
+    itself.
     """
     mapping = _UNIT_MAP.get(series.reading_type.unit_of_measure)
     if mapping is None:
@@ -621,42 +700,56 @@ def _has_interval_cost(up: UsagePoint) -> bool:
     return any(r.cost is not None for s in _forward_interval_series(up) for r in s.readings)
 
 
-async def _import_series(
+async def _import_series_group(
     hass: HomeAssistant,
     entry: ConfigEntry,
     up: UsagePoint,
-    series: MeterReadingSeries,
+    group: list[MeterReadingSeries],
     utility_display_name: str,
     *,
     fresh: bool = False,
 ) -> bool:
-    """Import one series. Returns False only when its unit has no HA mapping.
+    """Import every series of one flow direction on [up] into the single statistic they share.
 
-    The return value feeds the "this usage point imported nothing" check in
-    [import_usage_statistics], so it reports *representability*, not whether rows were
-    actually written: an empty or fully stale-filtered series is a normal quiet poll, not a
-    misconfigured feed, and must not trip that error.
+    Returns False only when none of them has a unit with an HA mapping. The return value feeds
+    the "this usage point imported nothing" check in [import_usage_statistics], so it reports
+    *representability*, not whether rows were actually written: an empty or fully
+    stale-filtered group is a normal quiet poll, not a misconfigured feed, and must not trip
+    that error.
+
+    The series are merged BEFORE accumulating, into one running sum. Importing them one at a
+    time — as this used to — gave each its own: on a rebuild every series restarted from zero,
+    so the stored sum fell by a whole segment's total at each boundary (a large negative bar in
+    the Energy dashboard), and on an ordinary poll a series older than one already written was
+    dropped whole by the stale-window guard. A utility is free to publish one meter's history
+    as many MeterReadings; UtilityAPI does (issue #21).
     """
-    if not series.readings:
-        return True  # Nothing to write; keeps logs quiet on the test-lab empty-account case.
-
     statistic_id = statistic_id_for_series(
         entry.entry_id,
         up.usage_point_id,
-        series.reading_type.flow_direction,
-        _series_commodity(up, series),
+        group[0].reading_type.flow_direction,
+        _series_commodity(up, group[0]),
     )
-    unit = _ha_unit_for(series.reading_type)
-    if unit is None:
-        _warn_once(
-            f"{statistic_id}:{series.reading_type.unit_of_measure}:no-unit",
-            "Skipping series %s: no HA unit mapping for %s/%s — its readings will not appear "
-            "in the Energy dashboard",
-            statistic_id,
-            series.reading_type.commodity,
-            series.reading_type.unit_of_measure,
-        )
+    # No unit can clash here: [_is_superseded_by_unit] has already left one per statistic.
+    representable: list[MeterReadingSeries] = []
+    for series in group:
+        if _ha_unit_for(series.reading_type) is None:
+            _warn_once(
+                f"{statistic_id}:{series.reading_type.unit_of_measure}:no-unit",
+                "Skipping series %s: no HA unit mapping for %s/%s — its readings will not "
+                "appear in the Energy dashboard",
+                statistic_id,
+                series.reading_type.commodity,
+                series.reading_type.unit_of_measure,
+            )
+            continue
+        representable.append(series)
+    if not representable:
         return False
+    if not any(series.readings for series in representable):
+        return True  # Nothing to write; keeps logs quiet on the test-lab empty-account case.
+    series = representable[0]
+    unit = _ha_unit_for(series.reading_type)
 
     metadata: StatisticMetaData = {
         "has_mean": False,
@@ -677,7 +770,7 @@ async def _import_series(
         (0.0, None) if fresh else await _resume_point(hass, statistic_id)
     )
 
-    by_hour, covered_seconds = _hourly_totals(series)
+    by_hour, covered_seconds = _hourly_totals(representable)
     _drop_incomplete_trailing_hour(by_hour, covered_seconds, statistic_id)
 
     stats: list[StatisticData] = []
@@ -708,8 +801,10 @@ async def _import_series(
     return True
 
 
-def _hourly_totals(series: MeterReadingSeries) -> tuple[dict[datetime, float], dict[datetime, int]]:
-    """Fold a series' readings into ``(quantity_by_hour, covered_seconds_by_hour)``.
+def _hourly_totals(
+    group: list[MeterReadingSeries],
+) -> tuple[dict[datetime, float], dict[datetime, int]]:
+    """Fold every series in [group] into ``(quantity_by_hour, covered_seconds_by_hour)``.
 
     Aggregating to the hour *before* accumulating is load-bearing for any utility whose feed
     uses a sub-hourly ``intervalLength`` (15 or 30 minutes — none in scope today, but the ESPI
@@ -725,14 +820,33 @@ def _hourly_totals(series: MeterReadingSeries) -> tuple[dict[datetime, float], d
     we later resume from describe the same unit of time.
 
     A reading LONGER than an hour is spread across the hours it spans — see [_hours_spanned].
+
+    Where readings of different granularity cover the same hour, the finer one wins that hour
+    and the coarser is ignored there: a bill-level reading alongside hourly intervals describes
+    the same consumption twice, and the hourly figure is the measurement while the bill's share
+    of that hour is only an even spread. Decided per hour, not per series, so a bill still fills
+    whatever part of its period the intervals don't reach. Readings within a factor of
+    [_PEER_RESOLUTION_FACTOR] of the finest are its peers and add up as before — sub-hourly
+    readings within an hour, or two billing periods of 29 and 31 days meeting at a boundary.
     """
+    # hour → [(resolution_seconds, value, seconds_of_this_hour_covered), ...]
+    contributions: dict[datetime, list[tuple[int, float, int]]] = {}
+    for series in group:
+        for reading in series.readings:
+            value = _to_ha_units(reading.value, series.reading_type)
+            # Everything at or under an hour is the same resolution as far as an hourly
+            # statistic can tell, and a degenerate duration is pinned to one hour anyway.
+            resolution = max(reading.duration_seconds, 3600)
+            for hour, overlap, fraction in _hours_spanned(reading.start, reading.duration_seconds):
+                contributions.setdefault(hour, []).append((resolution, value * fraction, overlap))
+
     by_hour: dict[datetime, float] = {}
     covered_seconds: dict[datetime, int] = {}
-    for reading in series.readings:
-        value = _to_ha_units(reading.value, series.reading_type)
-        for hour, overlap, fraction in _hours_spanned(reading.start, reading.duration_seconds):
-            by_hour[hour] = by_hour.get(hour, 0.0) + value * fraction
-            covered_seconds[hour] = covered_seconds.get(hour, 0) + overlap
+    for hour, parts in contributions.items():
+        ceiling = min(resolution for resolution, _, _ in parts) * _PEER_RESOLUTION_FACTOR
+        kept = [part for part in parts if part[0] < ceiling]
+        by_hour[hour] = sum(value for _, value, _ in kept)
+        covered_seconds[hour] = sum(overlap for _, _, overlap in kept)
     return by_hour, covered_seconds
 
 

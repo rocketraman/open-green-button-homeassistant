@@ -35,7 +35,9 @@ from custom_components.greenbutton.api import (
 from custom_components.greenbutton.const import DOMAIN
 from custom_components.greenbutton.statistics import (
     _recorded_forward_hours,
+    async_stored_usage_shows_resets,
     import_usage_statistics,
+    response_has_series_sharing_a_statistic,
     response_needs_import_migration,
     statistic_id_for_series,
     statistic_id_prefix_for_entry,
@@ -45,6 +47,7 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
 _DAY = 86400
+_H2 = timedelta(hours=2)
 
 
 async def test_recorded_forward_hours_reconstructs_hourly_kwh(hass: HomeAssistant) -> None:
@@ -1218,3 +1221,139 @@ def test_migration_rebuilds_gas_and_water_feeds_only() -> None:
         response_needs_import_migration(_commodity_response("GAS", _commodity_series("OTHER")), 3)
         is False
     )
+
+
+def _hourly(start: datetime, hours: int, wh: float = 1000.0) -> list[UsageReading]:
+    return [UsageReading(start + timedelta(hours=h), 3600, wh) for h in range(hours)]
+
+
+def _one_usage_point(*series: MeterReadingSeries) -> UsageResponse:
+    up = UsagePoint(usage_point_id="up1", service_kind="electricity", series=list(series))
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+async def test_series_sharing_a_statistic_accumulate_into_one_running_sum(
+    hass: HomeAssistant,
+) -> None:
+    """One meter's history split across MeterReadings is one statistic, written as one sum.
+
+    UtilityAPI's shape (issue #21). Each series used to be accumulated separately: on a rebuild
+    every one restarted from zero, so the sum fell at each boundary and the Energy dashboard
+    drew a negative bar the size of the previous segment. Deliberately out of chronological
+    order — feed order is not time order, and the older segments used to be dropped.
+    """
+    t0 = datetime(2026, 1, 8, tzinfo=UTC)
+    segments = [
+        _series("DELTA_DATA", meter_reading_id=f"mr{i}", readings=_hourly(t0 + i * _H2, 2))
+        for i in (2, 0, 1)
+    ]
+    calls = await _import_and_collect_usage(hass, _one_usage_point(*segments))
+    assert len(calls) == 1
+    rows = calls[0].args[2]
+    assert [r["start"] for r in rows] == [t0 + timedelta(hours=h) for h in range(6)]
+    assert [round(r["sum"], 3) for r in rows] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+
+async def test_rebuild_of_split_series_leaves_no_falling_sum(hass: HomeAssistant) -> None:
+    """The same, end to end through a real recorder on the ``fresh=True`` rebuild path."""
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    t0 = datetime(2026, 1, 8, tzinfo=UTC)
+    segments = [
+        _series("DELTA_DATA", meter_reading_id=f"mr{i}", readings=_hourly(t0 + i * _H2, 2))
+        for i in range(3)
+    ]
+    await import_usage_statistics(
+        hass, entry, _one_usage_point(*segments), utility_display_name="X", fresh=True
+    )
+    await async_wait_recording_done(hass)
+    assert not await async_stored_usage_shows_resets(hass, "01TESTENTRY", 0)
+    stat_id = statistic_id_for_series("01TESTENTRY", "up1", "FORWARD")
+    rows = await get_instance(hass).async_add_executor_job(
+        statistics_during_period, hass, t0, None, {stat_id}, "hour", None, {"sum"}
+    )
+    assert [round(r["sum"], 3) for r in rows[stat_id]] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+
+async def test_finer_reading_supersedes_a_coarser_one_hour_by_hour(hass: HomeAssistant) -> None:
+    """A bill-level reading and hourly intervals describe the same energy; don't count it twice.
+
+    The hourly figure wins each hour it covers. Per hour, not per series: the intervals here
+    reach only the first two of the bill's four hours, and the bill's even spread (1 kWh/h)
+    still has to fill the other two.
+    """
+    t0 = datetime(2026, 6, 2, tzinfo=UTC)
+    bill = _series(
+        "BULK_QUANTITY", meter_reading_id="bill", readings=[UsageReading(t0, 14399, 4000.0)]
+    )
+    intervals = _series("BULK_QUANTITY", meter_reading_id="ivl", readings=_hourly(t0, 2, 500.0))
+    for order in ((bill, intervals), (intervals, bill)):
+        calls = await _import_and_collect_usage(hass, _one_usage_point(*order))
+        assert [round(r["sum"], 3) for r in calls[0].args[2]] == [0.5, 1.0, 2.0, 3.0]
+
+
+async def test_readings_of_similar_length_sharing_an_hour_still_add_up(
+    hass: HomeAssistant,
+) -> None:
+    """Two billing periods of slightly different length are peers, not finer-vs-coarser.
+
+    Where they meet in one hour both shares count, as they always have — superseding there
+    would shave that hour off whichever bill happened to be longer.
+    """
+    t0 = datetime(2026, 6, 2, tzinfo=UTC)
+    first = _series(
+        "BULK_QUANTITY", meter_reading_id="b1", readings=[UsageReading(t0, 3 * 3600, 3000.0)]
+    )
+    second = _series(
+        "BULK_QUANTITY",
+        meter_reading_id="b2",
+        readings=[UsageReading(t0 + timedelta(hours=2), 4 * 3600, 4000.0)],
+    )
+    calls = await _import_and_collect_usage(hass, _one_usage_point(first, second))
+    assert [round(r["sum"], 3) for r in calls[0].args[2]] == [1.0, 2.0, 4.0, 5.0, 6.0, 7.0]
+
+
+def test_series_sharing_a_statistic_is_the_revision_5_signal() -> None:
+    """Two importable same-flow series are the shape; a superseded register or other flow isn't."""
+    delta = _series("DELTA_DATA", meter_reading_id="mr1")
+    assert response_has_series_sharing_a_statistic(
+        _one_usage_point(delta, _series("DELTA_DATA", meter_reading_id="mr2"))
+    )
+    assert not response_has_series_sharing_a_statistic(_one_usage_point(delta))
+    assert not response_has_series_sharing_a_statistic(
+        _one_usage_point(delta, _series("BULK_QUANTITY", meter_reading_id="mr2"))
+    )
+    assert not response_has_series_sharing_a_statistic(
+        _one_usage_point(delta, _series("DELTA_DATA", "REVERSE", meter_reading_id="mr2"))
+    )
+
+
+@pytest.mark.parametrize(
+    ("sums", "stamped_revision", "expected"),
+    [
+        ((1.0, 2.0, 0.5, 1.5), 4, True),  # the sum restarted at a series boundary
+        ((1.0, 2.0, 2.0, 3.0), 4, False),
+        ((1.0, 2.0, 0.5, 1.5), 5, False),  # already repaired/stamped: don't scan again
+    ],
+)
+async def test_stored_usage_resets_are_recognized_from_the_recorder(
+    hass: HomeAssistant, sums: tuple[float, ...], stamped_revision: int, expected: bool
+) -> None:
+    """A consumption sum that falls is the revision-5 damage, whatever this poll's feed shows."""
+    base = datetime(2026, 1, 8, tzinfo=UTC)
+    async_add_external_statistics(
+        hass,
+        {
+            "has_mean": False,
+            "has_sum": True,
+            "name": "test usage",
+            "source": DOMAIN,
+            "statistic_id": statistic_id_for_series("01TESTENTRY", "up1", "FORWARD"),
+            "unit_of_measurement": "kWh",
+            "unit_class": "energy",
+            "mean_type": StatisticMeanType.NONE,
+        },
+        [{"start": base + timedelta(hours=i), "state": s, "sum": s} for i, s in enumerate(sums)],
+    )
+    await async_wait_recording_done(hass)
+    assert await async_stored_usage_shows_resets(hass, "01TESTENTRY", stamped_revision) is expected
