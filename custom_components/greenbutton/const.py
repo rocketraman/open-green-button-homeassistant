@@ -238,7 +238,12 @@ CONF_IMPORT_LOGIC_REVISION = "import_logic_revision"
 #       billed through UsageSummary; feeds that itemize per-interval <cost> never ran the
 #       selection and are stamped forward untouched. Usage rows are unaffected — the damage is
 #       cost, and it is damage by omission, which is why nobody reported it as wrong data.
-IMPORT_LOGIC_REVISION = 3
+#   4 — gas and water. Only watt-hours and cubic metres were importable, every series shared the
+#       electricity-style statistic id, and ESPI uom 119 (cubic FEET) was mapped to m³. Gas and
+#       water now get dedicated statistic series, in the right unit, with therms/BTU/gallons/
+#       litres importable. Affects any feed carrying a gas or water series or a non-watt-hour
+#       unit; electricity-only accounts are stamped forward untouched.
+IMPORT_LOGIC_REVISION = 4
 
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see
