@@ -43,6 +43,12 @@ Home Assistant will tell you when this is what's happening: look for a notice un
 
 If it's still empty a day later the notice changes to say so, and we'd like to hear about it — the link in the notice goes to the tracking issue.
 
+### If the Energy dashboard stops updating
+
+If usage stops arriving in the Energy dashboard while the integration reports no errors, check **Settings → Repairs**. Utilities occasionally re-issue a meter's ID without anything changing at your home. The readings are still imported, but under the new ID they go into new statistics, so the ones your dashboard is set up with stand still.
+
+The integration notices this and asks whether the new ID is the same meter. **Merge** moves the readings imported under the new ID onto the end of your existing statistics and continues them from then on — nothing needs changing in the dashboard. **Keep separate** is for a meter that really is a different one: both sets of statistics are left as they are. The notice appears on the first poll after the change, so it can take up to a day.
+
 ## Recomputing statistics after an update
 
 Statistics are written once, as they're fetched — so if an update changes how usage or **cost** is calculated, rows already in the database keep their old values.

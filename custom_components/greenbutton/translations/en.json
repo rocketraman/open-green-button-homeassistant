@@ -68,6 +68,25 @@
     "no_data_yet_stuck": {
       "title": "{utility} still hasn't sent any usage data",
       "description": "It's been more than a day since this account was authorized, and {utility} has yet to return a single usage reading. The requests themselves are succeeding, so this isn't an authorization or connection problem — the utility just isn't giving us any data. Open Green Button has dropped back to its ordinary polling schedule and will keep checking.\n\nSome accounts genuinely have nothing to send (a newly-installed meter, or a utility that only publishes after your first bill closes). But this can also mean the account was authorized with the wrong scope, or that the utility's data export is broken at their end.\n\nPlease use the **Learn more** link below to open the tracking issue on GitHub and add a comment with: your utility/energy provider and region, how long the account has been active, and whether this is a residential or commercial account. Enabling debug logging for the integration first (Settings → Devices & Services → ⋮ → Enable debug logging) captures your utility's own response, which is the part we can't get any other way."
+    },
+    "usage_point_replaced": {
+      "title": "{utility} may have changed your {service} meter's ID",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Is this the same meter?",
+            "description": "Meter `{replaced_usage_point}` stopped reporting on {replaced_last_reading}, and a meter Open Green Button hasn't seen before, `{usage_point}`, started reporting where it left off. Utilities sometimes re-issue a meter's ID without anything changing at your home — and the same thing happens when a meter is physically replaced.\n\nUsage is still being imported, but under the new ID it goes into **new statistics**, so the ones your Energy dashboard is set up with look like they stopped updating.\n\n**Merge** if this is the same service continuing: the readings imported under the new ID are moved onto the end of the existing statistics, and everything from here on continues them. Nothing needs changing in the Energy dashboard.\n\n**Keep separate** if `{usage_point}` really is a different meter you want tracked on its own. Both sets of statistics are left as they are, and you can add the new one to the Energy dashboard yourself.",
+            "menu_options": {
+              "merge": "Merge — it's the same meter",
+              "keep_separate": "Keep separate — it's a different meter"
+            }
+          }
+        },
+        "abort": {
+          "entry_not_loaded": "This Open Green Button account isn't loaded right now. Reload it and try again.",
+          "not_started": "Home Assistant is still starting. Try again in a minute."
+        }
+      }
     }
   },
   "services": {
