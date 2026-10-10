@@ -14,6 +14,7 @@ the id format — never construct one ad-hoc elsewhere.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -547,9 +548,10 @@ async def import_usage_statistics(
 
     Cumulative meter registers are excluded — see [_is_interval_consumption_series].
 
-    Idempotent on (statistic_id, hour) — re-importing a previously-imported hour is a no-op,
-    so the coordinator can pull overlapping windows on every poll without worrying about
-    duplicates.
+    Idempotent on (statistic_id, hour) — re-importing a previously-imported hour with the same
+    value is a no-op, so the coordinator can pull overlapping windows on every poll without
+    worrying about duplicates. A re-fetched hour whose value has *changed* restates the usage
+    statistic from that hour on — see [_restated_rows].
 
     ``fresh=True`` means "the store was just cleared; import from a zero baseline". It skips
     the per-series resume-point read entirely. That read (``get_last_statistics``) is what a
@@ -938,11 +940,23 @@ async def _import_series_group(
         (0.0, None) if fresh else await _resume_point(hass, statistic_id)
     )
 
-    by_hour, covered_seconds = _hourly_totals(representable)
+    by_hour, covered_seconds, measured = _hourly_totals(representable)
     _drop_incomplete_trailing_hour(by_hour, covered_seconds, statistic_id)
 
     stats: list[StatisticData] = []
     running = resume_from_sum
+    if resume_after_epoch is not None:
+        # Hours this poll re-fetched that are already stored. A utility may correct a block
+        # after first publishing it, so these are compared with the store instead of assumed
+        # identical; only hours the feed fully measured are trusted to overrule it.
+        refetched = {
+            hour: by_hour[hour]
+            for hour in measured
+            if hour in by_hour and hour.timestamp() <= resume_after_epoch
+        }
+        restated = await _restated_rows(hass, statistic_id, refetched)
+        if restated is not None:
+            stats, running = restated
     for hour in sorted(by_hour):
         # Stale-window guard — HA's statistics machinery already deduplicates on
         # (statistic_id, start), but skipping locally avoids resetting `running` from
@@ -950,7 +964,8 @@ async def _import_series_group(
         # hour, because that's the granularity the stored row (and hence `_resume_point`) is
         # at: a raw sub-hourly reading start at :15 is > the hour's stored start, so a raw
         # comparison would wave through readings whose hour is already in the sum and add
-        # them on top of it, inflating that hour and every hour after it.
+        # them on top of it, inflating that hour and every hour after it. An already-stored
+        # hour whose value changed was handled above, by [_restated_rows].
         if resume_after_epoch is not None and hour.timestamp() <= resume_after_epoch:
             continue
         running += by_hour[hour]
@@ -969,10 +984,97 @@ async def _import_series_group(
     return True
 
 
+async def _restated_rows(
+    hass: HomeAssistant,
+    statistic_id: str,
+    refetched: dict[datetime, float],
+) -> tuple[list[StatisticData], float] | None:
+    """Rows that restate [statistic_id] where [refetched] disagrees with it, or None if it agrees.
+
+    [refetched] is ``{hour: quantity}`` for hours at or before the statistic's last stored row.
+    A utility can publish an IntervalBlock and correct it afterwards — Burlington Hydro served
+    one day as 24 zero readings and later, under the same hours, the real ~40 kWh. Skipping
+    every already-stored hour froze the zeros in place, a flat day in the Energy dashboard that
+    no later poll could repair.
+
+    The statistic is a cumulative sum, so one hour can't be corrected alone: every later row
+    carries the old value in its sum. The result therefore runs from the first differing hour
+    to the last stored row — re-fetched hours take the feed's value, the rest keep the
+    consumption already stored for them — and comes back with the sum it ends on, for the
+    caller to continue from. HA upserts on (statistic_id, start), so writing these rows replaces
+    the stored ones. A re-fetched hour with no stored row at all (a gap the feed has since
+    filled) counts as stored zero, and is inserted.
+
+    Nothing is deleted and nothing outside the statistic is touched; a poll whose overlap
+    matches the store — every ordinary poll — writes nothing here.
+    """
+    if not refetched:
+        return None
+    since = min(refetched)
+    by_id = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        since,
+        None,
+        {statistic_id},
+        "hour",
+        None,
+        # `change` is each row's sum less its predecessor's — for the first row, less the last
+        # row stored before [since], however far back that is.
+        {"sum", "change"},
+    )
+    stored: dict[datetime, tuple[float, float]] = {}
+    for row in by_id.get(statistic_id, []):
+        total, change = row.get("sum"), row.get("change")
+        if total is None or change is None:
+            continue
+        start = row["start"]
+        hour = start if isinstance(start, datetime) else datetime.fromtimestamp(start, tz=UTC)
+        stored[hour] = (total, change)
+    if not stored:
+        return None
+
+    differing = [
+        hour
+        for hour, quantity in refetched.items()
+        if not math.isclose(
+            quantity, stored[hour][1] if hour in stored else 0.0, rel_tol=1e-9, abs_tol=1e-6
+        )
+    ]
+    if not differing:
+        return None
+    first = min(differing)
+
+    # The sum just before [first]: the nearest stored row ahead of it, else whatever preceded
+    # the oldest row read back.
+    earlier = [hour for hour in stored if hour < first]
+    if earlier:
+        running = stored[max(earlier)][0]
+    else:
+        oldest_sum, oldest_change = stored[min(stored)]
+        running = oldest_sum - oldest_change
+    last_stored_sum = stored[max(stored)][0]
+
+    rows: list[StatisticData] = []
+    for hour in sorted({h for h in (*stored, *refetched) if h >= first}):
+        running += refetched[hour] if hour in refetched else stored[hour][1]
+        rows.append(StatisticData(start=hour, state=running, sum=running))
+    _LOGGER.info(
+        "Restating %s from %s: %d re-published hour(s) differ from what was stored, moving the "
+        "total by %+.3f across %d row(s)",
+        statistic_id,
+        first.isoformat(),
+        len(differing),
+        running - last_stored_sum,
+        len(rows),
+    )
+    return rows, running
+
+
 def _hourly_totals(
     group: list[MeterReadingSeries],
-) -> tuple[dict[datetime, float], dict[datetime, int]]:
-    """Fold every series in [group] into ``(quantity_by_hour, covered_seconds_by_hour)``.
+) -> tuple[dict[datetime, float], dict[datetime, int], set[datetime]]:
+    """Fold [group] into ``(quantity_by_hour, covered_seconds_by_hour, measured_hours)``.
 
     Aggregating to the hour *before* accumulating is load-bearing for any utility whose feed
     uses a sub-hourly ``intervalLength`` (15 or 30 minutes — none in scope today, but the ESPI
@@ -996,6 +1098,12 @@ def _hourly_totals(
     whatever part of its period the intervals don't reach. Readings within a factor of
     [_PEER_RESOLUTION_FACTOR] of the finest are its peers and add up as before — sub-hourly
     readings within an hour, or two billing periods of 29 and 31 days meeting at a boundary.
+
+    ``measured_hours`` are the hours whose quantity is a whole measurement: made up only of
+    readings no longer than an hour, which between them cover all of it. Only those may overrule
+    a value already stored ([_restated_rows]). An hour that is merely a multi-hour reading's even
+    share must not replace hourly readings a previous poll imported, and an hour the fetch window
+    cut part-way through would restate the stored hour down to the part it happened to carry.
     """
     # hour → [(resolution_seconds, value, seconds_of_this_hour_covered), ...]
     contributions: dict[datetime, list[tuple[int, float, int]]] = {}
@@ -1010,12 +1118,18 @@ def _hourly_totals(
 
     by_hour: dict[datetime, float] = {}
     covered_seconds: dict[datetime, int] = {}
+    measured: set[datetime] = set()
     for hour, parts in contributions.items():
         ceiling = min(resolution for resolution, _, _ in parts) * _PEER_RESOLUTION_FACTOR
         kept = [part for part in parts if part[0] < ceiling]
         by_hour[hour] = sum(value for _, value, _ in kept)
         covered_seconds[hour] = sum(overlap for _, _, overlap in kept)
-    return by_hour, covered_seconds
+        if (
+            all(resolution == 3600 for resolution, _, _ in kept)
+            and covered_seconds[hour] >= 3600 - _HOUR_COVERAGE_SLACK
+        ):
+            measured.add(hour)
+    return by_hour, covered_seconds, measured
 
 
 def _hours_spanned(start: datetime, duration_seconds: int) -> list[tuple[datetime, int, float]]:
@@ -1063,11 +1177,10 @@ def _drop_incomplete_trailing_hour(
 ) -> None:
     """Remove the newest hour from [by_hour] when the feed only covers part of it.
 
-    The cumulative-sum model can't revise an hour once written: the resume point is a single
-    (sum, start) pair, so re-stating an earlier hour would mean rewriting every later row. With
-    a sub-hourly feed a poll routinely lands mid-hour — writing that half-covered hour would
-    freeze it at half its real consumption, since the aligned stale-window guard correctly
-    refuses to add its remaining intervals on the next poll.
+    With a sub-hourly feed a poll routinely lands mid-hour — writing that half-covered hour
+    would freeze it at half its real consumption: the aligned stale-window guard correctly
+    refuses to add its remaining intervals on the next poll, and [_restated_rows] only revises
+    a stored hour from a fetch that covers the whole of it, which the next window need not.
 
     So hold the partial hour back instead and let a later poll import it whole. Only the
     *trailing* hour is deferred; a mid-series hour short of 3600s is a genuine gap in the feed
@@ -1388,6 +1501,10 @@ async def _import_cost_from_readings(
     Costs are summed per hour across the UsagePoint's FORWARD interval-consumption series
     (multiple meters roll up into one bill), then accumulated into the same cost stat the Energy
     dashboard reads. Cumulative registers are excluded — see [_forward_interval_series].
+
+    A re-fetched hour whose cost differs from the stored one restates the statistic from that
+    hour on, exactly as usage does — see [_restated_rows]. The cost rides on the same reading as
+    the consumption, so a block the utility corrects brings its corrected cost with it.
     """
     forward_series = _forward_interval_series(up)
     currency_code = next(
@@ -1408,6 +1525,11 @@ async def _import_cost_from_readings(
         return
 
     cost_by_hour: dict[datetime, float] = {}
+    # What makes an hour's cost a whole measurement, fit to overrule a stored one: every costed
+    # reading in it is an hour or shorter, and together they cover it. Same rule, for the same
+    # reasons, as the measured hours of [_hourly_totals].
+    covered_seconds: dict[datetime, int] = {}
+    spread: set[datetime] = set()
     for series in forward_series:
         for reading in series.readings:
             if reading.cost is None:
@@ -1416,8 +1538,11 @@ async def _import_cost_from_readings(
             # [_hours_spanned]. A billing-only feed carries the whole period's cost on one
             # reading, and pinning it to the first hour puts a month's bill in a single hour
             # of the cost statistic while the usage it pairs with is spread across the period.
-            for hour, _overlap, fraction in _hours_spanned(reading.start, reading.duration_seconds):
+            for hour, overlap, fraction in _hours_spanned(reading.start, reading.duration_seconds):
                 cost_by_hour[hour] = cost_by_hour.get(hour, 0.0) + reading.cost * fraction
+                covered_seconds[hour] = covered_seconds.get(hour, 0) + overlap
+                if reading.duration_seconds > 3600:
+                    spread.add(hour)
     if not cost_by_hour:
         return
 
@@ -1443,6 +1568,17 @@ async def _import_cost_from_readings(
     )
     stats: list[StatisticData] = []
     running = resume_from_sum
+    if resume_after_epoch is not None:
+        refetched = {
+            hour: cost
+            for hour, cost in cost_by_hour.items()
+            if hour.timestamp() <= resume_after_epoch
+            and hour not in spread
+            and covered_seconds[hour] >= 3600 - _HOUR_COVERAGE_SLACK
+        }
+        restated = await _restated_rows(hass, statistic_id, refetched)
+        if restated is not None:
+            stats, running = restated
     for hour in sorted(cost_by_hour):
         if resume_after_epoch is not None and hour.timestamp() <= resume_after_epoch:
             continue

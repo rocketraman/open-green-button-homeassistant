@@ -39,6 +39,7 @@ from custom_components.greenbutton.statistics import (
     import_usage_statistics,
     response_has_series_sharing_a_statistic,
     response_needs_import_migration,
+    statistic_id_for_cost,
     statistic_id_for_series,
     statistic_id_prefix_for_entry,
 )
@@ -1357,3 +1358,170 @@ async def test_stored_usage_resets_are_recognized_from_the_recorder(
     )
     await async_wait_recording_done(hass)
     assert await async_stored_usage_shows_resets(hass, "01TESTENTRY", stamped_revision) is expected
+
+
+# The Burlington Hydro block: 24 hourly rows, 2026-09-23 05:00Z → 2026-09-24 04:00Z.
+_BLOCK_START = datetime(2026, 9, 23, 5, tzinfo=UTC)
+# Distinct per-hour values, so a restatement that merely shifted the block would be caught.
+_BLOCK_WH = [1000.0 + 50.0 * h for h in range(24)]
+
+
+async def _usage_deltas(hass: HomeAssistant, stat_id: str, start: datetime) -> list[float]:
+    """Per-hour consumption from [start] on, recovered from the stored cumulative sum."""
+    by_id = await get_instance(hass).async_add_executor_job(
+        statistics_during_period, hass, start, None, {stat_id}, "hour", None, {"sum", "change"}
+    )
+    return [round(row["change"], 3) for row in by_id.get(stat_id, [])]
+
+
+async def test_republished_block_restates_the_stored_hours(hass: HomeAssistant) -> None:
+    """A block first published as zeros and corrected later replaces the zeros it left behind.
+
+    Three days are imported, the middle one all zeros. The next poll's overlap re-serves that
+    middle block with real readings, plus one new day. The stale-window guard used to skip every
+    hour at or before the last stored row, so the correction was dropped and the day stayed flat.
+    """
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    stat_id = statistic_id_for_series(entry.entry_id, "up1", "FORWARD")
+    day = timedelta(days=1)
+    before, after, newest = _BLOCK_START - day, _BLOCK_START + day, _BLOCK_START + 2 * day
+
+    def _block(values: list[float]) -> list[UsageReading]:
+        return [
+            UsageReading(_BLOCK_START + timedelta(hours=h), 3600, wh) for h, wh in enumerate(values)
+        ]
+
+    first = _hourly(before, 24) + _block([0.0] * 24) + _hourly(after, 24)
+    await import_usage_statistics(
+        hass, entry, _one_usage_point(_series("DELTA_DATA", readings=first)), "X"
+    )
+    await async_wait_recording_done(hass)
+    assert await _usage_deltas(hass, stat_id, before) == [1.0] * 24 + [0.0] * 24 + [1.0] * 24
+
+    second = _block(_BLOCK_WH) + _hourly(after, 24) + _hourly(newest, 24)
+    await import_usage_statistics(
+        hass, entry, _one_usage_point(_series("DELTA_DATA", readings=second)), "X"
+    )
+    await async_wait_recording_done(hass)
+
+    corrected = [wh / 1000 for wh in _BLOCK_WH]
+    assert await _usage_deltas(hass, stat_id, before) == [1.0] * 24 + corrected + [1.0] * 48
+    by_id = await get_instance(hass).async_add_executor_job(
+        statistics_during_period, hass, newest, None, {stat_id}, "hour", None, {"sum"}
+    )
+    assert round(by_id[stat_id][-1]["sum"], 3) == round(72.0 + sum(corrected), 3)
+
+
+async def test_coarser_refetch_does_not_restate_measured_hours(hass: HomeAssistant) -> None:
+    """A bill-level reading over hours already stored from hourly readings changes nothing.
+
+    Its even share of each hour differs from what was measured, but it is a spread, not a
+    correction — only a whole measurement of an hour may overrule the store.
+    """
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    stat_id = statistic_id_for_series(entry.entry_id, "up1", "FORWARD")
+    await import_usage_statistics(
+        hass,
+        entry,
+        _one_usage_point(_series("DELTA_DATA", readings=_hourly(_BLOCK_START, 48))),
+        "X",
+    )
+    await async_wait_recording_done(hass)
+
+    bill = [UsageReading(_BLOCK_START, 48 * 3600, 96_000.0)]
+    await import_usage_statistics(
+        hass, entry, _one_usage_point(_series("DELTA_DATA", readings=bill)), "X"
+    )
+    await async_wait_recording_done(hass)
+    assert await _usage_deltas(hass, stat_id, _BLOCK_START) == [1.0] * 48
+
+
+async def test_partly_refetched_hour_does_not_restate_it(hass: HomeAssistant) -> None:
+    """A window that opens mid-hour carries part of a stored hour; that part isn't a correction."""
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    stat_id = statistic_id_for_series(entry.entry_id, "up1", "FORWARD")
+    await import_usage_statistics(
+        hass, entry, _sub_hourly_response(range(5, 7)), utility_display_name="X"
+    )
+    await async_wait_recording_done(hass)
+
+    second = _sub_hourly_response(range(6, 8))
+    del second.usage_points[0].series[0].readings[:3]  # hour 06 from :45 only
+    await import_usage_statistics(hass, entry, second, utility_display_name="X")
+    await async_wait_recording_done(hass)
+    assert await _recorded_sums(hass, stat_id) == [(5, 1.0), (6, 2.0), (7, 3.0)]
+
+
+async def test_republished_non_zero_readings_are_restated_up_and_down(hass: HomeAssistant) -> None:
+    """A correction to a non-zero reading is applied either way; untouched hours keep theirs."""
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    stat_id = statistic_id_for_series(entry.entry_id, "up1", "FORWARD")
+    await import_usage_statistics(
+        hass,
+        entry,
+        _one_usage_point(_series("DELTA_DATA", readings=_hourly(_BLOCK_START, 6))),
+        "X",
+    )
+    await async_wait_recording_done(hass)
+
+    # Hours 2-4 re-served: one revised down, one unchanged, one revised up.
+    revised = [
+        UsageReading(_BLOCK_START + timedelta(hours=h), 3600, wh)
+        for h, wh in ((2, 400.0), (3, 1000.0), (4, 2500.0))
+    ]
+    await import_usage_statistics(
+        hass, entry, _one_usage_point(_series("DELTA_DATA", readings=revised)), "X"
+    )
+    await async_wait_recording_done(hass)
+    assert await _usage_deltas(hass, stat_id, _BLOCK_START) == [1.0, 1.0, 0.4, 1.0, 2.5, 1.0]
+
+
+async def test_republished_per_interval_cost_is_restated(hass: HomeAssistant) -> None:
+    """A corrected block's per-interval cost replaces the stored cost, as its usage does.
+
+    A multi-hour reading's cost over the same hours is only an even share and changes nothing.
+    """
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    cost_id = statistic_id_for_cost(entry.entry_id, "up1")
+
+    def _costed(*hours: tuple[int, float, float]) -> UsageResponse:
+        return _one_usage_point(
+            _series(
+                "DELTA_DATA",
+                readings=[
+                    UsageReading(_BLOCK_START + timedelta(hours=h), 3600, wh, cost=cost)
+                    for h, wh, cost in hours
+                ],
+            )
+        )
+
+    await import_usage_statistics(
+        hass,
+        entry,
+        _costed((0, 1000.0, 0.10), (1, 0.0, 0.0), (2, 0.0, 0.0), (3, 1000.0, 0.10)),
+        "X",
+    )
+    await async_wait_recording_done(hass)
+    assert await _usage_deltas(hass, cost_id, _BLOCK_START) == [0.1, 0.0, 0.0, 0.1]
+
+    # Hours 1-3 re-served: two corrected, one unchanged; plus a new hour.
+    await import_usage_statistics(
+        hass,
+        entry,
+        _costed((1, 2000.0, 0.25), (2, 500.0, 0.05), (3, 1000.0, 0.10), (4, 1000.0, 0.12)),
+        "X",
+    )
+    await async_wait_recording_done(hass)
+    assert await _usage_deltas(hass, cost_id, _BLOCK_START) == [0.1, 0.25, 0.05, 0.1, 0.12]
+
+    spread = _one_usage_point(
+        _series("DELTA_DATA", readings=[UsageReading(_BLOCK_START, 5 * 3600, 5000.0, cost=5.0)])
+    )
+    await import_usage_statistics(hass, entry, spread, "X")
+    await async_wait_recording_done(hass)
+    assert await _usage_deltas(hass, cost_id, _BLOCK_START) == [0.1, 0.25, 0.05, 0.1, 0.12]
