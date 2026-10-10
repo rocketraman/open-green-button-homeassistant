@@ -294,3 +294,49 @@ async def test_fetch_usage_202_surfaces_the_proxys_message(
         await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
 
     assert "https://dc.example/Batch/Bulk/000001" in str(excinfo.value)
+
+
+async def test_fetch_usage_202_carries_the_resources_the_utility_announced(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """`resourcePaths` on the 202 reach the exception, ready to pass back as `resource_path`.
+
+    These are the only way a first sync learns where an async-batch custodian put its data.
+    """
+    aioclient_mock.post(
+        PROXY_USAGE_URL,
+        status=202,
+        json={
+            "error": "utility_data_pending",
+            "resourcePaths": ["UsagePoint/up1", "UsagePoint/up2"],
+        },
+    )
+
+    with pytest.raises(OpenGbDataPendingError) as excinfo:
+        await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
+
+    assert excinfo.value.resource_paths == ("UsagePoint/up1", "UsagePoint/up2")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": "utility_data_pending"},  # an older proxy, or a custodian that named nothing
+        {"error": "utility_data_pending", "resourcePaths": None},
+        {"error": "utility_data_pending", "resourcePaths": "UsagePoint/up1"},
+        {"error": "utility_data_pending", "resourcePaths": [1, None, ""]},
+    ],
+)
+async def test_fetch_usage_202_without_usable_resource_paths_names_none(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    body: dict[str, object],
+) -> None:
+    """An absent or malformed `resourcePaths` is "nothing announced", never an error."""
+    aioclient_mock.post(PROXY_USAGE_URL, status=202, json=body)
+
+    with pytest.raises(OpenGbDataPendingError) as excinfo:
+        await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
+
+    assert excinfo.value.resource_paths == ()

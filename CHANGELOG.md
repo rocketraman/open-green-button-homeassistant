@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#21](https://github.com/rocketraman/open-green-button-homeassistant/issues/21)).
 - The repair for those negative bars no longer waits for a poll that returns new
   readings; it is recognized from the stored data alone.
+- A first sync with a utility that prepares its data in the background (Hydro
+  Ottawa, Alectra and other Savage Data utilities) no longer waits forever on
+  "your utility is preparing this". These utilities announce where the prepared
+  data is while answering the request; the integration now reads it from there
+  instead of looking for a meter list that does not exist. Needs the matching
+  server update
+  ([open-green-button#80](https://github.com/rocketraman/open-green-button/issues/80)).
 
 ## [0.3.0] - 2026-10-09
 

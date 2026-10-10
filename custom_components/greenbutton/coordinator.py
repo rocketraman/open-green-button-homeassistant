@@ -333,7 +333,9 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
                 self.entry.entry_id,
                 err,
             )
-            collected = await self._async_collect_deferred_batch(published_min, published_max)
+            collected = await self._async_collect_deferred_batch(
+                published_min, published_max, err.resource_paths
+            )
             if collected is not None:
                 # The prepared batch was there after all. Fall through to the success tail below,
                 # which clears the frozen window, stands the fast retry down and hands the data to
@@ -444,16 +446,16 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         self,
         published_min: datetime,
         published_max: datetime,
+        notified_paths: tuple[str, ...] = (),
     ) -> UsageResponse | None:
         """Try to collect a batch the custodian prepared out of band. None if we couldn't.
 
         The subscription-level batch URL is an ENQUEUE endpoint on the custodians that behave this
         way: it answers 202 to every request and never serves the dataset, no matter how exactly
         the URL is repeated (issues/10 — 252 byte-identical requests over 33 hours, all 202). What
-        it does do is prepare the batch, which the custodian then notifies at a per-UsagePoint URL
-        beneath that same subscription. Those notifications go to the proxy, which is stateless and
-        discards them; but the URL they name is derivable — subscription URI + `UsagePoint/{id}` —
-        so we can ask for it directly instead of waiting to be told.
+        it does do is prepare the batch, which the custodian then announces at per-UsagePoint URLs
+        beneath that same subscription. The proxy relays those on the 202 itself
+        ([notified_paths]), so we can go and read them straight away.
 
         Best-effort by design: every failure here returns None and leaves the caller's ordinary
         deferred-fetch handling (freeze the window, raise the repair issue, retry soon) exactly as
@@ -464,18 +466,35 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         per meter (see CONF_USAGE_POINT_CURSORS). The failed meter keeps its old cursor and its
         window simply stays open until it answers.
         """
-        usage_point_ids = await self._async_discover_usage_points(published_min, published_max)
-        if isinstance(usage_point_ids, UsageResponse):
-            return usage_point_ids  # The listing carried the data itself — nothing left to ask.
-        if not usage_point_ids:
+        # The frozen window exists so the ENQUEUE request can be repeated byte for byte. These
+        # are different URLs with no such constraint, and a freeze can be weeks old by the time a
+        # collection finally works — so read up to now rather than up to when we first asked.
+        published_max = max(published_max, datetime.now(UTC))
+
+        resource_paths = await self._async_discover_resource_paths(
+            published_min, published_max, notified_paths
+        )
+        if isinstance(resource_paths, UsageResponse):
+            return resource_paths  # The listing carried the data itself — nothing left to ask.
+        if not resource_paths:
             return None
 
         collected: list[Any] = []
         updated: datetime | None = None
-        for usage_point_id in usage_point_ids:
-            response = await self._async_fetch_resource(
-                f"UsagePoint/{usage_point_id}", published_min, published_max
-            )
+        for resource_path in resource_paths:
+            response = await self._async_fetch_resource(resource_path, published_min, published_max)
+            if response is None and resource_path in notified_paths:
+                # The custodian announced this URL bare — no date filter — and whether it accepts
+                # one at all is unverified. So when the filtered form fails, ask for it exactly as
+                # announced before giving the meter up. Costs a wider response, never a wrong one:
+                # the importer already tolerates readings older than the window.
+                response = await self._async_fetch_resource(resource_path, None, None)
+                if response is not None:
+                    _LOGGER.info(
+                        "Entry %s: resource %s answered only without a date filter",
+                        self.entry.entry_id,
+                        resource_path,
+                    )
             if response is None:
                 continue
             collected.extend(response.usage_points)
@@ -486,7 +505,7 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             _LOGGER.debug(
                 "Entry %s: no meter answered the prepared-batch collection (%d attempted)",
                 self.entry.entry_id,
-                len(usage_point_ids),
+                len(resource_paths),
             )
             return None
 
@@ -494,30 +513,43 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             "Entry %s: collected a deferred batch from %d of %d usage point(s)",
             self.entry.entry_id,
             len(collected),
-            len(usage_point_ids),
+            len(resource_paths),
         )
         return UsageResponse(updated=updated, usage_points=collected, new_credentials=None)
 
-    async def _async_discover_usage_points(
+    async def _async_discover_resource_paths(
         self,
         published_min: datetime,
         published_max: datetime,
+        notified_paths: tuple[str, ...] = (),
     ) -> list[str] | UsageResponse:
-        """The meters to collect from — or the whole feed, if the listing simply returned it.
+        """The resources to collect from — or the whole feed, if a listing simply returned it.
 
-        Prefers the meters we already know: the per-meter cursor map is keyed by usage point id,
-        so any entry that has ever imported can skip the extra request entirely. That also covers
-        a custodian which used to answer synchronously and later starts deferring (Elexicon looks
-        like this — it has served data fine in the past and now defers a two-year backfill).
+        In order of how much each source can be trusted:
 
-        Only an entry that has NEVER imported has to ask, which is the case that matters: a first
-        sync against a deferring custodian, exactly issues/10. Whether a UsagePoint listing exists
-        at all is unverified — no notification has ever named a collection URL, so this is
-        inference from REST convention, and its outcome is logged either way.
+        1. What the custodian just announced ([notified_paths]). Authoritative and current: it is
+           the custodian saying where this very batch is. It is also the ONLY source that works
+           for an entry that has never imported — a first sync, exactly issues/10 and
+           open-green-button issues/80.
+        2. The meters we already know, from the per-meter cursor map. Covers a custodian that
+           announced nothing this time, and one which used to answer synchronously and later
+           started deferring (Elexicon looks like this).
+        3. A `UsagePoint` listing, as a last resort. Savage Data answers it 404 (issues/80), so
+           this is kept only for a custodian we haven't met that defers, announces nothing and
+           does serve the collection.
         """
+        if notified_paths:
+            _LOGGER.info(
+                "Entry %s: the utility announced %d prepared resource(s): %s",
+                self.entry.entry_id,
+                len(notified_paths),
+                ", ".join(notified_paths),
+            )
+            return list(notified_paths)
+
         known = sorted(self._usage_point_cursors())
         if known:
-            return known
+            return [f"UsagePoint/{usage_point_id}" for usage_point_id in known]
 
         listing = await self._async_fetch_resource("UsagePoint", published_min, published_max)
         if listing is None:
@@ -538,13 +570,13 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             len(discovered),
             ", ".join(discovered) or "<none>",
         )
-        return discovered
+        return [f"UsagePoint/{usage_point_id}" for usage_point_id in discovered]
 
     async def _async_fetch_resource(
         self,
         resource_path: str,
-        published_min: datetime,
-        published_max: datetime,
+        published_min: datetime | None,
+        published_max: datetime | None,
     ) -> UsageResponse | None:
         """GET one ESPI resource beneath our subscription. None on any failure, never raises.
 

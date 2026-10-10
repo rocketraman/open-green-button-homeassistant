@@ -364,7 +364,23 @@ class OpenGbDataPendingError(OpenGbApiError):
     re-attempt can collect the batch the utility prepared (see ``CONF_PENDING_PUBLISHED_MIN``),
     re-attempts on a short timer, and surfaces a repair issue that only escalates to an error if
     the data never arrives.
+
+    ``resource_paths`` names where the utility put the prepared dataset, when it said: relative
+    ESPI resources beneath our subscription (``UsagePoint/{id}``), each fetchable by passing it
+    back as ``resource_path``. The utility announces these to the proxy out of band while it is
+    answering, and the proxy relays them on the 202. Empty when the utility named nothing (or the
+    proxy predates relaying them) — the caller then has to find the resources some other way.
     """
+
+    def __init__(
+        self,
+        *args: object,
+        new_credentials: NewCredentials | None = None,
+        resource_paths: tuple[str, ...] = (),
+    ) -> None:
+        """Standard error args plus the prepared resources the utility named, if any."""
+        super().__init__(*args, new_credentials=new_credentials)
+        self.resource_paths = resource_paths
 
 
 class OpenGbPermanentError(OpenGbApiError):
@@ -527,9 +543,9 @@ class OpenGbApi:
                 reason = f" ({detail})" if detail else ""
                 raise OpenGbDataPendingError(
                     "Utility is preparing data asynchronously (HTTP 202, "
-                    f"{error_code or 'utility_data_pending'}); background data loads are not "
-                    f"yet supported{reason}",
+                    f"{error_code or 'utility_data_pending'}){reason}",
                     new_credentials=new_credentials,
+                    resource_paths=_safe_json_str_list(text, "resourcePaths"),
                 )
             if resp.status != 200:
                 text = await resp.text()
@@ -635,6 +651,24 @@ def _safe_json_field(text: str, field: str) -> str | None:
     except (ValueError, AttributeError):
         return None
     return value if isinstance(value, str) else None
+
+
+def _safe_json_str_list(text: str, field: str) -> tuple[str, ...]:
+    """Pull a top-level list of strings out of a JSON body; empty on anything else.
+
+    Same tolerance as [_safe_json_field]: an absent field, a different shape or a malformed body
+    all mean "nothing named", never an error — the field is an optional extra on a response we
+    already know how to handle without it.
+    """
+    import json
+
+    try:
+        value = json.loads(text).get(field)
+    except (ValueError, AttributeError):
+        return ()
+    if not isinstance(value, list):
+        return ()
+    return tuple(item for item in value if isinstance(item, str) and item)
 
 
 _HEADER_NEW_ENCRYPTED_REFRESH_BLOB = "OpenGB-New-Encrypted-Refresh-Blob"
