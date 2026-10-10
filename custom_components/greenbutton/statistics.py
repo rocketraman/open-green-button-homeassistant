@@ -22,13 +22,19 @@ from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     async_list_statistic_ids,
     get_last_statistics,
+    get_metadata,
     statistics_during_period,
 )
 from homeassistant.const import UnitOfEnergy, UnitOfVolume
 from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.helpers.start import async_at_started
 
-from .const import DOMAIN
+from .const import (
+    CONF_USAGE_POINT_ALIASES,
+    DOMAIN,
+    LAST_FETCHED_OVERLAP,
+    USAGE_POINT_REPLACED_LOOKBACK,
+)
 from .tou import cost_detail_tou_bucket, ontario_tou_bucket
 
 if TYPE_CHECKING:
@@ -103,6 +109,23 @@ def statistic_id_for_cost(entry_id: str, usage_point_id: str) -> str:
     return f"{DOMAIN}:{_slugify(entry_id)}_{_slugify(usage_point_id)}_cost"
 
 
+def statistic_usage_point_id(entry: ConfigEntry, usage_point_id: str) -> str:
+    """The usage point whose statistics [usage_point_id]'s readings are written to.
+
+    Itself, unless the user has merged it into a meter it replaced — see
+    CONF_USAGE_POINT_ALIASES. Aliases chain, so a meter the utility re-issued twice resolves
+    through both to the original, whose statistic ids are the ones in the Energy dashboard.
+    """
+    aliases = entry.data.get(CONF_USAGE_POINT_ALIASES)
+    if not isinstance(aliases, dict):
+        return usage_point_id
+    seen = {usage_point_id}
+    while (target := aliases.get(usage_point_id)) is not None and target not in seen:
+        seen.add(target)
+        usage_point_id = target
+    return usage_point_id
+
+
 def statistic_id_prefix_for_entry(entry_id: str) -> str:
     """Return the ``startswith`` prefix that matches every statistic owned by an entry.
 
@@ -154,6 +177,151 @@ async def _async_statistic_ids_for_entry(hass: HomeAssistant, entry_id: str) -> 
         for item in all_ids
         if item.get("source") == DOMAIN and item["statistic_id"].startswith(prefix)
     ]
+
+
+def _usage_point_statistic_prefix(entry_id: str, usage_point_id: str) -> str:
+    """The ``startswith`` prefix of every statistic written under one usage point id."""
+    return f"{statistic_id_prefix_for_entry(entry_id)}{_slugify(usage_point_id)}_"
+
+
+async def async_usage_point_looks_replaced(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    silent_usage_point_id: str,
+    silent_since: datetime,
+    up: UsagePoint,
+) -> bool:
+    """Whether [up] looks like the same meter as one that has gone silent, under a new id.
+
+    Two things have to hold, both read from the recorder:
+
+      - [up] measures what the silent meter measured — at least one of the usage statistics it
+        writes already exists under the silent meter's id. A gas meter that publishes monthly is
+        silent through most of an electricity meter's polls and is not being replaced by it.
+      - [up] has no history from before the silent meter stopped. A replacement starts where the
+        old id left off; a second meter that has been reporting all along has rows well before.
+
+    Deliberately only a "looks like": the answer raises a repair issue for the user to decide,
+    it never merges anything by itself.
+    """
+    owned = set(await _async_statistic_ids_for_entry(hass, entry.entry_id))
+    silent_target = statistic_usage_point_id(entry, silent_usage_point_id)
+    same_measurement = any(
+        statistic_id_for_series(
+            entry.entry_id,
+            silent_target,
+            series.reading_type.flow_direction,
+            _series_commodity(up, series),
+        )
+        in owned
+        for series in up.series
+        if _is_interval_consumption_series(up, series)
+        and _ha_unit_for(series.reading_type) is not None
+    )
+    if not same_measurement:
+        return False
+
+    own_prefix = _usage_point_statistic_prefix(entry.entry_id, up.usage_point_id)
+    own_ids = {statistic_id for statistic_id in owned if statistic_id.startswith(own_prefix)}
+    if not own_ids:
+        return True  # Nothing recorded under the new id yet, so certainly no older history.
+    # A day clear of the poll overlap: the first poll that saw the new id asked from one overlap
+    # behind the silent meter's cursor, so a replacement legitimately has rows that far back.
+    before = silent_since - LAST_FETCHED_OVERLAP - timedelta(days=1)
+    by_id = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        before - USAGE_POINT_REPLACED_LOOKBACK,
+        before,
+        own_ids,
+        "hour",
+        None,
+        {"sum"},
+    )
+    return not any(by_id.values())
+
+
+async def async_merge_usage_point_statistics(
+    hass: HomeAssistant, entry_id: str, source_usage_point_id: str, target_usage_point_id: str
+) -> int:
+    """Move every statistic row written under one usage point id onto another's; return the count.
+
+    The counterpart to an alias (CONF_USAGE_POINT_ALIASES): the alias sends *future* readings to
+    the target's statistics, this carries over what was already written under the source id while
+    the two were being treated as different meters.
+
+    Each source statistic is appended to its namesake on the target. Rows the target already has
+    are skipped — the two overlap by a poll window — and the rest continue the target's running
+    sum, rebased on the source's sum at the last skipped row so no consumption is counted twice
+    or dropped. The source statistics are then cleared. Blocks until the recorder has committed
+    both, so a caller may import under the alias straight afterwards and resume from the right
+    point; only call it once Home Assistant is running (see the deadlock guard in
+    [import_usage_statistics]).
+    """
+    source_prefix = _usage_point_statistic_prefix(entry_id, source_usage_point_id)
+    target_prefix = _usage_point_statistic_prefix(entry_id, target_usage_point_id)
+    source_ids = [
+        statistic_id
+        for statistic_id in await _async_statistic_ids_for_entry(hass, entry_id)
+        if statistic_id.startswith(source_prefix)
+    ]
+    if not source_ids:
+        return 0
+    target_ids = {
+        source_id: target_prefix + source_id[len(source_prefix) :] for source_id in source_ids
+    }
+
+    recorder = get_instance(hass)
+    metadata_by_id = await recorder.async_add_executor_job(
+        lambda: get_metadata(hass, statistic_ids={*source_ids, *target_ids.values()})
+    )
+    rows_by_id = await recorder.async_add_executor_job(
+        statistics_during_period,
+        hass,
+        datetime.fromtimestamp(0, tz=UTC),
+        None,
+        set(source_ids),
+        "hour",
+        None,
+        {"sum"},
+    )
+
+    moved = 0
+    for source_id in source_ids:
+        target_id = target_ids[source_id]
+        resume_from_sum, resume_after_epoch = await _resume_point(hass, target_id)
+        baseline = 0.0
+        stats: list[StatisticData] = []
+        for row in rows_by_id.get(source_id, []):
+            total = row.get("sum")
+            if total is None:
+                continue
+            start = row["start"]
+            hour = start if isinstance(start, datetime) else datetime.fromtimestamp(start, tz=UTC)
+            if resume_after_epoch is not None and hour.timestamp() <= resume_after_epoch:
+                baseline = total
+                continue
+            value = resume_from_sum + (total - baseline)
+            stats.append(StatisticData(start=hour, state=value, sum=value))
+        if not stats:
+            continue
+        # The target's own metadata when it has any, so its name and unit are untouched; a
+        # statistic the target never had (a first bill, say) takes the source's.
+        _, known = metadata_by_id.get(target_id) or metadata_by_id[source_id]
+        metadata: StatisticMetaData = {**known, "statistic_id": target_id}
+        _LOGGER.info(
+            "Merging %d statistic rows from %s into %s (resume_from_sum=%.3f)",
+            len(stats),
+            source_id,
+            target_id,
+            resume_from_sum,
+        )
+        async_add_external_statistics(hass, metadata, stats)
+        moved += len(stats)
+
+    recorder.async_clear_statistics(source_ids)
+    await recorder.async_block_till_done()
+    return moved
 
 
 def response_has_cumulative_series(response: UsageResponse) -> bool:
@@ -726,7 +894,7 @@ async def _import_series_group(
     """
     statistic_id = statistic_id_for_series(
         entry.entry_id,
-        up.usage_point_id,
+        statistic_usage_point_id(entry, up.usage_point_id),
         group[0].reading_type.flow_direction,
         _series_commodity(up, group[0]),
     )
@@ -959,7 +1127,9 @@ def _forward_statistic_id(entry: ConfigEntry, up: UsagePoint) -> str:
         ),
         _COMMODITY_BY_SERVICE_KIND.get(up.service_kind.upper()),
     )
-    return statistic_id_for_series(entry.entry_id, up.usage_point_id, "FORWARD", commodity)
+    return statistic_id_for_series(
+        entry.entry_id, statistic_usage_point_id(entry, up.usage_point_id), "FORWARD", commodity
+    )
 
 
 async def _recorded_forward_hours(
@@ -1084,7 +1254,9 @@ async def _import_cost_summaries(
         )
         return
 
-    statistic_id = statistic_id_for_cost(entry.entry_id, up.usage_point_id)
+    statistic_id = statistic_id_for_cost(
+        entry.entry_id, statistic_usage_point_id(entry, up.usage_point_id)
+    )
     metadata: StatisticMetaData = {
         "has_mean": False,
         "has_sum": True,
@@ -1249,7 +1421,9 @@ async def _import_cost_from_readings(
     if not cost_by_hour:
         return
 
-    statistic_id = statistic_id_for_cost(entry.entry_id, up.usage_point_id)
+    statistic_id = statistic_id_for_cost(
+        entry.entry_id, statistic_usage_point_id(entry, up.usage_point_id)
+    )
     metadata: StatisticMetaData = {
         "has_mean": False,
         "has_sum": True,

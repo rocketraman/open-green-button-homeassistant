@@ -30,6 +30,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from .api import (
     NewCredentials,
@@ -54,7 +55,9 @@ from .const import (
     CONF_PENDING_SINCE,
     CONF_POLL_INTERVAL_SECONDS,
     CONF_PROXY_TOKEN,
+    CONF_USAGE_POINT_ALIASES,
     CONF_USAGE_POINT_CURSORS,
+    CONF_USAGE_POINT_SEPARATE,
     CONF_UTILITY_NAME,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
@@ -69,9 +72,12 @@ from .const import (
 from .statistics import (
     async_clear_statistics_for_entry,
     async_entry_has_statistics,
+    async_merge_usage_point_statistics,
     async_stored_usage_shows_resets,
+    async_usage_point_looks_replaced,
     import_usage_statistics,
     response_needs_import_migration,
+    statistic_usage_point_id,
 )
 from .storage import xml_cache_path
 
@@ -248,6 +254,14 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         # Then decide whether this account has anything at all yet — reads the cursor the line
         # above may have just written, so it must follow it.
         self._reconcile_data_availability()
+        # Ask about a meter the utility appears to have re-issued under a new id. Reads the
+        # cursors written above, and — like the customer label — is never what fails a poll.
+        try:
+            await self._async_check_replaced_usage_points(response)
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug(
+                "Entry %s: replaced-meter check failed", self.entry.entry_id, exc_info=True
+            )
         # A full-history rebuild has now landed; revert to incremental polling.
         self._force_full_history = False
 
@@ -741,6 +755,12 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             known = prior_cursors.get(up_id)
             if known is None or up_newest > known:
                 merged[up_id] = up_newest
+        # A meter the user merged into its replacement (CONF_USAGE_POINT_ALIASES) is retired
+        # here rather than at the merge: its cursor is what kept this poll's window reaching back
+        # over everything the replacement published, bills included, so that all of it could be
+        # imported under the alias first. Left in place it would pin the window there forever.
+        for retired in self._usage_point_aliases().values():
+            merged.pop(retired, None)
         merged_iso = {up_id: value.isoformat() for up_id, value in merged.items()}
 
         stored_cursors = self.entry.data.get(CONF_USAGE_POINT_CURSORS)
@@ -1127,6 +1147,180 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             self.async_set_updated_data(response)
         _LOGGER.info("Rebuild complete for entry %s", self.entry.entry_id)
         return response
+
+    def _usage_point_aliases(self) -> dict[str, str]:
+        """Meters the user merged, as ``{usage_point_id: the one it replaced}``."""
+        stored = self.entry.data.get(CONF_USAGE_POINT_ALIASES)
+        return dict(stored) if isinstance(stored, dict) else {}
+
+    def _usage_point_replaced_issue_id(self, usage_point_id: str) -> str:
+        """Stable repair-issue id for one possibly re-issued meter on this entry."""
+        return f"usage_point_replaced_{self.entry.entry_id}_{usage_point_id}"
+
+    async def _async_check_replaced_usage_points(self, response: UsageResponse) -> None:
+        """Raise a repair issue for a meter that looks like a silent one under a new id.
+
+        See CONF_USAGE_POINT_ALIASES for what goes wrong when a utility re-issues a UsagePoint id.
+        The shape we look for: a meter we hold a cursor for is absent from the feed, and a meter
+        that is present measures the same thing and has no history from before the absent one
+        stopped ([statistics.async_usage_point_looks_replaced]).
+
+        That is also what a real meter swap looks like, and near enough what a second meter added
+        to the account looks like, so this only ever asks. The user answers through the issue's
+        fix flow: merge ([async_merge_usage_point]) or keep apart
+        ([async_keep_usage_points_separate]). A meter with more than one silent candidate is left
+        alone — there is no telling which it continues.
+        """
+        from homeassistant.helpers import issue_registry as ir
+
+        cursors = self._usage_point_cursors()
+        listed = {up.usage_point_id for up in response.usage_points}
+        aliases = self._usage_point_aliases()
+        separate = self.entry.data.get(CONF_USAGE_POINT_SEPARATE)
+        separate = separate if isinstance(separate, dict) else {}
+        retired = set(aliases.values())
+        silent = {
+            up_id: cursor
+            for up_id, cursor in cursors.items()
+            if up_id not in listed and up_id not in retired
+        }
+
+        for up in response.usage_points:
+            up_id = up.usage_point_id
+            issue_id = self._usage_point_replaced_issue_id(up_id)
+            newest = cursors.get(up_id)
+            candidates: list[str] = []
+            if newest is not None and up_id not in aliases:
+                for silent_id, silent_since in silent.items():
+                    if silent_since >= newest or silent_id in separate.get(up_id, []):
+                        continue
+                    if await async_usage_point_looks_replaced(
+                        self.hass, self.entry, silent_id, silent_since, up
+                    ):
+                        candidates.append(silent_id)
+            if len(candidates) != 1:
+                if candidates:
+                    _LOGGER.info(
+                        "Entry %s: usage point %s could be a re-issue of any of %s — not asking, "
+                        "since there is no telling which",
+                        self.entry.entry_id,
+                        up_id,
+                        ", ".join(sorted(candidates)),
+                    )
+                ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+                continue
+
+            replaced_id = candidates[0]
+            replaced_last_reading = dt_util.as_local(silent[replaced_id]).date().isoformat()
+            _LOGGER.warning(
+                "Entry %s: usage point %s stopped reporting at %s and %s began where it left off. "
+                "If %s re-issued the meter's id, its readings are now going to new statistics "
+                "the Energy dashboard isn't showing — see Settings → Repairs to merge them",
+                self.entry.entry_id,
+                replaced_id,
+                silent[replaced_id].isoformat(),
+                up_id,
+                self.entry.data.get(CONF_UTILITY_NAME, "the utility"),
+            )
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                issue_id,
+                data={
+                    "entry_id": self.entry.entry_id,
+                    "usage_point_id": up_id,
+                    "replaced_usage_point_id": replaced_id,
+                    "replaced_last_reading": replaced_last_reading,
+                },
+                is_fixable=True,
+                # Survives a restart: the startup fetch is skipped inside the polling window, so
+                # nothing would re-raise it until the next scheduled poll.
+                is_persistent=True,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key="usage_point_replaced",
+                translation_placeholders={
+                    "utility": self.entry.data.get(CONF_UTILITY_NAME, "your utility"),
+                    "service": up.service_kind.lower(),
+                    "usage_point": up_id[:8],
+                    "replaced_usage_point": replaced_id[:8],
+                    "replaced_last_reading": replaced_last_reading,
+                },
+            )
+
+    async def async_merge_usage_point(
+        self, usage_point_id: str, replaced_usage_point_id: str
+    ) -> None:
+        """Treat [usage_point_id] as the same meter as [replaced_usage_point_id] from now on.
+
+        The user's "merge" answer to the repair issue above. In order:
+
+          1. Record the alias, so every later import writes to the replaced meter's statistics —
+             the ones the Energy dashboard is already configured with. First, so a poll landing
+             mid-merge can't write to the new id's statistics again behind our back.
+          2. Carry over the rows already written under the new id
+             ([statistics.async_merge_usage_point_statistics]).
+          3. Poll again, in the background. The window still reaches back to where the replaced
+             meter stopped — its cursor is only retired by [_advance_cursor] after that poll — so
+             bills the utility published in the meantime, which had no usage to be distributed
+             over under the new id, are costed now.
+
+        Only call with Home Assistant running: step 2 blocks on the recorder.
+        """
+        if statistic_usage_point_id(self.entry, replaced_usage_point_id) == usage_point_id:
+            raise ValueError(f"{replaced_usage_point_id} is already merged into {usage_point_id}")
+        self.hass.config_entries.async_update_entry(
+            self.entry,
+            data={
+                **self.entry.data,
+                CONF_USAGE_POINT_ALIASES: {
+                    **self._usage_point_aliases(),
+                    usage_point_id: replaced_usage_point_id,
+                },
+            },
+        )
+        target = statistic_usage_point_id(self.entry, usage_point_id)
+        moved = await async_merge_usage_point_statistics(
+            self.hass, self.entry.entry_id, usage_point_id, target
+        )
+        _LOGGER.info(
+            "Entry %s: merged usage point %s into %s (%d statistic row(s) carried over)",
+            self.entry.entry_id,
+            usage_point_id,
+            target,
+            moved,
+        )
+        self._async_delete_usage_point_replaced_issue(usage_point_id)
+        self.entry.async_create_background_task(
+            self.hass,
+            self.async_refresh(),
+            name=f"{DOMAIN} refresh after usage point merge {self.entry.entry_id}",
+        )
+
+    def async_keep_usage_points_separate(
+        self, usage_point_id: str, replaced_usage_point_id: str
+    ) -> None:
+        """Record that these are different meters, so the repair issue isn't raised for them again.
+
+        The user's other answer. Nothing else changes: each meter keeps its own statistics, and
+        the silent one keeps its cursor in case it reports again.
+        """
+        stored = self.entry.data.get(CONF_USAGE_POINT_SEPARATE)
+        separate = dict(stored) if isinstance(stored, dict) else {}
+        separate[usage_point_id] = sorted(
+            {*separate.get(usage_point_id, []), replaced_usage_point_id}
+        )
+        self.hass.config_entries.async_update_entry(
+            self.entry, data={**self.entry.data, CONF_USAGE_POINT_SEPARATE: separate}
+        )
+        self._async_delete_usage_point_replaced_issue(usage_point_id)
+
+    def _async_delete_usage_point_replaced_issue(self, usage_point_id: str) -> None:
+        """Delete the replaced-meter repair issue for one meter (no-op if absent)."""
+        from homeassistant.helpers import issue_registry as ir
+
+        ir.async_delete_issue(
+            self.hass, DOMAIN, self._usage_point_replaced_issue_id(usage_point_id)
+        )
 
     @property
     def _background_load_issue_id(self) -> str:

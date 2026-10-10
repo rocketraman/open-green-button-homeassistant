@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A repair notice when a utility appears to have re-issued a meter's ID. The
+  readings were still imported, but into new statistics, so the ones in the
+  Energy dashboard looked like they had stopped updating (seen with Burlington
+  Hydro in September 2026). The notice asks whether the new ID is the same
+  meter: **Merge** moves what was imported under it onto the end of the existing
+  statistics and continues them from then on; **Keep separate** leaves both as
+  they are. Nothing is merged without being asked.
+
 ### Fixed
 
 - Statistics repairs that an update brings now run on the restart that installs

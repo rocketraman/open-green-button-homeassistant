@@ -378,6 +378,10 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     from homeassistant.helpers import issue_registry as ir
 
     ir.async_delete_issue(hass, DOMAIN, f"background_load_{entry.entry_id}")
+    replaced_prefix = f"usage_point_replaced_{entry.entry_id}_"
+    for domain, issue_id in list(ir.async_get(hass).issues):
+        if domain == DOMAIN and issue_id.startswith(replaced_prefix):
+            ir.async_delete_issue(hass, DOMAIN, issue_id)
 
     owned = await async_clear_statistics_for_entry(hass, entry.entry_id)
     if owned:

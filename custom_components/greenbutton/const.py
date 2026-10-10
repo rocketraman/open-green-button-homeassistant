@@ -127,6 +127,32 @@ CONF_LAST_FETCHED_AT = "last_fetched_at"
 # step is needed.
 CONF_USAGE_POINT_CURSORS = "usage_point_cursors"
 
+# Meters the user has told us are one and the same: ``{usage_point_id: the id it replaced}``.
+#
+# Statistic ids are built from the UsagePoint id, and a utility can re-issue that id for a meter
+# that hasn't changed — Burlington Hydro did, mid-September 2026. Nothing fails when it happens:
+# the fetch succeeds and every reading is imported, but into a brand-new statistic starting from
+# zero, while the one the Energy dashboard is configured with simply stops. To the user that is
+# "my data stopped updating".
+#
+# An alias makes the new id write to the statistics of the one it replaced (see
+# [statistics.statistic_usage_point_id]). It is only ever written by the user's answer to the
+# repair issue [coordinator.GreenButtonCoordinator._async_check_replaced_usage_points] raises —
+# never inferred — because the same feed shape is also what a genuine second meter looks like.
+# Aliases chain (a meter re-issued twice resolves through both), and the replaced id's cursor is
+# retired on the next successful poll so it stops pinning the window.
+CONF_USAGE_POINT_ALIASES = "usage_point_aliases"
+
+# The other answer to that repair issue: ``{usage_point_id: [usage_point_ids it did NOT replace]}``.
+# Recorded so a pair the user chose to keep apart is never asked about again.
+CONF_USAGE_POINT_SEPARATE = "usage_point_separate"
+
+# How far behind a silent meter's last reading we look for rows of the meter that may have
+# replaced it. A replacement has none there — its history starts where the old one stopped — while
+# a second meter that has been reporting alongside all along does. Bounded so the check reads a
+# couple of months of hourly rows at most, not a meter's whole history, on every poll.
+USAGE_POINT_REPLACED_LOOKBACK = timedelta(days=60)
+
 # The exact `published-min`/`published-max` (UTC ISO 8601) of a fetch the utility answered with
 # HTTP 202 — "I'm preparing that dataset out of band". Set when a poll hits 202, replayed verbatim
 # by every retry, cleared on the first success.
