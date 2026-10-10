@@ -39,6 +39,7 @@ from custom_components.greenbutton.statistics import (
     import_usage_statistics,
     response_has_series_sharing_a_statistic,
     response_needs_import_migration,
+    statistic_id_for_cost,
     statistic_id_for_series,
     statistic_id_prefix_for_entry,
 )
@@ -1477,3 +1478,50 @@ async def test_republished_non_zero_readings_are_restated_up_and_down(hass: Home
     )
     await async_wait_recording_done(hass)
     assert await _usage_deltas(hass, stat_id, _BLOCK_START) == [1.0, 1.0, 0.4, 1.0, 2.5, 1.0]
+
+
+async def test_republished_per_interval_cost_is_restated(hass: HomeAssistant) -> None:
+    """A corrected block's per-interval cost replaces the stored cost, as its usage does.
+
+    A multi-hour reading's cost over the same hours is only an even share and changes nothing.
+    """
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    cost_id = statistic_id_for_cost(entry.entry_id, "up1")
+
+    def _costed(*hours: tuple[int, float, float]) -> UsageResponse:
+        return _one_usage_point(
+            _series(
+                "DELTA_DATA",
+                readings=[
+                    UsageReading(_BLOCK_START + timedelta(hours=h), 3600, wh, cost=cost)
+                    for h, wh, cost in hours
+                ],
+            )
+        )
+
+    await import_usage_statistics(
+        hass,
+        entry,
+        _costed((0, 1000.0, 0.10), (1, 0.0, 0.0), (2, 0.0, 0.0), (3, 1000.0, 0.10)),
+        "X",
+    )
+    await async_wait_recording_done(hass)
+    assert await _usage_deltas(hass, cost_id, _BLOCK_START) == [0.1, 0.0, 0.0, 0.1]
+
+    # Hours 1-3 re-served: two corrected, one unchanged; plus a new hour.
+    await import_usage_statistics(
+        hass,
+        entry,
+        _costed((1, 2000.0, 0.25), (2, 500.0, 0.05), (3, 1000.0, 0.10), (4, 1000.0, 0.12)),
+        "X",
+    )
+    await async_wait_recording_done(hass)
+    assert await _usage_deltas(hass, cost_id, _BLOCK_START) == [0.1, 0.25, 0.05, 0.1, 0.12]
+
+    spread = _one_usage_point(
+        _series("DELTA_DATA", readings=[UsageReading(_BLOCK_START, 5 * 3600, 5000.0, cost=5.0)])
+    )
+    await import_usage_statistics(hass, entry, spread, "X")
+    await async_wait_recording_done(hass)
+    assert await _usage_deltas(hass, cost_id, _BLOCK_START) == [0.1, 0.25, 0.05, 0.1, 0.12]

@@ -1501,6 +1501,10 @@ async def _import_cost_from_readings(
     Costs are summed per hour across the UsagePoint's FORWARD interval-consumption series
     (multiple meters roll up into one bill), then accumulated into the same cost stat the Energy
     dashboard reads. Cumulative registers are excluded — see [_forward_interval_series].
+
+    A re-fetched hour whose cost differs from the stored one restates the statistic from that
+    hour on, exactly as usage does — see [_restated_rows]. The cost rides on the same reading as
+    the consumption, so a block the utility corrects brings its corrected cost with it.
     """
     forward_series = _forward_interval_series(up)
     currency_code = next(
@@ -1521,6 +1525,11 @@ async def _import_cost_from_readings(
         return
 
     cost_by_hour: dict[datetime, float] = {}
+    # What makes an hour's cost a whole measurement, fit to overrule a stored one: every costed
+    # reading in it is an hour or shorter, and together they cover it. Same rule, for the same
+    # reasons, as the measured hours of [_hourly_totals].
+    covered_seconds: dict[datetime, int] = {}
+    spread: set[datetime] = set()
     for series in forward_series:
         for reading in series.readings:
             if reading.cost is None:
@@ -1529,8 +1538,11 @@ async def _import_cost_from_readings(
             # [_hours_spanned]. A billing-only feed carries the whole period's cost on one
             # reading, and pinning it to the first hour puts a month's bill in a single hour
             # of the cost statistic while the usage it pairs with is spread across the period.
-            for hour, _overlap, fraction in _hours_spanned(reading.start, reading.duration_seconds):
+            for hour, overlap, fraction in _hours_spanned(reading.start, reading.duration_seconds):
                 cost_by_hour[hour] = cost_by_hour.get(hour, 0.0) + reading.cost * fraction
+                covered_seconds[hour] = covered_seconds.get(hour, 0) + overlap
+                if reading.duration_seconds > 3600:
+                    spread.add(hour)
     if not cost_by_hour:
         return
 
@@ -1556,6 +1568,17 @@ async def _import_cost_from_readings(
     )
     stats: list[StatisticData] = []
     running = resume_from_sum
+    if resume_after_epoch is not None:
+        refetched = {
+            hour: cost
+            for hour, cost in cost_by_hour.items()
+            if hour.timestamp() <= resume_after_epoch
+            and hour not in spread
+            and covered_seconds[hour] >= 3600 - _HOUR_COVERAGE_SLACK
+        }
+        restated = await _restated_rows(hass, statistic_id, refetched)
+        if restated is not None:
+            stats, running = restated
     for hour in sorted(cost_by_hour):
         if resume_after_epoch is not None and hour.timestamp() <= resume_after_epoch:
             continue
