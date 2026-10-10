@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-10
+
 ### Added
 
 - A repair notice when a utility appears to have re-issued a meter's ID. The
@@ -28,11 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readings; it is recognized from the stored data alone.
 - A first sync with a utility that prepares its data in the background (Hydro
   Ottawa, Alectra and other Savage Data utilities) no longer waits forever on
-  "your utility is preparing this". These utilities announce where the prepared
-  data is while answering the request; the integration now reads it from there
-  instead of looking for a meter list that does not exist. Needs the matching
-  server update
+  "your utility is preparing this". These utilities reply "accepted" and
+  separately tell the server where the data can be picked up; the integration
+  now reads it from there instead of looking for a meter list that does not
+  exist
   ([open-green-button#80](https://github.com/rocketraman/open-green-button/issues/80)).
+- Readings a utility corrects after first publishing them are no longer ignored.
+  An hour already imported used to be skipped even when a later poll re-fetched
+  it with a different value, which could leave a day flat at zero (seen with
+  Burlington Hydro). Re-fetched hours are now compared with what is stored and
+  the statistics restated where they differ, for usage and for cost that the
+  utility reports per reading. Cost spread from monthly bills is not restated.
 
 ## [0.3.0] - 2026-10-09
 
