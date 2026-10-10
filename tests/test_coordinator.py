@@ -360,7 +360,11 @@ async def test_data_pending_freezes_the_window_and_retries_replay_it(
     ):
         await coordinator._async_update_data()
 
-    first = api.fetch_usage.await_args.kwargs
+    # The subscription-level poll, not the collection attempt that follows a 202: only the former
+    # is frozen (the collection deliberately reads up to now).
+    first = next(
+        c.kwargs for c in api.fetch_usage.await_args_list if c.kwargs.get("resource_path") is None
+    )
     assert entry.data[CONF_PENDING_PUBLISHED_MIN] == first["published_min"].isoformat()
 
     # What we sent is what gets frozen, and it is never in the future — the proxy clamps a future
@@ -382,7 +386,11 @@ async def test_data_pending_freezes_the_window_and_retries_replay_it(
         ):
             await coordinator._async_update_data()
 
-        retry = api.fetch_usage.await_args.kwargs
+        retry = [
+            c.kwargs
+            for c in api.fetch_usage.await_args_list
+            if c.kwargs.get("resource_path") is None
+        ][-1]
         assert retry["published_min"] == first["published_min"]
         # Identical AND not in the future: the value the proxy forwards is the value we sent.
         assert retry["published_max"] == frozen_max
@@ -1917,6 +1925,8 @@ async def test_a_deferred_customer_feed_is_reported_and_not_recorded(
 def _deferring_api(
     listing: UsageResponse | None = None,
     per_meter: dict[str, UsageResponse] | None = None,
+    announced: tuple[str, ...] = (),
+    rejects_date_filter: bool = False,
 ) -> OpenGbApi:
     """An API whose subscription-level fetch always defers, but whose resources may answer.
 
@@ -1928,12 +1938,14 @@ def _deferring_api(
     async def _fetch(**kwargs: object) -> UsageResponse:
         path = kwargs.get("resource_path")
         if path is None:
-            raise OpenGbDataPendingError("data pending (202)")
+            raise OpenGbDataPendingError("data pending (202)", resource_paths=announced)
         if path == "UsagePoint":
             if listing is None:
                 raise OpenGbDataPendingError("listing pending (202)")
             return listing
         assert isinstance(path, str)
+        if rejects_date_filter and kwargs.get("published_min") is not None:
+            raise OpenGbApiError(f"404 for {path} with a date filter")
         found = (per_meter or {}).get(path.removeprefix("UsagePoint/"))
         if found is None:
             raise OpenGbApiError(f"no such resource: {path}")
@@ -1980,6 +1992,106 @@ async def test_a_deferred_batch_is_collected_from_its_usage_points(
     }
     # Nothing is left pending: the batch landed, so no frozen window and no fast retry.
     assert CONF_PENDING_PUBLISHED_MIN not in entry.data
+    coordinator.cancel_pending_retry()
+
+
+async def test_a_first_sync_collects_from_the_resources_the_utility_announced(
+    hass: HomeAssistant,
+) -> None:
+    """An entry that has never imported learns its meters from the 202 and collects them.
+
+    open-green-button issues/80: Savage Data has no UsagePoint listing (404), so before the proxy
+    relayed the custodian's announcement a first sync had no way to find its meters and waited on
+    a 202 forever.
+    """
+    reading = datetime(2026, 6, 1, tzinfo=UTC)
+    api = _deferring_api(
+        per_meter={
+            "up1": _response_with_meters({"up1": [reading]}),
+            "up2": _response_with_meters({"up2": [reading]}),
+        },
+        announced=("UsagePoint/up1", "UsagePoint/up2"),
+    )
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        response = await coordinator._async_update_data()
+
+    assert {up.usage_point_id for up in response.usage_points} == {"up1", "up2"}
+    requested = [c.kwargs.get("resource_path") for c in api.fetch_usage.await_args_list]
+    assert requested == [None, "UsagePoint/up1", "UsagePoint/up2"], "no listing probe is needed"
+    assert CONF_PENDING_PUBLISHED_MIN not in entry.data
+    coordinator.cancel_pending_retry()
+
+
+async def test_announced_resources_win_over_the_meters_already_known(
+    hass: HomeAssistant,
+) -> None:
+    """The announcement is the custodian saying where THIS batch is — it beats our own records.
+
+    A meter the utility re-issued under a new id is the case that matters: the cursor map still
+    names the old one, which no longer answers.
+    """
+    reading = datetime(2026, 6, 2, tzinfo=UTC)
+    api = _deferring_api(
+        per_meter={"new": _response_with_meters({"new": [reading]})},
+        announced=("UsagePoint/new",),
+    )
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_USAGE_POINT_CURSORS: {"old": datetime(2026, 6, 1, tzinfo=UTC).isoformat()},
+        },
+    )
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        response = await coordinator._async_update_data()
+
+    assert {up.usage_point_id for up in response.usage_points} == {"new"}
+    requested = [c.kwargs.get("resource_path") for c in api.fetch_usage.await_args_list]
+    assert "UsagePoint/old" not in requested
+    coordinator.cancel_pending_retry()
+
+
+async def test_an_announced_resource_is_retried_bare_when_it_rejects_the_date_filter(
+    hass: HomeAssistant,
+) -> None:
+    """The custodian announces its URLs with no query, so that form is tried before giving up.
+
+    Whether a per-UsagePoint URL accepts a date filter at all is unverified. Asking first WITH
+    the filter keeps an incremental poll incremental where it is honoured; falling back to the
+    announced form means an unfiltered custodian still delivers.
+    """
+    reading = datetime(2026, 6, 3, tzinfo=UTC)
+    api = _deferring_api(
+        per_meter={"up1": _response_with_meters({"up1": [reading]})},
+        announced=("UsagePoint/up1",),
+        rejects_date_filter=True,
+    )
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        response = await coordinator._async_update_data()
+
+    assert {up.usage_point_id for up in response.usage_points} == {"up1"}
+    per_meter_calls = [
+        c.kwargs for c in api.fetch_usage.await_args_list if c.kwargs.get("resource_path")
+    ]
+    assert [c["published_min"] is None for c in per_meter_calls] == [False, True]
     coordinator.cancel_pending_retry()
 
 
