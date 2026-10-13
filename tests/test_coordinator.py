@@ -43,6 +43,7 @@ from custom_components.greenbutton.const import (
     CONF_PENDING_PUBLISHED_MIN,
     CONF_POLL_INTERVAL_SECONDS,
     CONF_PROXY_TOKEN,
+    CONF_RECENT_POLLS,
     CONF_USAGE_POINT_CURSORS,
     CONF_UTILITY_ID,
     CONF_UTILITY_NAME,
@@ -51,6 +52,7 @@ from custom_components.greenbutton.const import (
     IMPORT_LOGIC_REVISION,
     INITIAL_FETCH_LOOKBACK,
     LAST_FETCHED_OVERLAP,
+    POLL_HISTORY_RETENTION,
 )
 from custom_components.greenbutton.coordinator import GreenButtonCoordinator
 
@@ -142,6 +144,11 @@ async def test_first_refresh_calls_api_and_imports_stats(hass: HomeAssistant) ->
         new=AsyncMock(),
     ) as import_mock:
         await coordinator.async_refresh()
+
+    # Recorded for diagnostics: when we last asked and how much came back.
+    assert [poll["reading_count"] for poll in entry.data[CONF_RECENT_POLLS]] == [
+        sum(len(s.readings) for up in coordinator.data.usage_points for s in up.series)
+    ]
 
     # Both window params are always set — sending neither makes the GBA test-lab harness
     # omit IntervalBlocks. On a first refresh (no CONF_LAST_FETCHED_AT), published_min looks
@@ -2197,3 +2204,34 @@ async def test_a_failed_collection_leaves_the_deferred_handling_untouched(
     assert CONF_PENDING_PUBLISHED_MIN in entry.data
     assert CONF_USAGE_POINT_CURSORS not in entry.data
     coordinator.cancel_pending_retry()
+
+
+async def test_recent_polls_persist_and_drop_entries_past_retention(hass: HomeAssistant) -> None:
+    """Poll history lives in entry data so it survives the restart that usually precedes a
+    diagnostics download, and keeps only the last few days."""
+    entry = _entry(hass)
+    stale = datetime.now(UTC) - POLL_HISTORY_RETENTION - timedelta(hours=1)
+    recent = datetime.now(UTC) - timedelta(days=1)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_RECENT_POLLS: [
+                {"at": stale.isoformat(), "reading_count": 7},
+                {"at": "not a timestamp", "reading_count": 1},
+                {"at": recent.isoformat(), "reading_count": 3},
+            ],
+        },
+    )
+    coordinator = GreenButtonCoordinator(hass, _api_returning(_empty_response()), entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator.async_refresh()
+    coordinator.cancel_pending_retry()
+
+    polls = entry.data[CONF_RECENT_POLLS]
+    assert polls[0] == {"at": recent.isoformat(), "reading_count": 3}
+    assert [poll["reading_count"] for poll in polls] == [3, 0]

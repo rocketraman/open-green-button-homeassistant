@@ -19,6 +19,20 @@ ATTR_CONFIG_ENTRY_ID = "config_entry_id"
 # idempotent on (statistic_id, hour) so duplicates are harmless.
 LAST_FETCHED_OVERLAP = timedelta(days=1)
 
+# Entry data: when each recent successful fetch ran and how many readings it carried, oldest
+# first, as `[{"at": <ISO instant>, "reading_count": <int>}, ...]`. Written for the diagnostics
+# download only (it rides along in the entry-data dump) — nothing reads it back to make a
+# decision. It answers what the rest of a diagnostics file can't: the last response's feed
+# `updated` stamp is the custodian's, and an empty poll is otherwise indistinguishable from no
+# poll, so a run of zero-reading entries is the proof that we keep asking and the utility has
+# nothing new (issues/76). Persisted rather than held in memory because diagnostics are usually
+# downloaded right after an upgrade — i.e. right after the restart that would have emptied it.
+CONF_RECENT_POLLS = "recent_polls"
+# How much of that history to keep: long enough to show several consecutive daily polls, capped so
+# a fast-polling or fast-retrying entry can't grow the entry without bound.
+POLL_HISTORY_RETENTION = timedelta(days=5)
+POLL_HISTORY_MAX_ENTRIES = 50
+
 # Fallback for how far back to look on the first fetch (no recorded `last_fetched_at`). The
 # authoritative, per-utility window comes from the server in the claim response and is stored
 # as `CONF_INITIAL_HISTORY_SECONDS`; this constant is used ONLY when that value is absent —

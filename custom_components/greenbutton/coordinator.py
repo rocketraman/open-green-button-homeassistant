@@ -55,6 +55,7 @@ from .const import (
     CONF_PENDING_SINCE,
     CONF_POLL_INTERVAL_SECONDS,
     CONF_PROXY_TOKEN,
+    CONF_RECENT_POLLS,
     CONF_USAGE_POINT_ALIASES,
     CONF_USAGE_POINT_CURSORS,
     CONF_USAGE_POINT_SEPARATE,
@@ -67,6 +68,8 @@ from .const import (
     LAST_FETCHED_OVERLAP,
     PENDING_ESCALATE_AFTER,
     PENDING_RETRY_INTERVAL,
+    POLL_HISTORY_MAX_ENTRIES,
+    POLL_HISTORY_RETENTION,
     SERVICE_REBUILD_STATISTICS,
 )
 from .statistics import (
@@ -236,6 +239,7 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             total_readings,
             self.entry.entry_id,
         )
+        self._record_poll(now, total_readings)
 
         await import_usage_statistics(
             self.hass,
@@ -753,6 +757,27 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             _LOGGER.info("Labeled entry %s with customer detail: %s", self.entry.entry_id, label)
         else:
             self.hass.config_entries.async_update_entry(self.entry, data=data)
+
+    def _record_poll(self, now: datetime, reading_count: int) -> None:
+        """Append this fetch to the poll history kept for diagnostics (see CONF_RECENT_POLLS).
+
+        Entries older than the retention window are dropped, as is anything stored that won't
+        parse — the history is evidence for a human, never an input, so a bad value is discarded
+        rather than allowed to fail the poll.
+        """
+        stored = self.entry.data.get(CONF_RECENT_POLLS)
+        kept = [
+            poll
+            for poll in (stored if isinstance(stored, list) else [])
+            if isinstance(poll, dict)
+            and (at := _parse_iso_or_none(poll.get("at"))) is not None
+            and at >= now - POLL_HISTORY_RETENTION
+        ]
+        kept.append({"at": now.isoformat(), "reading_count": reading_count})
+        self.hass.config_entries.async_update_entry(
+            self.entry,
+            data={**self.entry.data, CONF_RECENT_POLLS: kept[-POLL_HISTORY_MAX_ENTRIES:]},
+        )
 
     def _advance_cursor(self, response: UsageResponse) -> None:
         """Persist the incremental cursor as the newest reading start we've imported.
