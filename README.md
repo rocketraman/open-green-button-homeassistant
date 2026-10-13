@@ -129,7 +129,7 @@ If something looks off (cost showing zero, readings missing, parser surprised by
 
 You'll get a JSON file containing:
 
-- Redacted config-entry data (no refresh tokens or proxy tokens leak, and the service address / account number are masked — including in the entry title and the `raw_xml` Atom titles)
+- Redacted config-entry data, including `recent_polls` — when each poll of the last few days ran and how many readings it returned (no refresh tokens or proxy tokens leak, and the service address / account number are masked — including in the entry title and the `raw_xml` Atom titles)
 - Coordinator state (last refresh result, scan interval)
 - Parsed last-response summary — usage points, series counts, **billing summaries with full cost-detail breakdown**
 - The raw ESPI XML from the most recent upstream fetch, **if** debug logging is enabled

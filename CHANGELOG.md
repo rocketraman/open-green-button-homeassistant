@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The diagnostics download now includes `recent_polls`: when each poll of the
+  last five days ran and how many readings it returned. It shows whether the
+  integration is still asking and the utility has nothing new, which nothing
+  else in the file could tell apart from not polling at all.
+
 ## [0.3.1] - 2026-10-10
 
 ### Added
