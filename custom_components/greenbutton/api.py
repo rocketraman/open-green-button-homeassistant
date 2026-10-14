@@ -269,6 +269,11 @@ class UsagePoint:
     service_kind: str
     series: list[MeterReadingSeries]
     summaries: list[BillingSummary] = field(default_factory=list)
+    # Flow directions this meter has published per-interval (non-cumulative) data in on EARLIER
+    # polls. Never set by the parser: the coordinator fills it in from CONF_INTERVAL_FLOWS, so a
+    # poll that happens to carry only a cumulative register can still be recognized as one — see
+    # [statistics.is_interval_consumption_series].
+    interval_flows_seen: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)

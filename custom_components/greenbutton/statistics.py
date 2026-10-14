@@ -216,7 +216,7 @@ async def async_usage_point_looks_replaced(
         )
         in owned
         for series in up.series
-        if _is_interval_consumption_series(up, series)
+        if is_interval_consumption_series(up, series)
         and _ha_unit_for(series.reading_type) is not None
     )
     if not same_measurement:
@@ -335,9 +335,7 @@ def response_has_cumulative_series(response: UsageResponse) -> bool:
     [coordinator.GreenButtonCoordinator._async_migrate_import].
     """
     return any(
-        not _is_interval_consumption_series(up, s)
-        for up in response.usage_points
-        for s in up.series
+        not is_interval_consumption_series(up, s) for up in response.usage_points for s in up.series
     )
 
 
@@ -357,7 +355,7 @@ def response_has_multi_hour_readings(response: UsageResponse) -> bool:
         len(_hours_spanned(r.start, r.duration_seconds)) > 1
         for up in response.usage_points
         for s in up.series
-        if _is_interval_consumption_series(up, s)
+        if is_interval_consumption_series(up, s)
         for r in s.readings
     )
 
@@ -441,7 +439,7 @@ def response_has_series_sharing_a_statistic(response: UsageResponse) -> bool:
             (s.reading_type.flow_direction, _series_commodity(up, s))
             for s in up.series
             if s.readings
-            and _is_interval_consumption_series(up, s)
+            and is_interval_consumption_series(up, s)
             and not _is_superseded_by_unit(up, s)
         ]
         if len(targets) != len(set(targets)):
@@ -491,6 +489,83 @@ async def async_stored_usage_shows_resets(
     return False
 
 
+# The revision whose damage [async_stored_usage_shows_register_days] recognizes.
+_LONE_REGISTER_REVISION = 6
+
+# An hour of stored usage at least this fraction of the meter's lifetime register can't be real:
+# it would take the meter's whole history so far, give or take, in two days. A register imported
+# as consumption lands at 1/24 of its value per hour (one daily snapshot spread over its hours, see
+# [_hours_spanned]) — or all of it in one hour, before that spreading existed — and the register
+# only grows, so the one in today's poll is never far above the one that did the damage.
+_REGISTER_HOUR_FRACTION = 1 / 48
+
+
+def response_damage_is_judged_from_stored_rows(_response: UsageResponse) -> bool:
+    """The feed-side revision-6 signal: there is none, so never True and never "can't tell".
+
+    A poll's shape can't show that an EARLIER poll lacked a register's interval sibling — on a
+    normal poll the sibling is right there. The damage is recognized from the stored rows instead,
+    by [async_stored_usage_shows_register_days].
+    """
+    return False
+
+
+async def async_stored_usage_shows_register_days(
+    hass: HomeAssistant, entry: ConfigEntry, response: UsageResponse, stamped_revision: int
+) -> bool:
+    """Whether [entry]'s stored usage holds a cumulative register imported as consumption.
+
+    The revision-6 damage: an hour whose usage is a sizeable fraction of the meter's lifetime
+    register (see [_REGISTER_HOUR_FRACTION]). Judged against the register this poll carries, which
+    is what keeps it from guessing — no fixed kWh threshold fits every meter, and a meter that has
+    never published a register can't have been hit at all. A poll without one says nothing, so it
+    answers False and the decision rests on the other revisions' checks, as for any feed that never
+    had the shape. Scans the register's statistic in full, so like [async_stored_usage_shows_resets]
+    it is gated on the stamp.
+    """
+    if stamped_revision >= _LONE_REGISTER_REVISION:
+        return False
+    # The smallest register value per statistic: the conservative scale for the damage threshold.
+    smallest: dict[str, float] = {}
+    for up in response.usage_points:
+        for series in up.series:
+            if is_interval_consumption_series(up, series):
+                continue
+            if _ha_unit_for(series.reading_type) is None:
+                continue
+            values = [_to_ha_units(r.value, series.reading_type) for r in series.readings]
+            values = [v for v in values if v > 0]
+            if not values:
+                continue
+            stat_id = statistic_id_for_series(
+                entry.entry_id,
+                statistic_usage_point_id(entry, up.usage_point_id),
+                series.reading_type.flow_direction,
+                _series_commodity(up, series),
+            )
+            smallest[stat_id] = min(min(values), smallest.get(stat_id, min(values)))
+    if not smallest:
+        return False
+    by_id = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        datetime.fromtimestamp(0, tz=UTC),
+        None,
+        set(smallest),
+        "hour",
+        None,
+        {"sum"},
+    )
+    for stat_id, rows in by_id.items():
+        threshold = smallest[stat_id] * _REGISTER_HOUR_FRACTION
+        sums = [row["sum"] for row in rows if row.get("sum") is not None]
+        # The first stored hour has no predecessor to diff against; its sum is its own usage.
+        hours = sums[:1] + [later - earlier for earlier, later in zip(sums, sums[1:], strict=False)]
+        if any(hour >= threshold for hour in hours):
+            return True
+    return False
+
+
 # Recognition predicates keyed by the import-logic revision that fixed the bug. An entry stamped
 # at revision N is tested against every predicate for a revision > N — so a user who skipped a
 # release still gets each repair they're owed, in one rebuild rather than one per revision.
@@ -502,6 +577,7 @@ _IMPORT_MIGRATION_CHECKS: dict[int, Callable[[UsageResponse], bool | None]] = {
     3: response_cost_may_be_missing_bills,
     4: response_has_gas_or_water_series,
     5: response_has_series_sharing_a_statistic,
+    6: response_damage_is_judged_from_stored_rows,
 }
 
 
@@ -546,7 +622,7 @@ async def import_usage_statistics(
 ) -> None:
     """Push every interval-consumption series in [response] into HA long-term statistics.
 
-    Cumulative meter registers are excluded — see [_is_interval_consumption_series].
+    Cumulative meter registers are excluded — see [is_interval_consumption_series].
 
     Idempotent on (statistic_id, hour) — re-importing a previously-imported hour with the same
     value is a no-op, so the coordinator can pull overlapping windows on every poll without
@@ -566,7 +642,7 @@ async def import_usage_statistics(
         # every series in one group lands in the same statistic and has to be accumulated as one.
         by_target: dict[tuple[str, str | None], list[MeterReadingSeries]] = {}
         for series in up.series:
-            if not _is_interval_consumption_series(up, series):
+            if not is_interval_consumption_series(up, series):
                 _warn_once(
                     f"{entry.entry_id}:{up.usage_point_id}:{series.meter_reading_id}:cumulative",
                     "Skipping meter reading %s on usage point %s: accumulation behaviour %s is a "
@@ -599,11 +675,21 @@ async def import_usage_statistics(
             )
             imported_any = imported or imported_any
         if up.series and not imported_any:
-            # Nothing on this usage point could be represented. Since a register is now only
-            # excluded when a same-flow sibling supersedes it (see
-            # [_is_interval_consumption_series]), reaching here means every series carried a
-            # unit we have no HA mapping for. The usage point contributes no energy at all —
-            # loud, because the symptom is an empty Energy dashboard.
+            if not any(is_interval_consumption_series(up, s) for s in up.series):
+                # Only a register this poll — its interval sibling (in this poll or an earlier
+                # one) is what excluded it, so this is a gap in the utility's publication, not an
+                # unrepresentable feed. The cursor holds where it was (see
+                # [coordinator._newest_reading_start]), so the next poll asks again.
+                _LOGGER.debug(
+                    "Usage point %s carried only its cumulative meter register this poll; nothing "
+                    "to import until its interval series is published",
+                    up.usage_point_id,
+                )
+                continue
+            # Nothing on this usage point could be represented, and it wasn't for want of an
+            # interval series: some series was skipped for a unit we have no HA mapping for. The
+            # usage point contributes no energy at all — loud, because the symptom is an empty
+            # Energy dashboard.
             _LOGGER.error(
                 "Usage point %s has no importable consumption series — all %d were skipped "
                 "(accumulation behaviours: %s; units: %s). No energy statistics will be written "
@@ -732,7 +818,7 @@ def _warn_once(key: str, msg: str, *args: object) -> None:
     _LOGGER.warning(msg, *args)
 
 
-def _is_interval_consumption_series(up: UsagePoint, series: MeterReadingSeries) -> bool:
+def is_interval_consumption_series(up: UsagePoint, series: MeterReadingSeries) -> bool:
     """True when a series' readings are per-interval quantities we can sum into a statistic.
 
     False for cumulative meter registers. Milton Hydro publishes an hourly ``DELTA_DATA``
@@ -756,17 +842,42 @@ def _is_interval_consumption_series(up: UsagePoint, series: MeterReadingSeries) 
     alongside a REVERSE delta series is not a collision, and excluding it would drop the only
     consumption data there is.
 
+    The sibling doesn't have to be in THIS poll. Milton's incremental responses can carry the
+    register alone — around a meter-read rollover the hourly series is briefly absent — and judged
+    on that poll by itself every meter-lifetime total would import as a day's consumption. So a
+    sibling the meter published on an earlier poll counts too ([UsagePoint.interval_flows_seen],
+    filled in by the coordinator from CONF_INTERVAL_FLOWS).
+
     Testing the values for monotonicity instead does NOT work here: each Consumers Energy
     MeterReading holds exactly one reading, and a one-element series is trivially
-    non-decreasing, so every one of them would still read as a register.
+    non-decreasing, so every one of them would still read as a register. The same goes for a
+    register-only poll carrying one new snapshot, or a flat register at a vacant house — and a
+    genuine daily consumption feed mislabelled cumulative would be dropped whenever its values
+    happened to rise.
     """
     if series.reading_type.accumulation_behaviour not in _CUMULATIVE_ACCUMULATION:
         return True
+    flow = series.reading_type.flow_direction
+    if flow in up.interval_flows_seen:
+        return False
     return not any(
         other.reading_type.accumulation_behaviour not in _CUMULATIVE_ACCUMULATION
-        and other.reading_type.flow_direction == series.reading_type.flow_direction
+        and other.reading_type.flow_direction == flow
         for other in up.series
     )
+
+
+def interval_flows(up: UsagePoint) -> set[str]:
+    """Flow directions in which [up] carries a per-interval (non-cumulative) series this poll.
+
+    What the coordinator remembers in CONF_INTERVAL_FLOWS. A series with no readings counts: its
+    ReadingType alone says the meter publishes interval data in that flow.
+    """
+    return {
+        s.reading_type.flow_direction
+        for s in up.series
+        if s.reading_type.accumulation_behaviour not in _CUMULATIVE_ACCUMULATION
+    }
 
 
 _COMMODITY_BY_READING_TYPE = {
@@ -831,7 +942,7 @@ def _is_superseded_by_unit(up: UsagePoint, series: MeterReadingSeries) -> bool:
         if other.reading_type.unit_of_measure in _UNIT_MAP
         and other.reading_type.flow_direction == series.reading_type.flow_direction
         and _series_commodity(up, other) == commodity
-        and _is_interval_consumption_series(up, other)
+        and is_interval_consumption_series(up, other)
     }
     # Sort key: "energy" < "volume", then the unit string.
     winner = min(rivals | {mapping[:2]}, key=lambda unit_and_class: unit_and_class[::-1])
@@ -848,7 +959,7 @@ def _forward_interval_series(up: UsagePoint) -> list[MeterReadingSeries]:
     return [
         s
         for s in up.series
-        if s.reading_type.flow_direction == "FORWARD" and _is_interval_consumption_series(up, s)
+        if s.reading_type.flow_direction == "FORWARD" and is_interval_consumption_series(up, s)
     ]
 
 

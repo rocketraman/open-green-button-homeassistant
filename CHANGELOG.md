@@ -14,6 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   integration is still asking and the utility has nothing new, which nothing
   else in the file could tell apart from not polling at all.
 
+### Fixed
+
+- Milton Hydro: a poll that carried only the meter's daily register reading,
+  without the hourly data it normally comes with, recorded the meter's lifetime
+  total as one day's usage (around 144,000 kWh). The poll also moved past the
+  missing hourly data, so it was never fetched. The register is now recognized
+  even without the hourly data, and the next poll asks for that data again.
+  Accounts that were hit repair themselves once after updating; others are left
+  alone
+  ([#17](https://github.com/rocketraman/open-green-button-homeassistant/pull/17),
+  thanks @geophilips).
+- A poll with only the register reading no longer logs an error asking for the
+  feed to be reported.
+
 ## [0.3.1] - 2026-10-10
 
 ### Added
