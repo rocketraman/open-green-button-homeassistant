@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -49,6 +50,7 @@ from .const import (
     CONF_ENCRYPTED_REFRESH_BLOB,
     CONF_IMPORT_LOGIC_REVISION,
     CONF_INITIAL_HISTORY_SECONDS,
+    CONF_INTERVAL_FLOWS,
     CONF_LAST_FETCHED_AT,
     CONF_PENDING_PUBLISHED_MAX,
     CONF_PENDING_PUBLISHED_MIN,
@@ -76,9 +78,12 @@ from .statistics import (
     async_clear_statistics_for_entry,
     async_entry_has_statistics,
     async_merge_usage_point_statistics,
+    async_stored_usage_shows_register_days,
     async_stored_usage_shows_resets,
     async_usage_point_looks_replaced,
     import_usage_statistics,
+    interval_flows,
+    is_interval_consumption_series,
     response_needs_import_migration,
     statistic_usage_point_id,
 )
@@ -96,15 +101,21 @@ _LOGGER = logging.getLogger(__package__)
 
 
 def _newest_reading_start(response: UsageResponse) -> datetime | None:
-    """Return the latest reading ``start`` across every series, or None if there are none.
+    """Return the latest reading ``start`` across every importable series, or None if none.
 
     Used to anchor the incremental cursor to the real data frontier (the newest interval we
     actually imported) rather than wall-clock ``now`` — see
     [GreenButtonCoordinator._advance_cursor].
+
+    A cumulative register the importer excludes doesn't count: on a poll that carries Milton's
+    daily register without its hourly sibling, letting the register move the cursor would push
+    the next window past the hourly data this poll was missing, and it would never be fetched.
     """
     newest: datetime | None = None
     for up in response.usage_points:
         for series in up.series:
+            if not is_interval_consumption_series(up, series):
+                continue
             for reading in series.readings:
                 if newest is None or reading.start > newest:
                     newest = reading.start
@@ -121,6 +132,8 @@ def _newest_reading_start_by_usage_point(response: UsageResponse) -> dict[str, d
     newest: dict[str, datetime] = {}
     for up in response.usage_points:
         for series in up.series:
+            if not is_interval_consumption_series(up, series):
+                continue
             for reading in series.readings:
                 current = newest.get(up.usage_point_id)
                 if current is None or reading.start > current:
@@ -230,7 +243,7 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             self.hass, self.entry.entry_id
         )
 
-        response = await self._fetch(published_min, published_max)
+        response = self._apply_interval_flows(await self._fetch(published_min, published_max))
 
         total_readings = sum(len(s.readings) for up in response.usage_points for s in up.series)
         _LOGGER.info(
@@ -560,7 +573,7 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             return []
         # A listing that came back carrying readings IS the batch — some custodians may serve the
         # collection rather than just enumerate it. Use it and skip the per-meter round trips.
-        if _newest_reading_start(listing) is not None:
+        if any(series.readings for up in listing.usage_points for series in up.series):
             _LOGGER.info(
                 "Entry %s: the UsagePoint listing carried readings directly for %d usage point(s)",
                 self.entry.entry_id,
@@ -757,6 +770,38 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             _LOGGER.info("Labeled entry %s with customer detail: %s", self.entry.entry_id, label)
         else:
             self.hass.config_entries.async_update_entry(self.entry, data=data)
+
+    def _apply_interval_flows(self, response: UsageResponse) -> UsageResponse:
+        """Remember which flows each meter publishes interval data in, and attach that memory.
+
+        Returns [response] with every UsagePoint's `interval_flows_seen` filled in from
+        CONF_INTERVAL_FLOWS — merged with what this poll itself shows, and persisted when that
+        adds anything. Must run before anything classifies the response's series (the import, the
+        cursor, the repair check), since a register on a poll without its sibling is only
+        recognizable through it. See [statistics.is_interval_consumption_series].
+        """
+        stored = self.entry.data.get(CONF_INTERVAL_FLOWS)
+        stored = stored if isinstance(stored, dict) else {}
+        merged: dict[str, list[str]] = {
+            up_id: sorted(flow for flow in flows if isinstance(flow, str))
+            for up_id, flows in stored.items()
+            if isinstance(flows, list)
+        }
+        usage_points = []
+        for up in response.usage_points:
+            seen = frozenset(merged.get(up.usage_point_id, ())) | interval_flows(up)
+            if seen:
+                merged[up.usage_point_id] = sorted(seen)
+            usage_points.append(
+                up if seen == up.interval_flows_seen else replace(up, interval_flows_seen=seen)
+            )
+        if merged != stored:
+            self.hass.config_entries.async_update_entry(
+                self.entry, data={**self.entry.data, CONF_INTERVAL_FLOWS: merged}
+            )
+        if all(a is b for a, b in zip(usage_points, response.usage_points, strict=True)):
+            return response
+        return replace(response, usage_points=usage_points)
 
     def _record_poll(self, now: datetime, reading_count: int) -> None:
         """Append this fetch to the poll history kept for diagnostics (see CONF_RECENT_POLLS).
@@ -1034,11 +1079,15 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         verdict = (
             response_needs_import_migration(response, stamped_revision) if has_readings else None
         )
-        # The one repair recognized from the stored rows instead of the feed, which also settles
-        # an otherwise undecidable poll — an empty one included. That matters right after an
-        # update: the poll that follows a restart is often a slice the last one already drained.
-        if verdict is not True and await async_stored_usage_shows_resets(
-            self.hass, self.entry.entry_id, stamped_revision
+        # The repairs recognized from the stored rows instead of the feed (revisions 5 and 6),
+        # which also settle an otherwise undecidable poll — an empty one included. That matters
+        # right after an update: the poll that follows a restart is often a slice the last one
+        # already drained.
+        if verdict is not True and (
+            await async_stored_usage_shows_resets(self.hass, self.entry.entry_id, stamped_revision)
+            or await async_stored_usage_shows_register_days(
+                self.hass, self.entry, response, stamped_revision
+            )
         ):
             verdict = True
         if verdict is None:
@@ -1156,7 +1205,9 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
                 published_min.isoformat(),
             )
             try:
-                response = await self._fetch(published_min, published_max)
+                response = self._apply_interval_flows(
+                    await self._fetch(published_min, published_max)
+                )
             except (UpdateFailed, ConfigEntryAuthFailed) as err:
                 raise HomeAssistantError(
                     f"Rebuild fetch failed for entry {self.entry.entry_id}: {err}. "

@@ -35,6 +35,7 @@ from custom_components.greenbutton.api import (
 from custom_components.greenbutton.const import DOMAIN
 from custom_components.greenbutton.statistics import (
     _recorded_forward_hours,
+    async_stored_usage_shows_register_days,
     async_stored_usage_shows_resets,
     import_usage_statistics,
     response_has_series_sharing_a_statistic,
@@ -614,7 +615,7 @@ def _accumulation_response(
     """A UsagePoint carrying [behaviour], optionally alongside a second series.
 
     The sibling is what makes a cumulative register *excludable* — see
-    [statistics._is_interval_consumption_series]. Without one, a register is all the utility
+    [statistics.is_interval_consumption_series]. Without one, a register is all the utility
     publishes and is imported.
     """
     series = [_series(behaviour, flow_direction)]
@@ -714,6 +715,87 @@ async def test_register_survives_a_sibling_of_the_other_flow_direction(
         ),
     )
     assert {c.args[1]["statistic_id"].rsplit("_", 1)[-1] for c in calls} == {"forward", "reverse"}
+
+
+def _daily_register(*values: float) -> MeterReadingSeries:
+    """Milton's daily BULK_QUANTITY register, one meter-lifetime snapshot (Wh) per day."""
+    start = datetime(2026, 10, 4, 5, tzinfo=UTC)
+    return MeterReadingSeries(
+        meter_reading_id="register",
+        reading_type=NormalizedReadingType(
+            commodity="ELECTRICITY_SECONDARY_METERED",
+            flow_direction="FORWARD",
+            accumulation_behaviour="BULK_QUANTITY",
+            interval_length_seconds=86400,
+            unit_of_measure="WATT_HOURS",
+            unit_of_measure_symbol="Wh",
+            power_of_ten_multiplier=0,
+            currency_numeric_code=124,
+        ),
+        readings=[
+            UsageReading(start + timedelta(days=i), 86400, value) for i, value in enumerate(values)
+        ],
+    )
+
+
+def _register_only(
+    register: MeterReadingSeries, interval_flows_seen: frozenset[str]
+) -> UsageResponse:
+    up = UsagePoint(
+        usage_point_id="up1",
+        service_kind="electricity",
+        series=[register],
+        interval_flows_seen=interval_flows_seen,
+    )
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        (143_990_215.8, 144_009_946.8, 144_028_369.2),  # the PR #17 billing-boundary poll
+        (144_028_369.2,),  # one new snapshot: a monotonicity test can't see it
+        (144_028_369.2, 144_028_369.2),  # flat: a vacant house
+    ],
+)
+async def test_register_without_its_sibling_this_poll_is_still_excluded(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, values: tuple[float, ...]
+) -> None:
+    """A meter that has published hourly data before keeps its register excluded on a poll
+    that carries the register alone — whatever its reading count or values.
+
+    Judged on that poll alone, each meter-lifetime total would import as a day's consumption
+    (~144,000 kWh). And it's a gap in publication, not a broken feed: no ERROR.
+    """
+    with caplog.at_level(logging.DEBUG, logger="custom_components.greenbutton.statistics"):
+        calls = await _import_and_collect_usage(
+            hass, _register_only(_daily_register(*values), frozenset({"FORWARD"}))
+        )
+    assert calls == []
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert "carried only its cumulative meter register" in caplog.text
+
+
+async def test_register_is_not_excluded_by_a_remembered_sibling_of_the_other_flow(
+    hass: HomeAssistant,
+) -> None:
+    """Remembered REVERSE (solar export) interval data says nothing about a FORWARD series."""
+    calls = await _import_and_collect_usage(
+        hass, _register_only(_daily_register(12_000.0, 18_000.0), frozenset({"REVERSE"}))
+    )
+    assert len(calls) == 1
+
+
+async def test_rising_daily_feed_with_no_sibling_ever_still_imports(hass: HomeAssistant) -> None:
+    """Without a remembered sibling, rising values alone don't make a series a register.
+
+    The PR #17 heuristic dropped any lone daily cumulative series whose values didn't fall; a
+    genuine daily consumption feed mislabelled BULK_QUANTITY does that about half the time.
+    """
+    calls = await _import_and_collect_usage(
+        hass, _register_only(_daily_register(12_000.0, 18_000.0, 21_000.0), frozenset())
+    )
+    assert len(calls) == 1
 
 
 async def test_billing_period_reading_spreads_across_its_hours(hass: HomeAssistant) -> None:
@@ -1358,6 +1440,66 @@ async def test_stored_usage_resets_are_recognized_from_the_recorder(
     )
     await async_wait_recording_done(hass)
     assert await async_stored_usage_shows_resets(hass, "01TESTENTRY", stamped_revision) is expected
+
+
+def _add_usage_rows(hass: HomeAssistant, start: datetime, hourly_kwh: list[float]) -> None:
+    """Store FORWARD usage rows for up1 with the given per-hour kWh, as a running sum."""
+    total = 0.0
+    rows = []
+    for i, kwh in enumerate(hourly_kwh):
+        total += kwh
+        rows.append({"start": start + timedelta(hours=i), "state": total, "sum": total})
+    async_add_external_statistics(
+        hass,
+        {
+            "has_mean": False,
+            "has_sum": True,
+            "name": "test usage",
+            "source": DOMAIN,
+            "statistic_id": statistic_id_for_series("01TESTENTRY", "up1", "FORWARD"),
+            "unit_of_measurement": "kWh",
+            "unit_class": "energy",
+            "mean_type": StatisticMeanType.NONE,
+        },
+        rows,
+    )
+
+
+@pytest.mark.parametrize(
+    ("hourly_kwh", "register_wh", "stamped_revision", "expected"),
+    [
+        # A 144,009 kWh register snapshot spread over its day: 6,000 kWh an hour.
+        ([1.2, 0.8, 6000.4, 6000.4, 1.1], (144_009_946.8,), 5, True),
+        # Before readings were spread (revision 2), the whole snapshot landed in one hour.
+        ([1.2, 144_009.9, 0.9], (144_009_946.8,), 1, True),
+        # A heavy but real hour is nowhere near a lifetime total.
+        ([1.2, 48.0, 0.9], (144_009_946.8,), 5, False),
+        # No register in this poll: nothing to judge the rows against.
+        ([1.2, 6000.4, 0.9], (), 5, False),
+        # Already stamped past the fix: don't scan again.
+        ([1.2, 6000.4, 0.9], (144_009_946.8,), 6, False),
+    ],
+)
+async def test_register_imported_as_consumption_is_recognized_from_the_recorder(
+    hass: HomeAssistant,
+    hourly_kwh: list[float],
+    register_wh: tuple[float, ...],
+    stamped_revision: int,
+    expected: bool,
+) -> None:
+    """Revision-6 damage: a stored hour that is a sizeable fraction of the meter's register."""
+    _add_usage_rows(hass, datetime(2026, 10, 4, tzinfo=UTC), hourly_kwh)
+    await async_wait_recording_done(hass)
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    entry.data = {}
+    hourly = _series("DELTA_DATA", meter_reading_id="hourly")
+    series = [hourly, _daily_register(*register_wh)] if register_wh else [hourly]
+    response = _one_usage_point(*series)
+    assert (
+        await async_stored_usage_shows_register_days(hass, entry, response, stamped_revision)
+        is expected
+    )
 
 
 # The Burlington Hydro block: 24 hourly rows, 2026-09-23 05:00Z → 2026-09-24 04:00Z.

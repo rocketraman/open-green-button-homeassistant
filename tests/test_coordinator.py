@@ -38,6 +38,7 @@ from custom_components.greenbutton.const import (
     CONF_CUSTOMER_LABEL,
     CONF_ENCRYPTED_REFRESH_BLOB,
     CONF_IMPORT_LOGIC_REVISION,
+    CONF_INTERVAL_FLOWS,
     CONF_LAST_FETCHED_AT,
     CONF_PENDING_PUBLISHED_MAX,
     CONF_PENDING_PUBLISHED_MIN,
@@ -1617,6 +1618,112 @@ async def test_advance_cursor_writes_one_cursor_per_meter(hass: HomeAssistant) -
     # The entry-wide frontier still tracks the newest across meters: it answers "has this entry
     # ever imported anything", which is not a per-meter question.
     assert entry.data[CONF_LAST_FETCHED_AT] == fast.isoformat()
+
+
+def _register_only_response(*days: int) -> UsageResponse:
+    """Milton at a meter-read rollover: the daily register snapshots, the hourly series absent."""
+    register_type = NormalizedReadingType(
+        commodity="ELECTRICITY_SECONDARY_METERED",
+        flow_direction="FORWARD",
+        accumulation_behaviour="BULK_QUANTITY",
+        interval_length_seconds=86400,
+        unit_of_measure="WATT_HOURS",
+        unit_of_measure_symbol="Wh",
+        power_of_ten_multiplier=-3,
+        currency_numeric_code=124,
+    )
+    register = MeterReadingSeries(
+        meter_reading_id="daily-register",
+        reading_type=register_type,
+        readings=[
+            UsageReading(datetime(2026, 10, day, 5, tzinfo=UTC), 86400, 143_990_215.8 + day * 20.0)
+            for day in days
+        ],
+    )
+    return UsageResponse(
+        updated=None,
+        usage_points=[UsagePoint("up1", "electricity", [register])],
+        new_credentials=None,
+    )
+
+
+async def test_register_only_response_does_not_advance_cursor(hass: HomeAssistant) -> None:
+    """A skipped cumulative register must not move the cursor past the missing hourly data.
+
+    The meter has published hourly data before (CONF_INTERVAL_FLOWS), so its register is
+    excluded on this poll; were it still to set the cursor, the next window would start after
+    the hours this poll was missing and they'd never be fetched. (From PR #17, @geophilips.)
+    """
+    prior = datetime(2026, 10, 5, 3, tzinfo=UTC)
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_LAST_FETCHED_AT: prior.isoformat(),
+            CONF_USAGE_POINT_CURSORS: {"up1": prior.isoformat()},
+            CONF_INTERVAL_FLOWS: {"up1": ["FORWARD"]},
+        },
+    )
+    coordinator = GreenButtonCoordinator(hass, _api_returning(_register_only_response(7)), entry)
+
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ) as import_mock:
+        await coordinator._async_update_data()
+
+    assert entry.data[CONF_LAST_FETCHED_AT] == prior.isoformat()
+    assert entry.data[CONF_USAGE_POINT_CURSORS] == {"up1": prior.isoformat()}
+    # The importer is handed the memory, which is what excludes the register there too.
+    (imported_up,) = import_mock.call_args.args[2].usage_points
+    assert imported_up.interval_flows_seen == frozenset({"FORWARD"})
+
+
+async def test_interval_flows_are_remembered_across_polls(hass: HomeAssistant) -> None:
+    """A poll showing hourly data beside the register is remembered, so a later register-only
+    poll is recognized without its sibling. Remembered flows only ever accumulate."""
+    entry = _entry(hass)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_INTERVAL_FLOWS: {"other": ["REVERSE"]}}
+    )
+    coordinator = GreenButtonCoordinator(
+        hass, _api_returning(_response_with_cumulative_register()), entry
+    )
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(),
+    ):
+        await coordinator._async_update_data()
+
+    assert entry.data[CONF_INTERVAL_FLOWS] == {"other": ["REVERSE"], "up1": ["FORWARD"]}
+
+
+async def test_import_migration_rebuilds_entry_whose_stored_rows_hold_a_register(
+    hass: HomeAssistant,
+) -> None:
+    """Revision-6 damage is read from the recorder: a normal poll can't show that an earlier one
+    lacked the register's sibling."""
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, 5)
+    api = _api_returning(_response_with_cumulative_register())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    damaged = patch(
+        "custom_components.greenbutton.coordinator.async_stored_usage_shows_register_days",
+        new=AsyncMock(return_value=True),
+    )
+    with has_stats, clear as clear_mock, _import, damaged as damaged_mock:
+        await coordinator.async_refresh()
+
+    assert api.fetch_usage.await_count == 2  # the poll, then the rebuild's full-history re-fetch
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+    # Judged against the register this poll carried, with the memory attached.
+    response = damaged_mock.call_args.args[2]
+    assert response.usage_points[0].interval_flows_seen == frozenset({"FORWARD"})
 
 
 async def test_window_scopes_to_the_furthest_behind_meter(hass: HomeAssistant) -> None:

@@ -141,6 +141,18 @@ CONF_LAST_FETCHED_AT = "last_fetched_at"
 # step is needed.
 CONF_USAGE_POINT_CURSORS = "usage_point_cursors"
 
+# Flow directions each meter has published per-interval data in: ``{usage_point_id: [flow]}``.
+#
+# Milton Hydro publishes an hourly DELTA_DATA series and a daily BULK_QUANTITY register for the
+# same meter, and the register is only recognizable as one by that sibling (see
+# [statistics.is_interval_consumption_series]). An incremental poll can carry the register alone —
+# around a meter-read rollover the hourly series is briefly absent — and judged on that poll
+# alone, each meter-lifetime total imports as one day's consumption. Remembering that the meter
+# HAS published interval data in that flow is what keeps the register excluded on such a poll,
+# whatever its reading count or values. Only ever grows; a meter that has never shown a sibling
+# (Consumers Energy's billing-only feed) is never in it, so its lone series still imports.
+CONF_INTERVAL_FLOWS = "interval_flows"
+
 # Meters the user has told us are one and the same: ``{usage_point_id: the id it replaced}``.
 #
 # Statistic ids are built from the UsagePoint id, and a utility can re-issue that id for a meter
@@ -291,7 +303,14 @@ CONF_IMPORT_LOGIC_REVISION = "import_logic_revision"
 #       UtilityAPI utilities (Consumers Energy, Eversource, El Paso Electric). Recognized from the
 #       stored rows as well as the feed, since one incremental poll rarely shows the shape.
 #       (issue #21)
-IMPORT_LOGIC_REVISION = 5
+#   6 — a poll carrying a meter's cumulative register WITHOUT its interval sibling imported each
+#       meter-lifetime total as a day's consumption (~144,000 kWh a day), and moved the cursor
+#       past the interval data the poll was missing, so it was never fetched. Affects Milton
+#       Hydro around a meter-read rollover. Recognized from the stored rows, against the scale of
+#       the register in the current poll: a normal poll can't show that an earlier one lacked
+#       the sibling, and rebuilding every Milton entry on that suspicion would re-pull history
+#       for accounts that never hit it. (PR #17)
+IMPORT_LOGIC_REVISION = 6
 
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see
