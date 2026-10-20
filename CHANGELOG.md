@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-20
+
 ### Added
 
 - The diagnostics download now includes `recent_polls`: when each poll of the
@@ -27,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thanks @geophilips).
 - A poll with only the register reading no longer logs an error asking for the
   feed to be reported.
+- Ontario time-of-use cost: statutory holidays are now priced off-peak all day,
+  including the weekday a weekend holiday moves to. They were costed on the
+  normal weekday schedule, which put part of the spend on on-peak and mid-peak
+  hours. The bill total was not affected
+  ([#16](https://github.com/rocketraman/open-green-button-homeassistant/pull/16),
+  thanks @margosmark).
 - Utilities listed under a parent company (e.g. Algoma Power under Fortis
   Ontario): reconnecting after the sign-in expires now shows the utility you
   picked on the consent page, rather than the parent company.
