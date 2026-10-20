@@ -228,6 +228,45 @@ async def test_second_flow_for_same_account_aborts_already_configured(
     assert result["reason"] == "already_configured"
 
 
+async def test_brand_flow_keeps_the_picked_brand(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """A brand claims under its parent's id; the entry and reauth keep the brand."""
+    brand = {"id": "example_brand", "displayName": "Example Brand"}
+    aioclient_mock.get(UTILITIES_URL, json=[*MOCK_UTILITIES, brand])
+    # The server answers a brand's claim with the parent utility's id.
+    aioclient_mock.post(claim_url(VALID_CLAIM_CODE), json=MOCK_CLAIM_RESPONSE)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_UTILITY_ID: "example_brand"}
+    )
+    assert "/connect/example_brand/start" in result["description_placeholders"]["authorize_url"]
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_CLAIM_CODE: VALID_CLAIM_CODE}
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Example Brand"
+    entry = result["result"]
+    assert entry.data[CONF_UTILITY_ID] == "example_brand"
+    assert entry.data[CONF_UTILITY_NAME] == "Example Brand"
+    # Dedup stays on the claim's (parent) id, so the same account added via the parent aborts.
+    assert entry.unique_id == f"example_utility:{MOCK_CLAIM_RESPONSE['subscriptionUri']}"
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_REAUTH, "entry_id": entry.entry_id},
+        data=entry.data,
+    )
+    assert result["step_id"] == "reauth_confirm"
+    placeholders = result["description_placeholders"]
+    assert "/connect/example_brand/start" in placeholders["authorize_url"]
+    assert placeholders["utility_name"] == "Example Brand"
+
+
 @pytest.fixture(name="config_entry")
 async def fixture_config_entry(
     hass: HomeAssistant,

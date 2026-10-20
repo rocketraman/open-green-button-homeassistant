@@ -315,9 +315,15 @@ def _entry_data(
     utility: UtilitySummary,
     claim: ClaimResponse,
 ) -> dict[str, Any]:
-    """The shape persisted in ConfigEntry.data."""
+    """The shape persisted in ConfigEntry.data.
+
+    Stores the id the user picked rather than the claim's: for a brand served under a parent
+    utility's registration (e.g. Algoma Power under Fortis Ontario) the claim carries the
+    parent id, and reauth must reopen the connect flow under the brand so the server's consent
+    page names it. The server resolves either id; [_unique_id_for] keys on the claim's.
+    """
     return {
-        CONF_UTILITY_ID: claim.utility_id,
+        CONF_UTILITY_ID: utility.id,
         CONF_UTILITY_NAME: utility.display_name,
         CONF_SERVER_BASE_URL: server_base_url,
         CONF_ENCRYPTED_REFRESH_BLOB: claim.encrypted_refresh_blob,

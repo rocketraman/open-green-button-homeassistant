@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thanks @geophilips).
 - A poll with only the register reading no longer logs an error asking for the
   feed to be reported.
+- Utilities listed under a parent company (e.g. Algoma Power under Fortis
+  Ontario): reconnecting after the sign-in expires now shows the utility you
+  picked on the consent page, rather than the parent company.
 
 ## [0.3.1] - 2026-10-10
 
