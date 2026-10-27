@@ -88,8 +88,10 @@ class UsageReading:
     duration_seconds: int
     value: float
     # Per-interval cost in the ReadingType's currency (float currency units, already divided out of
-    # ESPI's 1/100,000 raw). Present when the utility itemizes cost on each IntervalReading (e.g.
-    # savagedata/Milton); None when it only bills via a monthly UsageSummary (e.g. Burlington).
+    # ESPI's 1/100,000 raw — or 1/1,000 for a series that reports in that scale, see
+    # [MeterReadingSeries.cost_in_thousandths]). Present when the utility itemizes cost on each
+    # IntervalReading (e.g. savagedata/Milton); None when it only bills via a monthly UsageSummary
+    # (e.g. Burlington).
     cost: float | None = None
 
 
@@ -115,6 +117,10 @@ class MeterReadingSeries:
     meter_reading_id: str
     reading_type: NormalizedReadingType
     readings: list[UsageReading]
+    # True when this series' raw `<cost>` was recognized as 1/1,000 of the currency unit rather
+    # than ESPI's 1/100,000, and its readings' costs were scaled accordingly. Alectra (savagedata)
+    # reports this way (issue #33); see [espi._interval_cost_in_thousandths].
+    cost_in_thousandths: bool = False
 
 
 # Default ESPI cost scale: monetary amounts are reported in 1/100,000 of the currency unit.

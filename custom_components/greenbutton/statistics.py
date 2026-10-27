@@ -566,6 +566,23 @@ async def async_stored_usage_shows_register_days(
     return False
 
 
+def response_has_interval_cost_in_thousandths(response: UsageResponse) -> bool:
+    """True when [response] carries a series whose interval `<cost>` is in 1/1,000, not 1/100,000.
+
+    The revision-7 signal. Such costs used to be divided by ESPI's 1/100,000 regardless, so the
+    stored cost statistic is 100× too small (Alectra, issue #33). The scale is a property of the
+    series, recognized on every poll that carries priced readings — see
+    [espi._interval_cost_in_thousandths]. Feeds costed at the spec scale, or through UsageSummary,
+    are stamped forward untouched.
+    """
+    return any(
+        s.cost_in_thousandths
+        for up in response.usage_points
+        for s in up.series
+        if is_interval_consumption_series(up, s)
+    )
+
+
 # Recognition predicates keyed by the import-logic revision that fixed the bug. An entry stamped
 # at revision N is tested against every predicate for a revision > N — so a user who skipped a
 # release still gets each repair they're owed, in one rebuild rather than one per revision.
@@ -578,6 +595,7 @@ _IMPORT_MIGRATION_CHECKS: dict[int, Callable[[UsageResponse], bool | None]] = {
     4: response_has_gas_or_water_series,
     5: response_has_series_sharing_a_statistic,
     6: response_damage_is_judged_from_stored_rows,
+    7: response_has_interval_cost_in_thousandths,
 }
 
 

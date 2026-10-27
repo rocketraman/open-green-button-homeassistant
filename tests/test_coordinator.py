@@ -2394,3 +2394,48 @@ async def test_recent_polls_persist_and_drop_entries_past_retention(hass: HomeAs
     polls = entry.data[CONF_RECENT_POLLS]
     assert polls[0] == {"at": recent.isoformat(), "reading_count": 3}
     assert [poll["reading_count"] for poll in polls] == [3, 0]
+
+
+def _response_costed_in_thousandths() -> UsageResponse:
+    """Alectra's shape (issue #33): hourly readings whose <cost> the parser found in 1/1,000."""
+    from dataclasses import replace
+
+    response = _response_with_readings(datetime(2026, 10, 25, 5, tzinfo=UTC), cost=0.13)
+    up = response.usage_points[0]
+    series = replace(up.series[0], cost_in_thousandths=True)
+    return replace(response, usage_points=[replace(up, series=[series])])
+
+
+async def test_import_migration_rebuilds_entry_costed_in_thousandths(hass: HomeAssistant) -> None:
+    """An entry whose interval cost is in 1/1,000 rebuilds, restating its 100×-too-small cost."""
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, 6)
+    api = _api_returning(_response_costed_in_thousandths())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    assert coordinator.last_exception is None
+    assert api.fetch_usage.await_count == 2  # the poll, then the rebuild's full-history re-fetch
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
+async def test_import_migration_skips_entry_costed_at_spec_scale(hass: HomeAssistant) -> None:
+    """Interval cost at ESPI's own 1/100,000 was always imported right: stamp, don't rebuild."""
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, 6)
+    api = _api_returning(_response_with_readings(datetime(2026, 10, 25, 5, tzinfo=UTC), cost=0.13))
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    api.fetch_usage.assert_awaited_once()  # no rebuild
+    clear_mock.assert_not_awaited()
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION

@@ -137,6 +137,8 @@ def test_mixed_delta_and_bulk_series_parse_as_distinct_series() -> None:
 # (.../UsagePoint/{up}/MeterReading/{mr}/IntervalBlock/{ib}) and the MeterReading has NO flat
 # rel="related" espi-entry/UsagePoint link — only its hierarchical self URL. The parser must derive
 # the parent UsagePoint from that path, or interval readings never attach (the "0 readings" bug).
+# Values are milliwatt-hours (powerOfTenMultiplier -3) and costs are at ESPI's 1/100,000: 795 Wh
+# for $0.087 is ~11¢/kWh.
 _SAVAGEDATA_FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
   <id>urn:uuid:f</id>
@@ -170,7 +172,7 @@ _SAVAGEDATA_FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
   </entry>
   <entry xmlns:espi="http://naesb.org/espi">
     <link rel="self" href="https://sd/ReadingType/RT1"/>
-    <content><espi:ReadingType><espi:powerOfTenMultiplier>0</espi:powerOfTenMultiplier><espi:uom>72</espi:uom><espi:commodity>1</espi:commodity><espi:flowDirection>1</espi:flowDirection></espi:ReadingType></content>
+    <content><espi:ReadingType><espi:powerOfTenMultiplier>-3</espi:powerOfTenMultiplier><espi:uom>72</espi:uom><espi:commodity>1</espi:commodity><espi:flowDirection>1</espi:flowDirection></espi:ReadingType></content>
   </entry>
 </feed>"""
 
@@ -182,7 +184,7 @@ def test_hierarchical_urls_without_related_usagepoint_link_still_attach_readings
     assert len(usage_points) == 1
     readings = [r for series in usage_points[0].series for r in series.readings]
     assert len(readings) == 2, f"expected 2 readings, got {len(readings)}"
-    assert [r.value for r in readings] == [795000.0, 5271000.0]
+    assert [r.value for r in readings] == [795.0, 5271.0]  # milliwatt-hours at 10^-3
 
 
 def test_per_interval_cost_parsed_when_present_else_none() -> None:
@@ -192,6 +194,74 @@ def test_per_interval_cost_parsed_when_present_else_none() -> None:
     readings = usage_points[0].series[0].readings
     assert readings[0].cost == 0.087  # <cost>8700</cost>
     assert readings[1].cost is None  # second reading has no <cost>
+    assert usage_points[0].series[0].cost_in_thousandths is False  # ~11¢/kWh: the spec scale
+
+
+def _interval_cost_feed(*readings: tuple[int, int], uom: int = 72) -> bytes:
+    """A one-series feed of hourly (value Wh, raw <cost>) readings at powerOfTenMultiplier 0."""
+    interval_readings = "".join(
+        f"<espi:IntervalReading><espi:cost>{cost}</espi:cost><espi:timePeriod>"
+        f"<espi:duration>3600</espi:duration><espi:start>{1761364800 + i * 3600}</espi:start>"
+        f"</espi:timePeriod><espi:value>{value}</espi:value></espi:IntervalReading>"
+        for i, (value, cost) in enumerate(readings)
+    )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <id>urn:uuid:f</id>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="self" href="https://sd/Subscription/s/UsagePoint/UP1"/>
+    <content><espi:UsagePoint><espi:ServiceCategory><espi:kind>0</espi:kind></espi:ServiceCategory></espi:UsagePoint></content>
+  </entry>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="self" href="https://sd/Subscription/s/UsagePoint/UP1/MeterReading/MR1"/>
+    <link rel="related" type="espi-entry/ReadingType" href="https://sd/ReadingType/RT1"/>
+    <content><espi:MeterReading/></content>
+  </entry>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="up" type="espi-feed/IntervalBlock" href="https://sd/Subscription/s/UsagePoint/UP1/MeterReading/MR1/IntervalBlock"/>
+    <link rel="self" href="https://sd/Subscription/s/UsagePoint/UP1/MeterReading/MR1/IntervalBlock/IB1"/>
+    <content><espi:IntervalBlock>{interval_readings}</espi:IntervalBlock></content>
+  </entry>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="self" href="https://sd/ReadingType/RT1"/>
+    <content><espi:ReadingType><espi:powerOfTenMultiplier>0</espi:powerOfTenMultiplier><espi:uom>{uom}</espi:uom><espi:commodity>1</espi:commodity><espi:flowDirection>1</espi:flowDirection></espi:ReadingType></content>
+  </entry>
+</feed>""".encode()
+
+
+def test_interval_cost_in_thousandths_is_rescaled() -> None:
+    """Alectra reports <cost> in 1/1,000 of a dollar (issue #33): 130 for ~1.2 kWh is 13¢.
+
+    Read at ESPI's 1/100,000 that's 0.1¢/kWh — no real tariff — so the series is recognized as
+    thousandths and every reading's cost scaled up 100×, the uncosted reading left alone.
+    """
+    _updated, usage_points = parse_usage_feed(_interval_cost_feed((1200, 130), (1100, 120), (0, 0)))
+    series = usage_points[0].series[0]
+    assert series.cost_in_thousandths is True
+    assert [r.cost for r in series.readings] == [0.13, 0.12, 0.0]
+
+
+def test_interval_cost_at_spec_scale_is_left_alone() -> None:
+    """The same energy at 13¢ in ESPI's own 1/100,000 is a real price, and stays as it is."""
+    _updated, usage_points = parse_usage_feed(_interval_cost_feed((1200, 13000), (1100, 12000)))
+    series = usage_points[0].series[0]
+    assert series.cost_in_thousandths is False
+    assert [r.cost for r in series.readings] == [0.13, 0.12]
+
+
+def test_interval_cost_scale_needs_a_priced_watt_hour_series() -> None:
+    """Without both energy and a positive cost there's no price to judge, so the spec scale holds.
+
+    Covers the zero-cost placeholder Milton puts on its register, an all-free series, and a unit
+    we can't price (here therms, uom 169).
+    """
+    for feed in (
+        _interval_cost_feed((1200, 0), (1100, 0)),
+        _interval_cost_feed((0, 130)),
+        _interval_cost_feed((1200, 130), uom=169),
+    ):
+        _updated, usage_points = parse_usage_feed(feed)
+        assert usage_points[0].series[0].cost_in_thousandths is False
 
 
 # Burlington-shaped feed: a feed-level <updated> AND an <updated> on every entry, which is what

@@ -32,7 +32,7 @@ from __future__ import annotations
 import io
 import logging
 import xml.etree.ElementTree as ET  # Element/types only — parsing goes through defusedxml.
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import IO
 
@@ -80,6 +80,13 @@ _TAG_COST = f"{{{_ESPI_NS}}}cost"
 # ESPI reports monetary amounts (IntervalReading/cost, UsageSummary line items) in 1/100,000 of the
 # currency unit.
 _ESPI_COST_SCALE = 100_000.0
+
+# Some feeds report IntervalReading/cost in 1/1,000 instead — see [_interval_cost_in_thousandths].
+# A real electricity price is somewhere around $0.03–$1/kWh; read at 1/100,000, a thousandths feed
+# comes out 100× lower, at roughly $0.0003–$0.01/kWh. The two ranges don't meet, so this needn't be
+# precise — only below any price a utility actually charges on average.
+_THOUSANDTHS_PRICE_CEILING_PER_KWH = 0.01
+_THOUSANDTHS_RESCALE = _ESPI_COST_SCALE / 1_000.0
 _TAG_ACCUM = f"{{{_ESPI_NS}}}accumulationBehaviour"
 _TAG_COMMODITY = f"{{{_ESPI_NS}}}commodity"
 _TAG_CURRENCY = f"{{{_ESPI_NS}}}currency"
@@ -487,7 +494,11 @@ def _parse_interval_readings(block: ET.Element):
 
 
 def _cost_amount(text: str | None) -> float | None:
-    """Per-interval `<cost>` (ESPI 1/100,000 currency units) → float currency amount, or None."""
+    """Per-interval `<cost>` (ESPI 1/100,000 currency units) → float currency amount, or None.
+
+    A series found to be in 1/1,000 instead is rescaled once it's assembled — see
+    [_interval_cost_in_thousandths].
+    """
     if text is None:
         return None
     try:
@@ -552,11 +563,24 @@ def _assemble(
                 for r in block.readings
             ]
             readings.sort(key=lambda r: r.start)
+            reading_type = _normalize_reading_type(rt)
+            in_thousandths = _interval_cost_in_thousandths(readings, reading_type)
+            if in_thousandths:
+                _LOGGER.info(
+                    "MeterReading %s reports interval <cost> in 1/1,000 of the currency unit, "
+                    "not ESPI's 1/100,000; scaling its costs accordingly",
+                    mr_id,
+                )
+                readings = [
+                    replace(r, cost=r.cost * _THOUSANDTHS_RESCALE) if r.cost is not None else r
+                    for r in readings
+                ]
             series.append(
                 MeterReadingSeries(
                     meter_reading_id=mr_id,
-                    reading_type=_normalize_reading_type(rt),
+                    reading_type=reading_type,
                     readings=readings,
+                    cost_in_thousandths=in_thousandths,
                 )
             )
         # Fill in the parent UsagePoint's currency on each summary that didn't carry one of
@@ -575,6 +599,30 @@ def _assemble(
             )
         )
     return out
+
+
+def _interval_cost_in_thousandths(
+    readings: list[UsageReading], reading_type: NormalizedReadingType
+) -> bool:
+    """Whether a series' interval `<cost>` is in 1/1,000 of the currency unit, not 1/100,000.
+
+    ESPI puts IntervalReading/cost in 1/100,000 of the currency, but Alectra (savagedata) reports
+    it in 1/1,000 — ``<cost>130</cost>`` for 13¢ of energy — and nothing in the feed says which
+    (issue #33). The implied price tells them apart: read at 1/100,000, a thousandths feed prices
+    its energy 100× too cheap, under [_THOUSANDTHS_PRICE_CEILING_PER_KWH].
+
+    Judged on the whole series' total cost over total energy, so a few free or credited hours
+    can't tip it. Only watt-hour series carry a price we can sanity-check; anything else keeps the
+    spec scale.
+    """
+    if reading_type.unit_of_measure != "WATT_HOURS":
+        return False
+    priced = [r for r in readings if r.cost is not None and r.value > 0]
+    kwh = sum(r.value for r in priced) / 1000
+    cost = sum(r.cost for r in priced if r.cost is not None)
+    if kwh <= 0 or cost <= 0:
+        return False
+    return cost / kwh < _THOUSANDTHS_PRICE_CEILING_PER_KWH
 
 
 def _with_currency_default(s: BillingSummary, fallback: int | None) -> BillingSummary:
