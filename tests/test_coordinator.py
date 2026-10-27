@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
@@ -56,6 +57,7 @@ from custom_components.greenbutton.const import (
     POLL_HISTORY_RETENTION,
 )
 from custom_components.greenbutton.coordinator import GreenButtonCoordinator
+from custom_components.greenbutton.storage import xml_cache_path
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -2139,6 +2141,56 @@ async def test_a_first_sync_collects_from_the_resources_the_utility_announced(
     requested = [c.kwargs.get("resource_path") for c in api.fetch_usage.await_args_list]
     assert requested == [None, "UsagePoint/up1", "UsagePoint/up2"], "no listing probe is needed"
     assert CONF_PENDING_PUBLISHED_MIN not in entry.data
+    coordinator.cancel_pending_retry()
+
+
+@pytest.mark.parametrize("debug", [True, False])
+async def test_a_collected_resource_body_is_cached_for_diagnostics_only_under_debug(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    debug: bool,
+) -> None:
+    """The per-UsagePoint body reaches the raw-XML cache when debug logging is on.
+
+    For a custodian that defers every subscription-level fetch (issues/10), the resource
+    collection is the only response that ever carries readings, so it is the body diagnostics
+    needs — the 202 has none.
+    """
+    reading = datetime(2026, 6, 1, tzinfo=UTC)
+    body = b"<?xml version='1.0'?><feed>up1</feed>"
+    api = _deferring_api(
+        per_meter={"up1": _response_with_meters({"up1": [reading]})},
+        announced=("UsagePoint/up1",),
+    )
+    deferring_fetch = api.fetch_usage.side_effect
+
+    async def _fetch_feeding_the_sink(**kwargs: object) -> UsageResponse:
+        response = await deferring_fetch(**kwargs)
+        sink = kwargs.get("raw_xml_sink")
+        if sink is not None:
+            await sink(body)  # type: ignore[operator]
+        return response
+
+    api.fetch_usage.side_effect = _fetch_feeding_the_sink
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    with (
+        caplog.at_level(
+            logging.DEBUG if debug else logging.INFO, logger="custom_components.greenbutton"
+        ),
+        patch(
+            "custom_components.greenbutton.coordinator.import_usage_statistics",
+            new=AsyncMock(),
+        ),
+    ):
+        await coordinator._async_update_data()
+
+    path = Path(xml_cache_path(hass, entry.entry_id))
+    if debug:
+        assert path.read_bytes() == body
+    else:
+        assert not path.exists()
     coordinator.cancel_pending_retry()
 
 
