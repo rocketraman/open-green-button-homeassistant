@@ -608,6 +608,11 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
                 published_min=published_min,
                 published_max=published_max,
                 resource_path=resource_path,
+                # For a custodian that defers every subscription-level fetch, THIS is the only
+                # body that ever carries readings — without the sink, diagnostics would hold
+                # nothing (issues/10). One cache file per entry, so with several meters the last
+                # one to answer wins.
+                raw_xml_sink=self._make_raw_xml_sink_if_debug(),
             )
         except OpenGbApiError as err:
             self._persist_rotated_credentials(err.new_credentials)
