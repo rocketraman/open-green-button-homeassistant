@@ -7,8 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-28
+
+### Added
+
+- The diagnostics download now shows each series' total cost, total kWh and
+  implied price per kWh, plus the parsing quirks the last response was read
+  under, so a cost-scale problem is visible without debug logging.
+- With debug logging on, the diagnostics download now also keeps the raw data
+  for utilities that send readings per meter rather than in one feed (Alectra).
+
 ### Fixed
 
+- Alectra: interval cost was imported 100 times too small. Alectra reports
+  cost in thousandths of a dollar rather than the standard hundred-thousandths;
+  the server now flags this and the integration applies it. Affected entries
+  rebuild their statistics automatically
+  ([#33](https://github.com/rocketraman/open-green-button-homeassistant/issues/33)).
+- Enbridge Gas: usage and cost came out a million times too large, because
+  Enbridge sends every scale factor with the wrong sign. The server now flags
+  this and the integration corrects it. Affected entries rebuild their
+  statistics automatically.
 - El Paso Electric (and other UtilityAPI utilities that bill through monthly
   summaries): bill costs came out about 100,000 times too high, for example
   $470,770 for a 13 kWh day. A bill line that states the kWh it charged for was
