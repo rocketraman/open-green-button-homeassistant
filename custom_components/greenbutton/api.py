@@ -27,6 +27,7 @@ import aiohttp
 
 from .const import (
     API_VERSION,
+    QUIRK_INTERVAL_COST_IN_THOUSANDTHS,
     QUIRK_INVERT_COST_IF_POSITIVE_MULTIPLIER,
     QUIRK_INVERT_USAGE_IF_POSITIVE_MULTIPLIER,
 )
@@ -92,10 +93,9 @@ class UsageReading:
     duration_seconds: int
     value: float
     # Per-interval cost in the ReadingType's currency (float currency units, already divided out of
-    # ESPI's 1/100,000 raw — or 1/1,000 for a series that reports in that scale, see
-    # [MeterReadingSeries.cost_in_thousandths]). Present when the utility itemizes cost on each
-    # IntervalReading (e.g. savagedata/Milton); None when it only bills via a monthly UsageSummary
-    # (e.g. Burlington).
+    # ESPI's 1/100,000 raw — or 1/1,000 under the server's `intervalCostInThousandths` quirk).
+    # Present when the utility itemizes cost on each IntervalReading (e.g. savagedata/Milton); None
+    # when it only bills via a monthly UsageSummary (e.g. Burlington).
     cost: float | None = None
 
 
@@ -121,10 +121,35 @@ class MeterReadingSeries:
     meter_reading_id: str
     reading_type: NormalizedReadingType
     readings: list[UsageReading]
-    # True when this series' raw `<cost>` was recognized as 1/1,000 of the currency unit rather
-    # than ESPI's 1/100,000, and its readings' costs were scaled accordingly. Alectra (savagedata)
-    # reports this way (issue #33); see [espi._interval_cost_in_thousandths].
-    cost_in_thousandths: bool = False
+
+    @property
+    def total_cost(self) -> float | None:
+        """Sum of the readings' per-interval cost; None when no reading carries one."""
+        costs = [r.cost for r in self.readings if r.cost is not None]
+        return sum(costs) if costs else None
+
+    @property
+    def total_kwh(self) -> float | None:
+        """Sum of the readings in kWh; None for a series that isn't in watt-hours."""
+        if self.reading_type.unit_of_measure != "WATT_HOURS":
+            return None
+        return sum(r.value for r in self.readings) / 1000
+
+    @property
+    def implied_price_per_kwh(self) -> float | None:
+        """Total cost over total energy across the readings that carry a cost.
+
+        A sanity check on the cost scale: a real tariff is somewhere around $0.03–$1/kWh, so a
+        price far outside that means ``<cost>`` was read in the wrong scale (issue #33). None for a
+        series that isn't in watt-hours or has no costed energy.
+        """
+        if self.reading_type.unit_of_measure != "WATT_HOURS":
+            return None
+        priced = [r for r in self.readings if r.cost is not None and r.value > 0]
+        kwh = sum(r.value for r in priced) / 1000
+        if kwh <= 0:
+            return None
+        return sum(r.cost for r in priced if r.cost is not None) / kwh
 
 
 # Default ESPI cost scale: monetary amounts are reported in 1/100,000 of the currency unit.
@@ -605,6 +630,7 @@ class OpenGbApi:
             xml_bytes,
             invert_usage_if_positive_multiplier=QUIRK_INVERT_USAGE_IF_POSITIVE_MULTIPLIER in quirks,
             invert_cost_if_positive_multiplier=QUIRK_INVERT_COST_IF_POSITIVE_MULTIPLIER in quirks,
+            interval_cost_in_thousandths=QUIRK_INTERVAL_COST_IN_THOUSANDTHS in quirks,
         )
         # xml_bytes goes out of scope here; the only persistent copy is whatever the sink
         # decided to do with it (default: nothing).

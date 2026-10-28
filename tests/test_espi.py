@@ -1,7 +1,11 @@
 """Parser regression tests for custodian-specific ESPI feed shapes."""
 
+import logging
 from datetime import UTC, datetime
 
+import pytest
+
+from custom_components.greenbutton import espi
 from custom_components.greenbutton.espi import (
     _accumulation,
     _flow_direction,
@@ -194,7 +198,6 @@ def test_per_interval_cost_parsed_when_present_else_none() -> None:
     readings = usage_points[0].series[0].readings
     assert readings[0].cost == 0.087  # <cost>8700</cost>
     assert readings[1].cost is None  # second reading has no <cost>
-    assert usage_points[0].series[0].cost_in_thousandths is False  # ~11¢/kWh: the spec scale
 
 
 def _interval_cost_feed(*readings: tuple[int, int], uom: int = 72) -> bytes:
@@ -229,39 +232,58 @@ def _interval_cost_feed(*readings: tuple[int, int], uom: int = 72) -> bytes:
 </feed>""".encode()
 
 
-def test_interval_cost_in_thousandths_is_rescaled() -> None:
-    """Alectra reports <cost> in 1/1,000 of a dollar (issue #33): 130 for ~1.2 kWh is 13¢.
+def test_interval_cost_quirk_reads_cost_in_thousandths() -> None:
+    """Alectra reports <cost> in 1/1,000 of a dollar (issue #33): 130 for 1.2 kWh is 13¢.
 
-    Read at ESPI's 1/100,000 that's 0.1¢/kWh — no real tariff — so the series is recognized as
-    thousandths and every reading's cost scaled up 100×, the uncosted reading left alone.
+    The server's `intervalCostInThousandths` quirk says so; usage and an uncosted reading are
+    untouched.
     """
-    _updated, usage_points = parse_usage_feed(_interval_cost_feed((1200, 130), (1100, 120), (0, 0)))
-    series = usage_points[0].series[0]
-    assert series.cost_in_thousandths is True
-    assert [r.cost for r in series.readings] == [0.13, 0.12, 0.0]
+    _updated, usage_points = parse_usage_feed(
+        _interval_cost_feed((1200, 130), (1100, 120), (0, 0)), interval_cost_in_thousandths=True
+    )
+    readings = usage_points[0].series[0].readings
+    assert [r.cost for r in readings] == [0.13, 0.12, 0.0]
+    assert [r.value for r in readings] == [1200.0, 1100.0, 0.0]
 
 
-def test_interval_cost_at_spec_scale_is_left_alone() -> None:
-    """The same energy at 13¢ in ESPI's own 1/100,000 is a real price, and stays as it is."""
-    _updated, usage_points = parse_usage_feed(_interval_cost_feed((1200, 13000), (1100, 12000)))
-    series = usage_points[0].series[0]
-    assert series.cost_in_thousandths is False
-    assert [r.cost for r in series.readings] == [0.13, 0.12]
+def test_without_the_interval_cost_quirk_cost_follows_the_spec() -> None:
+    """No quirk: <cost> is ESPI's 1/100,000, whatever price that implies."""
+    _updated, usage_points = parse_usage_feed(_interval_cost_feed((1200, 130), (1100, 120)))
+    assert [r.cost for r in usage_points[0].series[0].readings] == [0.0013, 0.0012]
 
 
-def test_interval_cost_scale_needs_a_priced_watt_hour_series() -> None:
-    """Without both energy and a positive cost there's no price to judge, so the spec scale holds.
+def test_implausibly_cheap_interval_cost_warns_once(caplog: pytest.LogCaptureFixture) -> None:
+    """A series priced below any real tariff gets one warning that its utility may need a quirk.
 
-    Covers the zero-cost placeholder Milton puts on its register, an all-free series, and a unit
-    we can't price (here therms, uom 169).
+    It's a hint only: the cost is left at the spec scale, and a repeat poll doesn't warn again.
     """
-    for feed in (
-        _interval_cost_feed((1200, 0), (1100, 0)),
-        _interval_cost_feed((0, 130)),
-        _interval_cost_feed((1200, 130), uom=169),
-    ):
+    espi._WARNED_COST_SCALE.clear()
+    feed = _interval_cost_feed((1200, 130), (1100, 120))
+    with caplog.at_level(logging.WARNING, logger=espi.__name__):
         _updated, usage_points = parse_usage_feed(feed)
-        assert usage_points[0].series[0].cost_in_thousandths is False
+        parse_usage_feed(feed)
+    assert usage_points[0].series[0].readings[0].cost == 0.0013
+    warnings = [r for r in caplog.records if "non-standard scale" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "MR1" in warnings[0].getMessage()
+
+
+def test_plausible_or_unpriceable_interval_cost_does_not_warn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No warning for a real price, for the same feed under the quirk, or with no price to judge.
+
+    The last covers Milton's zero-cost register placeholder, a series with no energy, and a unit
+    we can't price (therms, uom 169).
+    """
+    espi._WARNED_COST_SCALE.clear()
+    with caplog.at_level(logging.WARNING, logger=espi.__name__):
+        parse_usage_feed(_interval_cost_feed((1200, 13000), (1100, 12000)))
+        parse_usage_feed(_interval_cost_feed((1200, 130)), interval_cost_in_thousandths=True)
+        parse_usage_feed(_interval_cost_feed((1200, 0), (1100, 0)))
+        parse_usage_feed(_interval_cost_feed((0, 130)))
+        parse_usage_feed(_interval_cost_feed((1200, 130), uom=169))
+    assert not [r for r in caplog.records if "non-standard scale" in r.getMessage()]
 
 
 # Burlington-shaped feed: a feed-level <updated> AND an <updated> on every entry, which is what

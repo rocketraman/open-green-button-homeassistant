@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
+import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.greenbutton.api import (
@@ -17,6 +18,7 @@ from custom_components.greenbutton.api import (
     MeterReadingSeries,
     NormalizedReadingType,
     UsagePoint,
+    UsageReading,
     UsageResponse,
 )
 from custom_components.greenbutton.const import (
@@ -194,6 +196,56 @@ async def test_diagnostics_summarizes_response_with_cost_details(hass: HomeAssis
     assert len(s["cost_details"]) == 2
     notes = {d["note"] for d in s["cost_details"]}
     assert notes == {"Regulatory Charges", "Off Peak-Summer"}
+
+
+async def test_diagnostics_shows_series_cost_price_and_quirks(hass: HomeAssistant) -> None:
+    """Per-series cost, energy and implied price, plus the quirks the response was parsed under.
+
+    The price is what shows a cost-scale problem at a glance: Alectra read at ESPI's 1/100,000
+    came out at ~0.1¢/kWh (issue #33). Readings without a cost are left out of the price.
+    """
+    entry = _entry_with_data(hass)
+    base = _sample_response()
+    series = base.usage_points[0].series[0]
+    start = datetime(2026, 10, 25, 5, tzinfo=UTC)
+    priced = MeterReadingSeries(
+        meter_reading_id=series.meter_reading_id,
+        reading_type=series.reading_type,
+        readings=[
+            UsageReading(start, 3600, 2000.0, cost=0.2),
+            UsageReading(start + timedelta(hours=1), 3600, 1000.0, cost=0.1),
+            UsageReading(start + timedelta(hours=2), 3600, 500.0),  # no cost: not in the price
+        ],
+    )
+    response = UsageResponse(
+        updated=base.updated,
+        usage_points=[UsagePoint("up1", "ELECTRICITY", series=[priced])],
+        new_credentials=None,
+        quirks=frozenset({"intervalCostInThousandths"}),
+    )
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = _stub_coordinator(response)
+
+    last = (await async_get_config_entry_diagnostics(hass, entry))["last_response"]
+
+    summary = last["usage_points"][0]["series"][0]
+    assert summary["total_cost"] == pytest.approx(0.3)
+    assert summary["total_kwh"] == pytest.approx(3.5)
+    assert summary["implied_price_per_kwh"] == pytest.approx(0.1)
+    assert last["quirks"] == ["intervalCostInThousandths"]
+    json.dumps(last)  # the download is JSON
+
+
+async def test_diagnostics_series_without_cost_has_no_price(hass: HomeAssistant) -> None:
+    """A series with no readings or no per-interval cost reports None, not a misleading zero."""
+    entry = _entry_with_data(hass)
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = _stub_coordinator(_sample_response())
+
+    last = (await async_get_config_entry_diagnostics(hass, entry))["last_response"]
+
+    summary = last["usage_points"][0]["series"][0]
+    assert summary["total_cost"] is None
+    assert summary["implied_price_per_kwh"] is None
+    assert last["quirks"] == []
 
 
 async def test_diagnostics_includes_raw_xml_when_file_present(hass: HomeAssistant) -> None:

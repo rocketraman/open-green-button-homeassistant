@@ -32,7 +32,7 @@ from __future__ import annotations
 import io
 import logging
 import xml.etree.ElementTree as ET  # Element/types only — parsing goes through defusedxml.
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import IO
 
@@ -81,12 +81,17 @@ _TAG_COST = f"{{{_ESPI_NS}}}cost"
 # currency unit.
 _ESPI_COST_SCALE = 100_000.0
 
-# Some feeds report IntervalReading/cost in 1/1,000 instead — see [_interval_cost_in_thousandths].
-# A real electricity price is somewhere around $0.03–$1/kWh; read at 1/100,000, a thousandths feed
+# Alectra reports IntervalReading/cost in 1/1,000 instead (issue #33). Nothing in the feed says so,
+# so the server names it per utility — the `intervalCostInThousandths` quirk.
+_THOUSANDTHS_COST_SCALE = 1_000.0
+
+# A real electricity price is somewhere around $0.03–$1/kWh; a series in 1/1,000 read at 1/100,000
 # comes out 100× lower, at roughly $0.0003–$0.01/kWh. The two ranges don't meet, so this needn't be
-# precise — only below any price a utility actually charges on average.
-_THOUSANDTHS_PRICE_CEILING_PER_KWH = 0.01
-_THOUSANDTHS_RESCALE = _ESPI_COST_SCALE / 1_000.0
+# precise. Only used to warn that a utility may need the quirk — see [_warn_if_cost_looks_scaled].
+_IMPLAUSIBLE_PRICE_PER_KWH = 0.01
+
+# MeterReadings already warned about, so a misscaled feed logs once per run rather than every poll.
+_WARNED_COST_SCALE: set[str] = set()
 _TAG_ACCUM = f"{{{_ESPI_NS}}}accumulationBehaviour"
 _TAG_COMMODITY = f"{{{_ESPI_NS}}}commodity"
 _TAG_CURRENCY = f"{{{_ESPI_NS}}}currency"
@@ -171,6 +176,7 @@ def parse_usage_feed(
     *,
     invert_usage_if_positive_multiplier: bool = False,
     invert_cost_if_positive_multiplier: bool = False,
+    interval_cost_in_thousandths: bool = False,
 ) -> tuple[datetime | None, list[UsagePoint]]:
     """Parse an ESPI usage Atom feed.
 
@@ -182,7 +188,9 @@ def parse_usage_feed(
 
     The two ``invert_*`` flags correct a custodian that sends ``powerOfTenMultiplier`` with the
     wrong sign on its ReadingTypes (usage) or its UsageSummary cost lines (cost) — see
-    [_power_of_ten]. They come from the server's quirks of the same names, never decided here.
+    [_power_of_ten]. ``interval_cost_in_thousandths`` reads IntervalReading ``<cost>`` in 1/1,000
+    of the currency rather than 1/100,000. All three come from the server's quirks of the same
+    names, never decided here.
     """
     # iterparse wants a stream, not a bytes literal — wrap if needed.
     stream = io.BytesIO(source) if isinstance(source, bytes) else source
@@ -228,6 +236,9 @@ def parse_usage_feed(
                 raw_summaries,
                 invert_usage=invert_usage_if_positive_multiplier,
                 invert_cost=invert_cost_if_positive_multiplier,
+                interval_cost_scale=(
+                    _THOUSANDTHS_COST_SCALE if interval_cost_in_thousandths else _ESPI_COST_SCALE
+                ),
             )
             elem.clear()
 
@@ -364,6 +375,7 @@ def _classify_entry(
     *,
     invert_usage: bool = False,
     invert_cost: bool = False,
+    interval_cost_scale: float = _ESPI_COST_SCALE,
 ) -> None:
     # Atom content wrapper → first child tells us the payload type.
     content = entry.find(f"{{{_ATOM_NS}}}content")
@@ -403,7 +415,7 @@ def _classify_entry(
         interval_blocks.append(
             _RawIntervalBlock(
                 meter_reading_id=mr_id_from_up,
-                readings=list(_parse_interval_readings(payload)),
+                readings=list(_parse_interval_readings(payload, interval_cost_scale)),
             )
         )
     elif payload.tag == _TAG_READING_TYPE:
@@ -489,8 +501,8 @@ def _parse_cost_detail(elem: ET.Element, *, invert_cost: bool = False) -> CostDe
     )
 
 
-def _parse_interval_readings(block: ET.Element):
-    """Yield UsageReading objects from an IntervalBlock element."""
+def _parse_interval_readings(block: ET.Element, cost_scale: float = _ESPI_COST_SCALE):
+    """Yield UsageReading objects from an IntervalBlock, ``<cost>`` divided by [cost_scale]."""
     for r in block.findall(_TAG_INTERVAL_READING):
         time_period = r.find(_TAG_TIME_PERIOD)
         if time_period is None:
@@ -510,20 +522,17 @@ def _parse_interval_readings(block: ET.Element):
             start=datetime.fromtimestamp(start_epoch, tz=UTC),
             duration_seconds=duration_seconds,
             value=value,
-            cost=_cost_amount(r.findtext(_TAG_COST)),
+            cost=_cost_amount(r.findtext(_TAG_COST), cost_scale),
         )
 
 
-def _cost_amount(text: str | None) -> float | None:
-    """Per-interval `<cost>` (ESPI 1/100,000 currency units) → float currency amount, or None.
-
-    A series found to be in 1/1,000 instead is rescaled once it's assembled — see
-    [_interval_cost_in_thousandths].
-    """
+def _cost_amount(text: str | None, scale: float = _ESPI_COST_SCALE) -> float | None:
+    """Per-interval `<cost>` (ESPI 1/100,000 currency units, unless [scale] says otherwise) →
+    float currency amount, or None."""
     if text is None:
         return None
     try:
-        return int(text) / _ESPI_COST_SCALE
+        return int(text) / scale
     except (TypeError, ValueError):
         return None
 
@@ -585,25 +594,11 @@ def _assemble(
             ]
             readings.sort(key=lambda r: r.start)
             reading_type = _normalize_reading_type(rt)
-            in_thousandths = _interval_cost_in_thousandths(readings, reading_type)
-            if in_thousandths:
-                _LOGGER.info(
-                    "MeterReading %s reports interval <cost> in 1/1,000 of the currency unit, "
-                    "not ESPI's 1/100,000; scaling its costs accordingly",
-                    mr_id,
-                )
-                readings = [
-                    replace(r, cost=r.cost * _THOUSANDTHS_RESCALE) if r.cost is not None else r
-                    for r in readings
-                ]
-            series.append(
-                MeterReadingSeries(
-                    meter_reading_id=mr_id,
-                    reading_type=reading_type,
-                    readings=readings,
-                    cost_in_thousandths=in_thousandths,
-                )
+            one = MeterReadingSeries(
+                meter_reading_id=mr_id, reading_type=reading_type, readings=readings
             )
+            _warn_if_cost_looks_scaled(one)
+            series.append(one)
         # Fill in the parent UsagePoint's currency on each summary that didn't carry one of
         # its own.
         fallback_currency = currency_by_up.get(up_id)
@@ -622,28 +617,30 @@ def _assemble(
     return out
 
 
-def _interval_cost_in_thousandths(
-    readings: list[UsageReading], reading_type: NormalizedReadingType
-) -> bool:
-    """Whether a series' interval `<cost>` is in 1/1,000 of the currency unit, not 1/100,000.
+def _warn_if_cost_looks_scaled(series: MeterReadingSeries) -> None:
+    """Warn when a series' interval cost prices its energy below any real tariff.
 
-    ESPI puts IntervalReading/cost in 1/100,000 of the currency, but Alectra (savagedata) reports
-    it in 1/1,000 — ``<cost>130</cost>`` for 13¢ of energy — and nothing in the feed says which
-    (issue #33). The implied price tells them apart: read at 1/100,000, a thousandths feed prices
-    its energy 100× too cheap, under [_THOUSANDTHS_PRICE_CEILING_PER_KWH].
-
-    Judged on the whole series' total cost over total energy, so a few free or credited hours
-    can't tip it. Only watt-hour series carry a price we can sanity-check; anything else keeps the
-    spec scale.
+    That's the signature of a custodian reporting ``<cost>`` in another scale than the one we read
+    it in — Alectra's 1/1,000 before the server's ``intervalCostInThousandths`` quirk (issue #33).
+    Only a hint for the maintainers: the scale is never changed here, because a guess that misfires
+    would silently restate someone's cost. Judged on [MeterReadingSeries.implied_price_per_kwh],
+    so a few free or credited hours can't trip it. An all-free series (Milton's register
+    placeholder) prices at zero and is left alone.
     """
-    if reading_type.unit_of_measure != "WATT_HOURS":
-        return False
-    priced = [r for r in readings if r.cost is not None and r.value > 0]
-    kwh = sum(r.value for r in priced) / 1000
-    cost = sum(r.cost for r in priced if r.cost is not None)
-    if kwh <= 0 or cost <= 0:
-        return False
-    return cost / kwh < _THOUSANDTHS_PRICE_CEILING_PER_KWH
+    price = series.implied_price_per_kwh
+    if price is None or not 0 < price < _IMPLAUSIBLE_PRICE_PER_KWH:
+        return
+    if series.meter_reading_id in _WARNED_COST_SCALE:
+        return
+    _WARNED_COST_SCALE.add(series.meter_reading_id)
+    _LOGGER.warning(
+        "MeterReading %s prices its energy at %.4f per kWh, far below any real tariff — its "
+        "utility probably reports interval <cost> in a non-standard scale and needs a server "
+        "quirk. Please report this at "
+        "https://github.com/rocketraman/open-green-button-homeassistant/issues",
+        series.meter_reading_id,
+        price,
+    )
 
 
 def _with_currency_default(s: BillingSummary, fallback: int | None) -> BillingSummary:

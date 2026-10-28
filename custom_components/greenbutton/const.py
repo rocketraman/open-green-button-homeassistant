@@ -109,6 +109,8 @@ CONF_LAST_IMPORTED = "last_imported"
 # cost lines (cost). See [espi._power_of_ten].
 QUIRK_INVERT_USAGE_IF_POSITIVE_MULTIPLIER = "invertUsageIfPositiveMultiplier"
 QUIRK_INVERT_COST_IF_POSITIVE_MULTIPLIER = "invertCostIfPositiveMultiplier"
+# IntervalReading <cost> is read in 1/1,000 of the currency unit, not 1/100,000 (Alectra, #33).
+QUIRK_INTERVAL_COST_IN_THOUSANDTHS = "intervalCostInThousandths"
 
 # The quirk set (sorted list) the entry's stored statistics were computed under. A poll that
 # arrives with a different set means those rows were scaled by rules that no longer apply, so the
@@ -324,11 +326,7 @@ CONF_IMPORT_LOGIC_REVISION = "import_logic_revision"
 #       the register in the current poll: a normal poll can't show that an earlier one lacked
 #       the sibling, and rebuilding every Milton entry on that suspicion would re-pull history
 #       for accounts that never hit it. (PR #17)
-#   7 — per-interval <cost> reported in 1/1,000 of the currency unit was divided by ESPI's
-#       1/100,000 like every other feed, so the cost statistic came out 100× too small (~3¢ for
-#       a day's ~$2.70 of energy). Affects Alectra (savagedata). Recognized from the feed: a
-#       series whose costs price its energy far below any real tariff. (issue #33)
-IMPORT_LOGIC_REVISION = 7
+IMPORT_LOGIC_REVISION = 6
 
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see

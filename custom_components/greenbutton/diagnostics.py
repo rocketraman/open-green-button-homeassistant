@@ -126,6 +126,11 @@ def _summarize_response(response: UsageResponse | None) -> dict[str, Any] | None
                         "last_reading_start": (
                             s.readings[-1].start.isoformat() if s.readings else None
                         ),
+                        # Per-interval cost as parsed, and the price it implies — the quickest
+                        # check that <cost> was read in the right scale (issue #33).
+                        "total_cost": s.total_cost,
+                        "total_kwh": s.total_kwh,
+                        "implied_price_per_kwh": s.implied_price_per_kwh,
                     }
                     for s in up.series
                 ],
@@ -145,6 +150,8 @@ def _summarize_response(response: UsageResponse | None) -> dict[str, Any] | None
             for up in response.usage_points
         ],
         "new_credentials_present": response.new_credentials is not None,
+        # The server's per-utility parsing quirks (`OpenGB-Quirks`) this response was parsed under.
+        "quirks": sorted(response.quirks),
     }
 
 

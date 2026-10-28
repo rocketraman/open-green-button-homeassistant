@@ -162,6 +162,30 @@ async def test_fetch_usage_without_quirks_follows_the_spec(
     assert [r.value for r in readings] == [1_000_000.0, 1_500_000.0]
 
 
+async def test_fetch_usage_applies_the_servers_interval_cost_quirk(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """`intervalCostInThousandths` reads IntervalReading <cost> in 1/1,000 (Alectra, issue #33)."""
+    feed = MOCK_USAGE_XML.replace(
+        b"<espi:IntervalReading>", b"<espi:IntervalReading><espi:cost>130</espi:cost>"
+    )
+    aioclient_mock.post(
+        PROXY_USAGE_URL,
+        content=feed,
+        headers={
+            "Content-Type": "application/atom+xml",
+            "OpenGB-Quirks": "intervalCostInThousandths",
+        },
+    )
+
+    response = await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
+
+    assert response.quirks == frozenset({"intervalCostInThousandths"})
+    readings = response.usage_points[0].series[0].readings
+    assert [r.cost for r in readings] == [0.13, 0.13]
+
+
 async def test_fetch_usage_passes_published_window(
     hass: HomeAssistant,
     aioclient_mock: AiohttpClientMocker,
