@@ -263,3 +263,105 @@ def test_elexicon_excludes_amount_due_and_balance_forward_subtotals() -> None:
     assert "Balance Forward" not in charged_notes
     # If "Amount Due" ($172.03) leaked in, the total would double to ~$344.
     assert round(summary.total_cost, 2) == 172.03
+
+
+# --- Enbridge Gas ----------------------------------------------------------------------------
+#
+# Every cost-line powerOfTenMultiplier has the wrong sign (the server's
+# `invertCostIfPositiveMultiplier` quirk), and
+# the itemized lines don't reconcile: they include $/m³ rates and the supply charge twice, under
+# two names. billLastPeriod agrees with the "Amount Due" line, which settles the bill's scale.
+# Structure from a real Enbridge feed; amounts are synthetic.
+_ENBRIDGE_USAGE_SUMMARY_XML = """
+<UsageSummary xmlns="http://naesb.org/espi">
+  <billingPeriod><duration>2592000</duration><start>1788048000</start></billingPeriod>
+  <billLastPeriod>41250</billLastPeriod>
+  <billToDate>41250</billToDate>
+  <costAdditionalLastPeriod>0</costAdditionalLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>41250</amount><note>Amount Due</note>
+    <measurement><powerOfTenMultiplier>3</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>10</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>4750</amount><note>HST ($)</note>
+    <measurement><powerOfTenMultiplier>3</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>5</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>6000</amount><note>Gas Supply Charge</note>
+    <measurement><powerOfTenMultiplier>3</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>2</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>6000</amount><note>Gas Service Provider Supply Charge ($)</note>
+    <measurement><powerOfTenMultiplier>3</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>2</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>30500</amount><note>Customer charge</note>
+    <measurement><powerOfTenMultiplier>3</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>10</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>173871</amount><note>Total Gas Supply Rate $/m3 (net)</note>
+    <measurement><powerOfTenMultiplier>3</powerOfTenMultiplier><uom>80</uom></measurement>
+    <itemKind>10</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <note>Adjustment Factor (atmospheric)</note>
+    <measurement><powerOfTenMultiplier>6</powerOfTenMultiplier><uom>114</uom><value>1004000</value></measurement>
+    <itemKind>10</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <currency>124</currency>
+</UsageSummary>
+"""
+
+
+def _parse_enbridge_summary(*, bill: int = 41250, amount_due: int = 41250) -> BillingSummary:
+    xml = _ENBRIDGE_USAGE_SUMMARY_XML.replace(
+        "<billLastPeriod>41250</billLastPeriod>", f"<billLastPeriod>{bill}</billLastPeriod>"
+    ).replace("<amount>41250</amount>", f"<amount>{amount_due}</amount>")
+    summary = espi._parse_usage_summary(_xml_fromstring(xml), invert_cost=True)
+    assert summary is not None
+    return summary
+
+
+def test_enbridge_inverted_multipliers_scale_amounts_down() -> None:
+    """Under the quirk a line at 3 is ÷1,000: 4750 is $4.75, not $4,750,000."""
+    by_note = {d.note: d for d in _parse_enbridge_summary().cost_details}
+    assert round(by_note["HST ($)"].amount, 2) == 4.75
+    assert by_note["HST ($)"].amount_power_of_ten == -3
+
+
+def test_enbridge_total_is_the_bill_that_matches_its_amount_due() -> None:
+    """$41.25 — not the itemized sum, which counts supply twice and adds a $173.87/m³ rate."""
+    assert round(_parse_enbridge_summary().total_cost, 2) == 41.25
+
+
+def test_enbridge_zero_bill_is_zero() -> None:
+    """A $0 bill matches its $0 Amount Due, so the unreconcilable itemization is never summed."""
+    assert _parse_enbridge_summary(bill=0, amount_due=0).total_cost == 0
+
+
+def test_a_bill_that_disagrees_with_its_amount_due_falls_back_to_the_itemization() -> None:
+    """The match is the evidence; without it the per-line-scaled rule applies as before."""
+    summary = _parse_enbridge_summary(bill=99999)
+    assert round(summary.total_cost, 2) != 100.0
+    assert summary.total_cost != 41.25
+
+
+def test_elexicon_bill_does_not_match_its_amount_due() -> None:
+    """savagedata's billLastPeriod (1/1,000) never equals its Amount Due raw (at 10^-2)."""
+    summary = _parse_elexicon_summary()
+    amount_due = next(d for d in summary.cost_details if d.note == "Amount Due")
+    assert amount_due.amount_raw != summary.bill_last_period_raw
+    assert round(summary.total_cost, 2) == 172.03
+
+
+def test_without_the_cost_quirk_enbridge_amounts_follow_the_spec() -> None:
+    """The usage quirk alone doesn't touch cost lines: 3 stays ×1,000."""
+    summary = espi._parse_usage_summary(_xml_fromstring(_ENBRIDGE_USAGE_SUMMARY_XML))
+    assert summary is not None
+    hst = next(d for d in summary.cost_details if d.note == "HST ($)")
+    assert hst.amount_power_of_ten == 3

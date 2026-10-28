@@ -1,7 +1,11 @@
 """Parser regression tests for custodian-specific ESPI feed shapes."""
 
+import logging
 from datetime import UTC, datetime
 
+import pytest
+
+from custom_components.greenbutton import espi
 from custom_components.greenbutton.espi import (
     _accumulation,
     _flow_direction,
@@ -137,6 +141,8 @@ def test_mixed_delta_and_bulk_series_parse_as_distinct_series() -> None:
 # (.../UsagePoint/{up}/MeterReading/{mr}/IntervalBlock/{ib}) and the MeterReading has NO flat
 # rel="related" espi-entry/UsagePoint link — only its hierarchical self URL. The parser must derive
 # the parent UsagePoint from that path, or interval readings never attach (the "0 readings" bug).
+# Values are milliwatt-hours (powerOfTenMultiplier -3) and costs are at ESPI's 1/100,000: 795 Wh
+# for $0.087 is ~11¢/kWh.
 _SAVAGEDATA_FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
   <id>urn:uuid:f</id>
@@ -170,7 +176,7 @@ _SAVAGEDATA_FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
   </entry>
   <entry xmlns:espi="http://naesb.org/espi">
     <link rel="self" href="https://sd/ReadingType/RT1"/>
-    <content><espi:ReadingType><espi:powerOfTenMultiplier>0</espi:powerOfTenMultiplier><espi:uom>72</espi:uom><espi:commodity>1</espi:commodity><espi:flowDirection>1</espi:flowDirection></espi:ReadingType></content>
+    <content><espi:ReadingType><espi:powerOfTenMultiplier>-3</espi:powerOfTenMultiplier><espi:uom>72</espi:uom><espi:commodity>1</espi:commodity><espi:flowDirection>1</espi:flowDirection></espi:ReadingType></content>
   </entry>
 </feed>"""
 
@@ -182,7 +188,7 @@ def test_hierarchical_urls_without_related_usagepoint_link_still_attach_readings
     assert len(usage_points) == 1
     readings = [r for series in usage_points[0].series for r in series.readings]
     assert len(readings) == 2, f"expected 2 readings, got {len(readings)}"
-    assert [r.value for r in readings] == [795000.0, 5271000.0]
+    assert [r.value for r in readings] == [795.0, 5271.0]  # milliwatt-hours at 10^-3
 
 
 def test_per_interval_cost_parsed_when_present_else_none() -> None:
@@ -192,6 +198,92 @@ def test_per_interval_cost_parsed_when_present_else_none() -> None:
     readings = usage_points[0].series[0].readings
     assert readings[0].cost == 0.087  # <cost>8700</cost>
     assert readings[1].cost is None  # second reading has no <cost>
+
+
+def _interval_cost_feed(*readings: tuple[int, int], uom: int = 72) -> bytes:
+    """A one-series feed of hourly (value Wh, raw <cost>) readings at powerOfTenMultiplier 0."""
+    interval_readings = "".join(
+        f"<espi:IntervalReading><espi:cost>{cost}</espi:cost><espi:timePeriod>"
+        f"<espi:duration>3600</espi:duration><espi:start>{1761364800 + i * 3600}</espi:start>"
+        f"</espi:timePeriod><espi:value>{value}</espi:value></espi:IntervalReading>"
+        for i, (value, cost) in enumerate(readings)
+    )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <id>urn:uuid:f</id>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="self" href="https://sd/Subscription/s/UsagePoint/UP1"/>
+    <content><espi:UsagePoint><espi:ServiceCategory><espi:kind>0</espi:kind></espi:ServiceCategory></espi:UsagePoint></content>
+  </entry>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="self" href="https://sd/Subscription/s/UsagePoint/UP1/MeterReading/MR1"/>
+    <link rel="related" type="espi-entry/ReadingType" href="https://sd/ReadingType/RT1"/>
+    <content><espi:MeterReading/></content>
+  </entry>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="up" type="espi-feed/IntervalBlock" href="https://sd/Subscription/s/UsagePoint/UP1/MeterReading/MR1/IntervalBlock"/>
+    <link rel="self" href="https://sd/Subscription/s/UsagePoint/UP1/MeterReading/MR1/IntervalBlock/IB1"/>
+    <content><espi:IntervalBlock>{interval_readings}</espi:IntervalBlock></content>
+  </entry>
+  <entry xmlns:espi="http://naesb.org/espi">
+    <link rel="self" href="https://sd/ReadingType/RT1"/>
+    <content><espi:ReadingType><espi:powerOfTenMultiplier>0</espi:powerOfTenMultiplier><espi:uom>{uom}</espi:uom><espi:commodity>1</espi:commodity><espi:flowDirection>1</espi:flowDirection></espi:ReadingType></content>
+  </entry>
+</feed>""".encode()
+
+
+def test_interval_cost_quirk_reads_cost_in_thousandths() -> None:
+    """Alectra reports <cost> in 1/1,000 of a dollar (issue #33): 130 for 1.2 kWh is 13¢.
+
+    The server's `intervalCostInThousandths` quirk says so; usage and an uncosted reading are
+    untouched.
+    """
+    _updated, usage_points = parse_usage_feed(
+        _interval_cost_feed((1200, 130), (1100, 120), (0, 0)), interval_cost_in_thousandths=True
+    )
+    readings = usage_points[0].series[0].readings
+    assert [r.cost for r in readings] == [0.13, 0.12, 0.0]
+    assert [r.value for r in readings] == [1200.0, 1100.0, 0.0]
+
+
+def test_without_the_interval_cost_quirk_cost_follows_the_spec() -> None:
+    """No quirk: <cost> is ESPI's 1/100,000, whatever price that implies."""
+    _updated, usage_points = parse_usage_feed(_interval_cost_feed((1200, 130), (1100, 120)))
+    assert [r.cost for r in usage_points[0].series[0].readings] == [0.0013, 0.0012]
+
+
+def test_implausibly_cheap_interval_cost_warns_once(caplog: pytest.LogCaptureFixture) -> None:
+    """A series priced below any real tariff gets one warning that its utility may need a quirk.
+
+    It's a hint only: the cost is left at the spec scale, and a repeat poll doesn't warn again.
+    """
+    espi._WARNED_COST_SCALE.clear()
+    feed = _interval_cost_feed((1200, 130), (1100, 120))
+    with caplog.at_level(logging.WARNING, logger=espi.__name__):
+        _updated, usage_points = parse_usage_feed(feed)
+        parse_usage_feed(feed)
+    assert usage_points[0].series[0].readings[0].cost == 0.0013
+    warnings = [r for r in caplog.records if "non-standard scale" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "MR1" in warnings[0].getMessage()
+
+
+def test_plausible_or_unpriceable_interval_cost_does_not_warn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No warning for a real price, for the same feed under the quirk, or with no price to judge.
+
+    The last covers Milton's zero-cost register placeholder, a series with no energy, and a unit
+    we can't price (therms, uom 169).
+    """
+    espi._WARNED_COST_SCALE.clear()
+    with caplog.at_level(logging.WARNING, logger=espi.__name__):
+        parse_usage_feed(_interval_cost_feed((1200, 13000), (1100, 12000)))
+        parse_usage_feed(_interval_cost_feed((1200, 130)), interval_cost_in_thousandths=True)
+        parse_usage_feed(_interval_cost_feed((1200, 0), (1100, 0)))
+        parse_usage_feed(_interval_cost_feed((0, 130)))
+        parse_usage_feed(_interval_cost_feed((1200, 130), uom=169))
+    assert not [r for r in caplog.records if "non-standard scale" in r.getMessage()]
 
 
 # Burlington-shaped feed: a feed-level <updated> AND an <updated> on every entry, which is what
@@ -388,3 +480,32 @@ def test_service_kind_codes_follow_the_espi_schema() -> None:
     assert _service_kind(5) == "REFUSE"
     assert _service_kind(6) == "SEWERAGE"
     assert _service_kind(None) == "UNKNOWN"
+
+
+def test_invert_usage_if_positive_multiplier() -> None:
+    """The server's `invertUsageIfPositiveMultiplier` quirk: 3 means ÷1,000; -3 and 0 stay put.
+
+    Only a positive multiplier flips, so a custodian that corrects its feed before the quirk is
+    switched off is still read right.
+    """
+    for sent, expected in (("3", -3), ("-3", -3), ("0", 0)):
+        feed = _MIXED_ACCUMULATION_FEED.replace(
+            b"<espi:powerOfTenMultiplier>0</espi:powerOfTenMultiplier>",
+            f"<espi:powerOfTenMultiplier>{sent}</espi:powerOfTenMultiplier>".encode(),
+        )
+        _updated, usage_points = parse_usage_feed(feed, invert_usage_if_positive_multiplier=True)
+        hourly = next(s for s in usage_points[0].series if s.meter_reading_id == "MR_HOURLY")
+        assert hourly.reading_type.power_of_ten_multiplier == expected
+        assert hourly.readings[0].value == 1000 * 10**expected
+
+
+def test_the_cost_quirk_leaves_reading_multipliers_alone() -> None:
+    """`invertCostIfPositiveMultiplier` is about UsageSummary cost lines only — a custodian may get
+    its usage scale right and its cost scale wrong."""
+    feed = _MIXED_ACCUMULATION_FEED.replace(
+        b"<espi:powerOfTenMultiplier>0</espi:powerOfTenMultiplier>",
+        b"<espi:powerOfTenMultiplier>3</espi:powerOfTenMultiplier>",
+    )
+    _updated, usage_points = parse_usage_feed(feed, invert_cost_if_positive_multiplier=True)
+    hourly = next(s for s in usage_points[0].series if s.meter_reading_id == "MR_HOURLY")
+    assert hourly.reading_type.power_of_ten_multiplier == 3

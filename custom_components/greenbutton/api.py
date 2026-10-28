@@ -25,7 +25,12 @@ from typing import Any
 
 import aiohttp
 
-from .const import API_VERSION
+from .const import (
+    API_VERSION,
+    QUIRK_INTERVAL_COST_IN_THOUSANDTHS,
+    QUIRK_INVERT_COST_IF_POSITIVE_MULTIPLIER,
+    QUIRK_INVERT_USAGE_IF_POSITIVE_MULTIPLIER,
+)
 
 # An async callable that receives raw upstream XML bytes and persists them somewhere.
 # The bytes are released as soon as the call returns — no caller holds a reference.
@@ -88,8 +93,9 @@ class UsageReading:
     duration_seconds: int
     value: float
     # Per-interval cost in the ReadingType's currency (float currency units, already divided out of
-    # ESPI's 1/100,000 raw). Present when the utility itemizes cost on each IntervalReading (e.g.
-    # savagedata/Milton); None when it only bills via a monthly UsageSummary (e.g. Burlington).
+    # ESPI's 1/100,000 raw — or 1/1,000 under the server's `intervalCostInThousandths` quirk).
+    # Present when the utility itemizes cost on each IntervalReading (e.g. savagedata/Milton); None
+    # when it only bills via a monthly UsageSummary (e.g. Burlington).
     cost: float | None = None
 
 
@@ -116,6 +122,35 @@ class MeterReadingSeries:
     reading_type: NormalizedReadingType
     readings: list[UsageReading]
 
+    @property
+    def total_cost(self) -> float | None:
+        """Sum of the readings' per-interval cost; None when no reading carries one."""
+        costs = [r.cost for r in self.readings if r.cost is not None]
+        return sum(costs) if costs else None
+
+    @property
+    def total_kwh(self) -> float | None:
+        """Sum of the readings in kWh; None for a series that isn't in watt-hours."""
+        if self.reading_type.unit_of_measure != "WATT_HOURS":
+            return None
+        return sum(r.value for r in self.readings) / 1000
+
+    @property
+    def implied_price_per_kwh(self) -> float | None:
+        """Total cost over total energy across the readings that carry a cost.
+
+        A sanity check on the cost scale: a real tariff is somewhere around $0.03–$1/kWh, so a
+        price far outside that means ``<cost>`` was read in the wrong scale (issue #33). None for a
+        series that isn't in watt-hours or has no costed energy.
+        """
+        if self.reading_type.unit_of_measure != "WATT_HOURS":
+            return None
+        priced = [r for r in self.readings if r.cost is not None and r.value > 0]
+        kwh = sum(r.value for r in priced) / 1000
+        if kwh <= 0:
+            return None
+        return sum(r.cost for r in priced if r.cost is not None) / kwh
+
 
 # Default ESPI cost scale: monetary amounts are reported in 1/100,000 of the currency unit.
 # savagedata/Elexicon feeds override this per line via <measurement><powerOfTenMultiplier>;
@@ -138,6 +173,10 @@ _NON_CHARGE_NOTES = frozenset(
         "amount due",
     }
 )
+
+
+# The subtotal lines that state a bill's grand total — see [BillingSummary.total_cost].
+_BILL_TOTAL_NOTES = frozenset({"amount due", "total amount due"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,7 +256,10 @@ class BillingSummary:
     def total_cost(self) -> float:
         """Best-effort total cost for *this billing period* in currency units.
 
-        Two feed families need different rules:
+        **A ``billLastPeriod`` that matches its own per-line-scaled "Amount Due" (Enbridge)** is
+        taken at that line's scale and wins outright — see the comment in the body.
+
+        Otherwise two feed families need different rules:
 
         **Per-line-scaled feeds (savagedata/Elexicon).** Each charge line carries its own
         ``powerOfTenMultiplier`` (see [`CostDetail.amount`]) and the itemized charges reconcile
@@ -244,6 +286,21 @@ class BillingSummary:
         itemized $187.73, confirming the subtotal is the wrong number.
         """
         charges = sum(d.amount for d in self.cost_details if d.is_period_charge)
+
+        # A billLastPeriod that is the raw amount of the bill's own per-line-scaled "Amount Due"
+        # is in that line's scale: two fields agreeing settles what neither says alone. Enbridge
+        # (35030 on both, the line at 10^-3 → $35.03) needs this, because its itemized lines
+        # don't reconcile — they mix in $/m³ rates and repeat the supply charge under a second
+        # name. savagedata never matches (172030 against an Amount Due of 17203 at 10^-2), and
+        # bare feeds carry no line multiplier, so neither reaches this.
+        if self.bill_last_period_raw is not None:
+            for d in self.cost_details:
+                if (
+                    d.amount_power_of_ten is not None
+                    and d.normalized_note in _BILL_TOTAL_NOTES
+                    and d.amount_raw == self.bill_last_period_raw
+                ):
+                    return d.amount
 
         # savagedata/Elexicon: per-line-scaled amounts; billLastPeriod is in an untrustworthy
         # scale, so the itemized charges are authoritative.
@@ -291,6 +348,8 @@ class UsageResponse:
     updated: datetime | None
     usage_points: list[UsagePoint]
     new_credentials: NewCredentials | None
+    # The server's per-utility parsing quirks (`OpenGB-Quirks`) this response was parsed under.
+    quirks: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -513,6 +572,7 @@ class OpenGbApi:
             # not drop. Read the headers up front and attach them to every error so the
             # coordinator can persist them before retrying.
             new_credentials = _new_credentials_from_headers(resp.headers)
+            quirks = _quirks_from_headers(resp.headers)
             if resp.status == 401:
                 text = await resp.text()
                 error_code = _safe_json_field(text, "error")
@@ -566,13 +626,19 @@ class OpenGbApi:
             # artifact on disk (which is useful for figuring out *why* it failed).
             await raw_xml_sink(xml_bytes)
 
-        updated, usage_points = parse_usage_feed(xml_bytes)
+        updated, usage_points = parse_usage_feed(
+            xml_bytes,
+            invert_usage_if_positive_multiplier=QUIRK_INVERT_USAGE_IF_POSITIVE_MULTIPLIER in quirks,
+            invert_cost_if_positive_multiplier=QUIRK_INVERT_COST_IF_POSITIVE_MULTIPLIER in quirks,
+            interval_cost_in_thousandths=QUIRK_INTERVAL_COST_IN_THOUSANDTHS in quirks,
+        )
         # xml_bytes goes out of scope here; the only persistent copy is whatever the sink
         # decided to do with it (default: nothing).
         return UsageResponse(
             updated=updated,
             usage_points=usage_points,
             new_credentials=new_credentials,
+            quirks=quirks,
         )
 
     async def fetch_customer(
@@ -691,6 +757,15 @@ def _new_credentials_from_headers(headers: Any) -> NewCredentials | None:
     if not blob or not token:
         return None
     return NewCredentials(encrypted_refresh_blob=blob, proxy_token=token)
+
+
+_HEADER_QUIRKS = "OpenGB-Quirks"
+
+
+def _quirks_from_headers(headers: Any) -> frozenset[str]:
+    """The comma-separated `OpenGB-Quirks` tokens; empty when the utility has none."""
+    raw = headers.get(_HEADER_QUIRKS) or ""
+    return frozenset(token.strip() for token in raw.split(",") if token.strip())
 
 
 def _to_iso_z(dt: datetime) -> str:

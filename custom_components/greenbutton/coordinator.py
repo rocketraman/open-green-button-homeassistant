@@ -43,6 +43,7 @@ from .api import (
 )
 from .const import (
     BACKGROUND_LOAD_ISSUE_URL,
+    CONF_APPLIED_QUIRKS,
     CONF_CUSTOMER_ACCOUNT_ID,
     CONF_CUSTOMER_ADDRESS,
     CONF_CUSTOMER_LABEL,
@@ -232,18 +233,21 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             published_max.isoformat(),
         )
 
-        # Sampled BEFORE the import, while the store still reflects only the previous logic:
-        # afterwards we can't tell a first-ever import from one that appended to older rows,
-        # and that distinction decides whether a repair rebuild is warranted. Only read when a
-        # repair is actually outstanding, so the steady state costs no recorder round-trip.
-        import_migration_pending = (
-            self.entry.data.get(CONF_IMPORT_LOGIC_REVISION) != IMPORT_LOGIC_REVISION
-        )
+        response = self._apply_interval_flows(await self._fetch(published_min, published_max))
+
+        # A repair is owed when the stored rows were computed by superseded import logic, or under
+        # a different set of server quirks than this response was parsed with.
+        import_migration_pending = self.entry.data.get(
+            CONF_IMPORT_LOGIC_REVISION
+        ) != IMPORT_LOGIC_REVISION or self._quirks_changed(response)
+        # Sampled BEFORE the import (the fetch writes nothing), while the store still reflects
+        # only the previous logic: afterwards we can't tell a first-ever import from one that
+        # appended to older rows, and that distinction decides whether a repair rebuild is
+        # warranted. Only read when a repair is actually outstanding, so the steady state costs no
+        # recorder round-trip.
         had_prior_statistics = import_migration_pending and await async_entry_has_statistics(
             self.hass, self.entry.entry_id
         )
-
-        response = self._apply_interval_flows(await self._fetch(published_min, published_max))
 
         total_readings = sum(len(s.readings) for up in response.usage_points for s in up.series)
         _LOGGER.info(
@@ -1066,9 +1070,24 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         succeeded, and taking the entry down over a repair of *old* rows would also stop new ones
         from arriving.
         """
-        from homeassistant.exceptions import HomeAssistantError
-
         stamped_revision = self.entry.data.get(CONF_IMPORT_LOGIC_REVISION, 0)
+
+        # Rows scaled under a different quirk set than this response was parsed with (the server
+        # switched one on or off for this utility) are wrong wherever the quirk bites, and nothing
+        # in the feed can say which rows those are — so with anything stored, rebuild.
+        if self._quirks_changed(response):
+            if had_prior_statistics:
+                return await self._async_rebuild_for_repair(
+                    publish=publish,
+                    reason=(
+                        f"was imported under server quirks {sorted(self._applied_quirks())} "
+                        f"but the server now sends {sorted(response.quirks)}"
+                    ),
+                )
+            # Nothing stored was scaled the old way.
+            self._store_applied_quirks(response.quirks)
+            if stamped_revision == IMPORT_LOGIC_REVISION:
+                return None
 
         # An empty store alone does NOT mean "never imported" — revision 1 rebuilt affected
         # entries by purging first and then importing nothing, which is precisely the damage
@@ -1116,13 +1135,26 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             self._store_import_logic_revision()
             return None
 
+        return await self._async_rebuild_for_repair(
+            publish=publish,
+            reason=(
+                f"imported statistics under superseded logic (revision {stamped_revision}, "
+                f"current is {IMPORT_LOGIC_REVISION}) and its feed has the shape that bug "
+                "applied to"
+            ),
+        )
+
+    async def _async_rebuild_for_repair(
+        self, *, publish: bool, reason: str
+    ) -> UsageResponse | None:
+        """Run the automatic repair rebuild for [_async_migrate_import]. None when it failed."""
+        from homeassistant.exceptions import HomeAssistantError
+
         _LOGGER.warning(
-            "Entry %s imported statistics under superseded logic (revision %d, current is %d) "
-            "and its feed has the shape that bug applied to. Rebuilding this entry's statistics "
-            "from a full history re-fetch — this runs once and may take several minutes",
+            "Entry %s %s. Rebuilding this entry's statistics from a full history re-fetch — "
+            "this runs once and may take several minutes",
             self.entry.entry_id,
-            stamped_revision,
-            IMPORT_LOGIC_REVISION,
+            reason,
         )
         try:
             rebuilt = await self.async_rebuild_statistics(publish=publish)
@@ -1140,14 +1172,28 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             )
             return None
 
-        # The revision stamp is written by [async_rebuild_statistics] itself, so a manual
-        # rebuild counts too — it produces rows under exactly the same current logic.
+        # The revision and quirk stamps are written by [async_rebuild_statistics] itself, so a
+        # manual rebuild counts too — it produces rows under exactly the same current logic.
         # INFO, not WARNING: this is the resolution of the warning above, and HA logs at INFO
         # by default, so it lands in the same log the user is already reading.
         _LOGGER.info(
             "Statistics for entry %s have been rebuilt and are now correct", self.entry.entry_id
         )
         return rebuilt
+
+    def _applied_quirks(self) -> frozenset[str]:
+        """The server quirk set this entry's stored statistics were computed under."""
+        return frozenset(self.entry.data.get(CONF_APPLIED_QUIRKS) or ())
+
+    def _quirks_changed(self, response: UsageResponse) -> bool:
+        """Whether [response] was parsed under different server quirks than the stored rows."""
+        return response.quirks != self._applied_quirks()
+
+    def _store_applied_quirks(self, quirks: frozenset[str]) -> None:
+        """Stamp the entry as holding statistics computed under [quirks]."""
+        self.hass.config_entries.async_update_entry(
+            self.entry, data={**self.entry.data, CONF_APPLIED_QUIRKS: sorted(quirks)}
+        )
 
     def _store_import_logic_revision(self) -> None:
         """Stamp the entry as holding statistics computed by the current import logic."""
@@ -1252,8 +1298,9 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         self._reconcile_data_availability()
         # Everything in the store was just computed by the current logic, so the entry is at the
         # current revision by construction — whether we got here from the `rebuild_statistics`
-        # action or from the automatic repair in [_async_migrate_import].
+        # action or from the automatic repair in [_async_migrate_import]. Likewise the quirks.
         self._store_import_logic_revision()
+        self._store_applied_quirks(response.quirks)
         if publish:
             # Publish the fresh response into the coordinator (updates .data, marks the update
             # successful, notifies listeners, and re-arms the poll) without a second fetch.

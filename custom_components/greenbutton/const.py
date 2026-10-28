@@ -102,6 +102,22 @@ CONF_SCOPE = "scope"
 CONF_API_VERSION = "api_version"
 CONF_LAST_IMPORTED = "last_imported"
 
+# Per-utility parsing quirks the server sends on every /proxy/usage response (`OpenGB-Quirks`,
+# comma-separated). They live server-side so a quirk can be switched off the day a utility fixes
+# its feed, without waiting on users to update this integration.
+# A positive powerOfTenMultiplier is read as negative — on ReadingTypes (usage) or on UsageSummary
+# cost lines (cost). See [espi._power_of_ten].
+QUIRK_INVERT_USAGE_IF_POSITIVE_MULTIPLIER = "invertUsageIfPositiveMultiplier"
+QUIRK_INVERT_COST_IF_POSITIVE_MULTIPLIER = "invertCostIfPositiveMultiplier"
+# IntervalReading <cost> is read in 1/1,000 of the currency unit, not 1/100,000 (Alectra, #33).
+QUIRK_INTERVAL_COST_IN_THOUSANDTHS = "intervalCostInThousandths"
+
+# The quirk set (sorted list) the entry's stored statistics were computed under. A poll that
+# arrives with a different set means those rows were scaled by rules that no longer apply, so the
+# coordinator rebuilds them — see [coordinator.GreenButtonCoordinator._async_migrate_import].
+# Absent ⇒ no quirks.
+CONF_APPLIED_QUIRKS = "applied_quirks"
+
 # Per-utility initial-backfill window, in seconds, as supplied by the server in the claim
 # response (`initialHistorySeconds`). The coordinator uses this to compute `published-min` on
 # the first fetch. Absent on entries created before the server exposed it → coordinator falls
