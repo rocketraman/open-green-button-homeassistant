@@ -157,6 +157,10 @@ class MeterReadingSeries:
 # see [CostDetail.amount].
 _ESPI_COST_SCALE = 100_000.0
 
+# ESPI UnitSymbolKind for money: the only <measurement> uom whose powerOfTenMultiplier scales a cost
+# line's <amount> — see [CostDetail.carries_a_quantity].
+UOM_CURRENCY = 80
+
 # Normalized (lowercased, whitespace-collapsed) notes for UsageSummary detail lines that are
 # NOT this period's charges: running-balance bookkeeping and subtotals that already aggregate
 # the real charge lines. Summing these back in is what triples a bill. See
@@ -191,6 +195,10 @@ class CostDetail:
         ``<measurement><powerOfTenMultiplier>`` (e.g. ``-6`` for Delivery, ``-3`` for TOU
         peaks) and the amount is ``amount_raw × 10^power``. ``amount_power_of_ten`` is None
         for the bare encoding.
+
+    Only a currency (uom 80) measurement scales the amount. ``measurement_uom`` keeps the uom of
+    whatever measurement the line carried, so a line billed in a *quantity* (UtilityAPI's kWh)
+    can be recognized as the shape issue #99 mispriced.
     """
 
     amount_raw: int
@@ -198,6 +206,7 @@ class CostDetail:
     item_kind: int | None
     unit_cost_raw: int | None
     amount_power_of_ten: int | None = None
+    measurement_uom: int | None = None
 
     @property
     def amount(self) -> float:
@@ -209,6 +218,15 @@ class CostDetail:
         if self.amount_power_of_ten is not None:
             return self.amount_raw * (10.0**self.amount_power_of_ten)
         return self.amount_raw / _ESPI_COST_SCALE
+
+    @property
+    def carries_a_quantity(self) -> bool:
+        """A non-zero line whose measurement is of something other than money (UtilityAPI's kWh).
+
+        Its multiplier scales the quantity, not the amount, which stays bare 1/100,000. Before
+        issue #99 such a line was priced at that multiplier — the import-revision-7 damage.
+        """
+        return self.amount_raw != 0 and self.measurement_uom not in (None, UOM_CURRENCY)
 
     @property
     def normalized_note(self) -> str:

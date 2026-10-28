@@ -41,6 +41,7 @@ from typing import IO
 from defusedxml.ElementTree import iterparse as _safe_iterparse
 
 from .api import (
+    UOM_CURRENCY,
     BillingSummary,
     CostDetail,
     CustomerInfo,
@@ -485,11 +486,17 @@ def _parse_cost_detail(elem: ET.Element, *, invert_cost: bool = False) -> CostDe
     line's ``<amount>`` (Delivery at -6, TOU peaks at -3, …); Burlington-style feeds omit it
     and use bare 1/100,000 amounts. Capture the multiplier when present so [CostDetail.amount]
     scales correctly and [BillingSummary.total_cost] can tell the two encodings apart.
+
+    Only a currency measurement (uom 80) scales the amount. UtilityAPI (El Paso Electric) attaches
+    the line's billed *quantity* as a kWh measurement beside a bare 1/100,000 amount, and taking
+    that multiplier as the amount's scale prices a day's usage in the hundreds of thousands of
+    dollars (open-green-button issues/99).
     """
     measurement = elem.find(_TAG_MEASUREMENT)
+    measurement_uom = _int_text(measurement.find(_TAG_UOM)) if measurement is not None else None
     amount_power_of_ten = (
         _power_of_ten(measurement.find(_TAG_POW10), invert_if_positive=invert_cost)
-        if measurement is not None
+        if measurement is not None and measurement_uom == UOM_CURRENCY
         else None
     )
     return CostDetail(
@@ -498,6 +505,7 @@ def _parse_cost_detail(elem: ET.Element, *, invert_cost: bool = False) -> CostDe
         item_kind=_int_text(elem.find(_TAG_ITEM_KIND)),
         unit_cost_raw=_int_text(elem.find(_TAG_UNIT_COST)),
         amount_power_of_ten=amount_power_of_ten,
+        measurement_uom=measurement_uom,
     )
 
 

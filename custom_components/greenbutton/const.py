@@ -326,7 +326,12 @@ CONF_IMPORT_LOGIC_REVISION = "import_logic_revision"
 #       the register in the current poll: a normal poll can't show that an earlier one lacked
 #       the sibling, and rebuilding every Milton entry on that suspicion would re-pull history
 #       for accounts that never hit it. (PR #17)
-IMPORT_LOGIC_REVISION = 6
+#   7 — a UsageSummary cost line's <measurement> multiplier was taken as its amount's scale even
+#       when the measurement was a quantity, not money. UtilityAPI puts the billed kWh there beside
+#       a bare 1/100,000 amount, so every bill was priced ~100,000× too high — $470,770 for a
+#       13 kWh day. Affects UtilityAPI utilities billed through UsageSummary (El Paso Electric);
+#       recognized from any bill in the poll carrying such a line. (open-green-button issues/99)
+IMPORT_LOGIC_REVISION = 7
 
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see

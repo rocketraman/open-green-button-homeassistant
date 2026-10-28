@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- El Paso Electric (and other UtilityAPI utilities that bill through monthly
+  summaries): bill costs came out about 100,000 times too high, for example
+  $470,770 for a 13 kWh day. A bill line that states the kWh it charged for was
+  read as if that kWh figure set the scale of the dollar amount. Affected
+  entries rebuild their statistics automatically once a poll brings in a bill.
+  ([open-green-button#99](https://github.com/rocketraman/open-green-button/issues/99))
+
 ## [0.3.2] - 2026-10-20
 
 ### Added
