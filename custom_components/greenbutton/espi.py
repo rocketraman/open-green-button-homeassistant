@@ -166,7 +166,12 @@ class _RawUsageSummary:
     summary: BillingSummary
 
 
-def parse_usage_feed(source: IO[bytes] | bytes) -> tuple[datetime | None, list[UsagePoint]]:
+def parse_usage_feed(
+    source: IO[bytes] | bytes,
+    *,
+    invert_usage_if_positive_multiplier: bool = False,
+    invert_cost_if_positive_multiplier: bool = False,
+) -> tuple[datetime | None, list[UsagePoint]]:
     """Parse an ESPI usage Atom feed.
 
     Accepts either a file-like object opened in binary mode or a raw `bytes` buffer (as
@@ -174,6 +179,10 @@ def parse_usage_feed(source: IO[bytes] | bytes) -> tuple[datetime | None, list[U
     where ``updated_at`` is the feed-level ``<updated>`` instant and ``usage_points`` is the
     assembled domain tree. Empty ``usage_points`` is a valid result — it means the feed had
     no UsagePoint entries (the test-lab default before they seed your account).
+
+    The two ``invert_*`` flags correct a custodian that sends ``powerOfTenMultiplier`` with the
+    wrong sign on its ReadingTypes (usage) or its UsageSummary cost lines (cost) — see
+    [_power_of_ten]. They come from the server's quirks of the same names, never decided here.
     """
     # iterparse wants a stream, not a bytes literal — wrap if needed.
     stream = io.BytesIO(source) if isinstance(source, bytes) else source
@@ -217,6 +226,8 @@ def parse_usage_feed(source: IO[bytes] | bytes) -> tuple[datetime | None, list[U
                 raw_reading_types,
                 raw_interval_blocks,
                 raw_summaries,
+                invert_usage=invert_usage_if_positive_multiplier,
+                invert_cost=invert_cost_if_positive_multiplier,
             )
             elem.clear()
 
@@ -350,6 +361,9 @@ def _classify_entry(
     reading_types: dict[str, _RawReadingType],
     interval_blocks: list[_RawIntervalBlock],
     summaries: list[_RawUsageSummary],
+    *,
+    invert_usage: bool = False,
+    invert_cost: bool = False,
 ) -> None:
     # Atom content wrapper → first child tells us the payload type.
     content = entry.find(f"{{{_ATOM_NS}}}content")
@@ -404,19 +418,23 @@ def _classify_entry(
             currency=_int_text(payload.find(_TAG_CURRENCY)),
             flow_direction=_int_text(payload.find(_TAG_FLOW)),
             interval_length_seconds=interval_len,
-            power_of_ten_multiplier=_int_text(payload.find(_TAG_POW10)) or 0,
+            power_of_ten_multiplier=(
+                _power_of_ten(payload.find(_TAG_POW10), invert_if_positive=invert_usage) or 0
+            ),
             uom=_int_text(payload.find(_TAG_UOM)),
         )
     elif payload.tag == _TAG_USAGE_SUMMARY:
         # Pin to parent via "related" link, since UsageSummary doesn't appear in the
         # UsagePoint's own link tree.
         up_id_from_related = _related_id(entry, "espi-entry/UsagePoint", "UsagePoint")
-        summary = _parse_usage_summary(payload)
+        summary = _parse_usage_summary(payload, invert_cost=invert_cost)
         if summary is not None:
             summaries.append(_RawUsageSummary(usage_point_id=up_id_from_related, summary=summary))
 
 
-def _parse_usage_summary(payload: ET.Element) -> BillingSummary | None:
+def _parse_usage_summary(
+    payload: ET.Element, *, invert_cost: bool = False
+) -> BillingSummary | None:
     """Build a BillingSummary from the inside of a `<content><espi:UsageSummary>` block."""
     billing_period_elem = payload.find(_TAG_BILLING_PERIOD)
     if billing_period_elem is None:
@@ -441,13 +459,14 @@ def _parse_usage_summary(payload: ET.Element) -> BillingSummary | None:
         bill_last_period_raw=_int_text(payload.find(_TAG_BILL_LAST_PERIOD)),
         cost_additional_last_period_raw=_int_text(payload.find(_TAG_COST_ADDITIONAL_LAST_PERIOD)),
         cost_details=[
-            _parse_cost_detail(d) for d in payload.findall(_TAG_COST_ADDITIONAL_DETAIL_LAST_PERIOD)
+            _parse_cost_detail(d, invert_cost=invert_cost)
+            for d in payload.findall(_TAG_COST_ADDITIONAL_DETAIL_LAST_PERIOD)
         ],
         currency_numeric_code=currency,
     )
 
 
-def _parse_cost_detail(elem: ET.Element) -> CostDetail:
+def _parse_cost_detail(elem: ET.Element, *, invert_cost: bool = False) -> CostDetail:
     """One <espi:costAdditionalDetailLastPeriod> → CostDetail.
 
     savagedata/Elexicon feeds nest a ``<measurement><powerOfTenMultiplier>`` that scales the
@@ -457,7 +476,9 @@ def _parse_cost_detail(elem: ET.Element) -> CostDetail:
     """
     measurement = elem.find(_TAG_MEASUREMENT)
     amount_power_of_ten = (
-        _int_text(measurement.find(_TAG_POW10)) if measurement is not None else None
+        _power_of_ten(measurement.find(_TAG_POW10), invert_if_positive=invert_cost)
+        if measurement is not None
+        else None
     )
     return CostDetail(
         amount_raw=_int_text(elem.find(_TAG_AMOUNT)) or 0,
@@ -803,6 +824,20 @@ def _child_int(parent: ET.Element, *path: str) -> int | None:
             return None
         cur = cur.find(tag)
     return _int_text(cur)
+
+
+def _power_of_ten(elem: ET.Element | None, *, invert_if_positive: bool) -> int | None:
+    """A ``powerOfTenMultiplier``, corrected when the custodian sends it with the wrong sign.
+
+    ESPI's real quantity is value × 10^n. Enbridge Gas scales the raw value UP instead and puts
+    the scale in n with the sign flipped — a 538 m³ month is ``538000`` at ``3``, a $35.03 bill
+    ``35030`` at ``3`` — so ``invert_if_positive`` reads a positive n as −n and leaves the rest.
+    That stays right if the custodian fixes its feed (sending ``-3``) before the server's quirk is
+    switched off; the one thing it gets wrong is a genuinely positive multiplier, which no feed
+    with the quirk sends.
+    """
+    n = _int_text(elem)
+    return -n if invert_if_positive and n is not None and n > 0 else n
 
 
 def _int_text(elem: ET.Element | None) -> int | None:

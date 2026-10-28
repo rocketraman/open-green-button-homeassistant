@@ -115,6 +115,53 @@ async def test_fetch_usage_surfaces_new_credentials_from_response_headers(
     assert response.new_credentials.proxy_token == "rotated_proxy_token"  # noqa: S105
 
 
+async def test_fetch_usage_applies_the_servers_usage_multiplier_quirk(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """`invertUsageIfPositiveMultiplier` reads a ReadingType multiplier of 3 as ÷1,000."""
+    feed = MOCK_USAGE_XML.replace(
+        b"<espi:powerOfTenMultiplier>0</espi:powerOfTenMultiplier>",
+        b"<espi:powerOfTenMultiplier>3</espi:powerOfTenMultiplier>",
+    )
+    aioclient_mock.post(
+        PROXY_USAGE_URL,
+        content=feed,
+        headers={
+            "Content-Type": "application/atom+xml",
+            "OpenGB-Quirks": "invertUsageIfPositiveMultiplier, invertCostIfPositiveMultiplier",
+        },
+    )
+
+    response = await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
+
+    assert response.quirks == frozenset(
+        {"invertUsageIfPositiveMultiplier", "invertCostIfPositiveMultiplier"}
+    )
+    readings = response.usage_points[0].series[0].readings
+    assert [r.value for r in readings] == [1.0, 1.5]
+
+
+async def test_fetch_usage_without_quirks_follows_the_spec(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """No `OpenGB-Quirks` header: a multiplier of 3 is ×1,000, as ESPI says."""
+    feed = MOCK_USAGE_XML.replace(
+        b"<espi:powerOfTenMultiplier>0</espi:powerOfTenMultiplier>",
+        b"<espi:powerOfTenMultiplier>3</espi:powerOfTenMultiplier>",
+    )
+    aioclient_mock.post(
+        PROXY_USAGE_URL, content=feed, headers={"Content-Type": "application/atom+xml"}
+    )
+
+    response = await _api(hass).fetch_usage("blob_value", "token_value")  # noqa: S106
+
+    assert response.quirks == frozenset()
+    readings = response.usage_points[0].series[0].readings
+    assert [r.value for r in readings] == [1_000_000.0, 1_500_000.0]
+
+
 async def test_fetch_usage_passes_published_window(
     hass: HomeAssistant,
     aioclient_mock: AiohttpClientMocker,

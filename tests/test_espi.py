@@ -458,3 +458,32 @@ def test_service_kind_codes_follow_the_espi_schema() -> None:
     assert _service_kind(5) == "REFUSE"
     assert _service_kind(6) == "SEWERAGE"
     assert _service_kind(None) == "UNKNOWN"
+
+
+def test_invert_usage_if_positive_multiplier() -> None:
+    """The server's `invertUsageIfPositiveMultiplier` quirk: 3 means ÷1,000; -3 and 0 stay put.
+
+    Only a positive multiplier flips, so a custodian that corrects its feed before the quirk is
+    switched off is still read right.
+    """
+    for sent, expected in (("3", -3), ("-3", -3), ("0", 0)):
+        feed = _MIXED_ACCUMULATION_FEED.replace(
+            b"<espi:powerOfTenMultiplier>0</espi:powerOfTenMultiplier>",
+            f"<espi:powerOfTenMultiplier>{sent}</espi:powerOfTenMultiplier>".encode(),
+        )
+        _updated, usage_points = parse_usage_feed(feed, invert_usage_if_positive_multiplier=True)
+        hourly = next(s for s in usage_points[0].series if s.meter_reading_id == "MR_HOURLY")
+        assert hourly.reading_type.power_of_ten_multiplier == expected
+        assert hourly.readings[0].value == 1000 * 10**expected
+
+
+def test_the_cost_quirk_leaves_reading_multipliers_alone() -> None:
+    """`invertCostIfPositiveMultiplier` is about UsageSummary cost lines only — a custodian may get
+    its usage scale right and its cost scale wrong."""
+    feed = _MIXED_ACCUMULATION_FEED.replace(
+        b"<espi:powerOfTenMultiplier>0</espi:powerOfTenMultiplier>",
+        b"<espi:powerOfTenMultiplier>3</espi:powerOfTenMultiplier>",
+    )
+    _updated, usage_points = parse_usage_feed(feed, invert_cost_if_positive_multiplier=True)
+    hourly = next(s for s in usage_points[0].series if s.meter_reading_id == "MR_HOURLY")
+    assert hourly.reading_type.power_of_ten_multiplier == 3

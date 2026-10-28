@@ -36,6 +36,7 @@ from custom_components.greenbutton.api import (
     UsageResponse,
 )
 from custom_components.greenbutton.const import (
+    CONF_APPLIED_QUIRKS,
     CONF_CUSTOMER_LABEL,
     CONF_ENCRYPTED_REFRESH_BLOB,
     CONF_IMPORT_LOGIC_REVISION,
@@ -55,6 +56,8 @@ from custom_components.greenbutton.const import (
     INITIAL_FETCH_LOOKBACK,
     LAST_FETCHED_OVERLAP,
     POLL_HISTORY_RETENTION,
+    QUIRK_INVERT_COST_IF_POSITIVE_MULTIPLIER,
+    QUIRK_INVERT_USAGE_IF_POSITIVE_MULTIPLIER,
 )
 from custom_components.greenbutton.coordinator import GreenButtonCoordinator
 from custom_components.greenbutton.storage import xml_cache_path
@@ -2439,3 +2442,101 @@ async def test_import_migration_skips_entry_costed_at_spec_scale(hass: HomeAssis
     api.fetch_usage.assert_awaited_once()  # no rebuild
     clear_mock.assert_not_awaited()
     assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
+# --- Server quirks (`OpenGB-Quirks`) ------------------------------------------------------------
+#
+# A quirk changes how the feed is scaled, so rows stored under a different quirk set than the one
+# a poll arrives with are wrong — and the server can switch a quirk at any time, independent of
+# this integration's version.
+
+
+_ENBRIDGE_QUIRKS = (
+    QUIRK_INVERT_USAGE_IF_POSITIVE_MULTIPLIER,
+    QUIRK_INVERT_COST_IF_POSITIVE_MULTIPLIER,
+)
+_ENBRIDGE_QUIRK_STAMP = sorted(_ENBRIDGE_QUIRKS)
+
+
+def _response_with_quirks(*quirks: str) -> UsageResponse:
+    from dataclasses import replace
+
+    response = _response_with_readings(datetime(2026, 10, 25, 5, tzinfo=UTC), cost=0.13)
+    return replace(response, quirks=frozenset(quirks))
+
+
+async def test_a_new_server_quirk_rebuilds_an_entry_with_stored_rows(hass: HomeAssistant) -> None:
+    """Enbridge's rows were imported before the inverted-multiplier quirk existed: rebuild them."""
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, IMPORT_LOGIC_REVISION)
+    api = _api_returning(_response_with_quirks(*_ENBRIDGE_QUIRKS))
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    assert coordinator.last_exception is None
+    assert api.fetch_usage.await_count == 2  # the poll, then the rebuild's full-history re-fetch
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
+    assert entry.data[CONF_APPLIED_QUIRKS] == _ENBRIDGE_QUIRK_STAMP
+
+
+async def test_a_removed_server_quirk_rebuilds_too(hass: HomeAssistant) -> None:
+    """Switching a quirk off server-side restates rows that were corrected under it."""
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, IMPORT_LOGIC_REVISION)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_APPLIED_QUIRKS: _ENBRIDGE_QUIRK_STAMP}
+    )
+    api = _api_returning(_response_with_quirks())
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    assert api.fetch_usage.await_count == 2
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
+    assert entry.data[CONF_APPLIED_QUIRKS] == []
+
+
+async def test_a_server_quirk_on_a_new_entry_is_stamped_without_a_rebuild(
+    hass: HomeAssistant,
+) -> None:
+    """Nothing stored predates the quirk, so the first import is already right."""
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    api = _api_returning(_response_with_quirks(*_ENBRIDGE_QUIRKS))
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=False)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    api.fetch_usage.assert_awaited_once()
+    clear_mock.assert_not_awaited()
+    assert entry.data[CONF_APPLIED_QUIRKS] == _ENBRIDGE_QUIRK_STAMP
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
+async def test_unchanged_server_quirks_cost_nothing(hass: HomeAssistant) -> None:
+    """The steady state: same quirks, current revision — no recorder check, no rebuild."""
+    hass.set_state(CoreState.running)
+    entry = _entry(hass)
+    _stamp(hass, entry, IMPORT_LOGIC_REVISION)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_APPLIED_QUIRKS: _ENBRIDGE_QUIRK_STAMP}
+    )
+    api = _api_returning(_response_with_quirks(*_ENBRIDGE_QUIRKS))
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats as has_stats_mock, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    api.fetch_usage.assert_awaited_once()
+    has_stats_mock.assert_not_awaited()
+    clear_mock.assert_not_awaited()
