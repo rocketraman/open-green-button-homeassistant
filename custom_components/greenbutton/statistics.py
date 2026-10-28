@@ -398,6 +398,29 @@ def response_cost_may_be_missing_bills(response: UsageResponse) -> bool | None:
     return None
 
 
+def response_cost_lines_carry_a_quantity(response: UsageResponse) -> bool | None:
+    """Whether [response] shows cost lines that were priced off a quantity measurement.
+
+    The revision-7 signal. A UsageSummary line's ``<measurement><powerOfTenMultiplier>`` was taken
+    as its amount's scale whatever the measurement was of. UtilityAPI (El Paso Electric) attaches
+    the billed kWh there beside a bare 1/100,000 amount, so its bills came out ~100,000× too large
+    (open-green-button issues/99). Only a currency (uom 80) measurement scales an amount now.
+
+      - **True** — some line [carries a quantity][api.CostDetail.carries_a_quantity].
+      - **False** — the poll carries bills and none has that shape, or every usage point itemizes
+        per-interval ``<cost>`` and never ran the summary path.
+      - **None** — no bills and no per-interval cost: wait, as for revision 3.
+    """
+    verdicts: list[bool | None] = []
+    for up in response.usage_points:
+        if any(d.carries_a_quantity for s in up.summaries for d in s.cost_details):
+            return True
+        verdicts.append(False if up.summaries or _has_interval_cost(up) else None)
+    if verdicts and all(v is False for v in verdicts):
+        return False
+    return None
+
+
 def response_has_gas_or_water_series(response: UsageResponse) -> bool:
     """True when [response] carries a series whose statistic changed with gas/water support.
 
@@ -578,6 +601,7 @@ _IMPORT_MIGRATION_CHECKS: dict[int, Callable[[UsageResponse], bool | None]] = {
     4: response_has_gas_or_water_series,
     5: response_has_series_sharing_a_statistic,
     6: response_damage_is_judged_from_stored_rows,
+    7: response_cost_lines_carry_a_quantity,
 }
 
 

@@ -26,6 +26,7 @@ from pytest_homeassistant_custom_component.components.recorder.common import (
 
 from custom_components.greenbutton.api import (
     BillingSummary,
+    CostDetail,
     MeterReadingSeries,
     NormalizedReadingType,
     UsagePoint,
@@ -38,6 +39,7 @@ from custom_components.greenbutton.statistics import (
     async_stored_usage_shows_register_days,
     async_stored_usage_shows_resets,
     import_usage_statistics,
+    response_cost_lines_carry_a_quantity,
     response_has_series_sharing_a_statistic,
     response_needs_import_migration,
     statistic_id_for_cost,
@@ -1286,7 +1288,8 @@ def test_migration_rebuilds_gas_and_water_feeds_only() -> None:
     electricity = _commodity_response(
         "ELECTRICITY", _commodity_series("WATT_HOURS", commodity="ELECTRICITY_SECONDARY_METERED")
     )
-    assert response_needs_import_migration(electricity, 3) is False
+    # Not rebuilt. Not stamped either: a poll with no cost can't clear revision 7.
+    assert response_needs_import_migration(electricity, 3) is not True
     # Was written as m³ under the bare id.
     assert response_needs_import_migration(
         _commodity_response("GAS", _commodity_series("CUBIC_FEET")), 3
@@ -1302,7 +1305,7 @@ def test_migration_rebuilds_gas_and_water_feeds_only() -> None:
     # Still unimportable, so there is nothing a rebuild would change.
     assert (
         response_needs_import_migration(_commodity_response("GAS", _commodity_series("OTHER")), 3)
-        is False
+        is not True
     )
 
 
@@ -1409,6 +1412,36 @@ def test_series_sharing_a_statistic_is_the_revision_5_signal() -> None:
     assert not response_has_series_sharing_a_statistic(
         _one_usage_point(delta, _series("DELTA_DATA", "REVERSE", meter_reading_id="mr2"))
     )
+
+
+def _billed_with(*details: CostDetail) -> UsageResponse:
+    summary = BillingSummary(
+        billing_period_start=_APR2,
+        billing_period_duration_seconds=30 * _DAY,
+        bill_last_period_raw=5_432_100,
+        cost_additional_last_period_raw=0,
+        cost_details=list(details),
+        currency_numeric_code=840,
+    )
+    up = UsagePoint(
+        usage_point_id="up1", service_kind="electricity", series=[], summaries=[summary]
+    )
+    return UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+
+
+def _line(amount_raw: int, measurement_uom: int | None) -> CostDetail:
+    return CostDetail(amount_raw, "Energy Charge", 1, None, measurement_uom=measurement_uom)
+
+
+def test_a_cost_line_carrying_a_quantity_is_the_revision_7_signal() -> None:
+    """UtilityAPI's kWh-measured charge line is the shape; currency, bare and zero lines aren't."""
+    assert response_cost_lines_carry_a_quantity(_billed_with(_line(4_120_000, 72))) is True
+    assert response_cost_lines_carry_a_quantity(_billed_with(_line(4_120_000, 80))) is False
+    assert response_cost_lines_carry_a_quantity(_billed_with(_line(4_120_000, None))) is False
+    # Burlington/Elexicon meter-read metadata: a Wh measurement, but nothing was priced off it.
+    assert response_cost_lines_carry_a_quantity(_billed_with(_line(0, 72))) is False
+    # No bills and no per-interval cost: can't tell yet.
+    assert response_cost_lines_carry_a_quantity(_one_usage_point(_series("DELTA_DATA"))) is None
 
 
 @pytest.mark.parametrize(

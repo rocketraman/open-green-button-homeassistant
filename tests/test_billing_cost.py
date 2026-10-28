@@ -365,3 +365,40 @@ def test_without_the_cost_quirk_enbridge_amounts_follow_the_spec() -> None:
     assert summary is not None
     hst = next(d for d in summary.cost_details if d.note == "HST ($)")
     assert hst.amount_power_of_ten == 3
+
+
+# --- UtilityAPI (El Paso Electric) quantity measurements --------------------------------------
+#
+# UtilityAPI documents every <amount> as bare 1/100,000 and uses <measurement> for the line's
+# billed quantity (here kWh: uom 72 at 10^3). Reading that multiplier as the amount's scale
+# flipped the bill into the per-line-scaled family and priced El Paso Electric's daily usage in
+# the hundreds of thousands of dollars (open-green-button issues/99).
+_UTILITYAPI_USAGE_SUMMARY_XML = """
+<UsageSummary xmlns="http://naesb.org/espi">
+  <billingPeriod>
+    <duration>2592000</duration>
+    <start>1778934402</start>
+  </billingPeriod>
+  <billLastPeriod>5432100</billLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>4120000</amount><note>Energy Charge</note>
+    <measurement><powerOfTenMultiplier>3</powerOfTenMultiplier><uom>72</uom><value>412</value></measurement>
+    <itemKind>1</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <costAdditionalDetailLastPeriod>
+    <amount>1312100</amount><note>Customer Charge</note>
+    <itemKind>1</itemKind>
+  </costAdditionalDetailLastPeriod>
+  <currency>840</currency>
+</UsageSummary>
+"""
+
+
+def test_a_quantity_measurement_does_not_scale_the_amount() -> None:
+    """A kWh measurement describes what was billed, not the amount's scale: still 1/100,000."""
+    summary = espi._parse_usage_summary(_xml_fromstring(_UTILITYAPI_USAGE_SUMMARY_XML))
+    assert summary is not None
+    energy = next(d for d in summary.cost_details if d.note == "Energy Charge")
+    assert energy.amount_power_of_ten is None
+    assert round(energy.amount, 2) == 41.20
+    assert round(summary.total_cost, 2) == 54.32
