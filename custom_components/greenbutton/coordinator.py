@@ -78,6 +78,7 @@ from .const import (
 from .statistics import (
     async_clear_statistics_for_entry,
     async_entry_has_statistics,
+    async_flush_recorder,
     async_merge_usage_point_statistics,
     async_stored_usage_shows_register_days,
     async_stored_usage_shows_resets,
@@ -294,7 +295,7 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
                 if rebuilt is not None:
                     return rebuilt
             else:
-                # DEADLOCK GUARD — the rebuild awaits `Recorder.async_block_till_done()`, which
+                # DEADLOCK GUARD — the rebuild awaits [statistics.async_flush_recorder], which
                 # cannot complete before HA has started (the recorder isn't draining its queue
                 # yet) while HA in turn won't start until config-entry setup returns — and the
                 # first refresh runs inside that setup. Same trap [statistics] documents for its
@@ -1241,7 +1242,6 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             HomeAssistantError: the rebuild fetch failed (network / upstream / reauth).
                 Nothing was purged; the existing statistics remain intact.
         """
-        from homeassistant.components.recorder import get_instance
         from homeassistant.exceptions import HomeAssistantError
 
         now = datetime.now(UTC)
@@ -1277,7 +1277,7 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
 
         # The fetch succeeded — now it's safe to purge and re-import from a clean slate.
         cleared = await async_clear_statistics_for_entry(self.hass, self.entry.entry_id)
-        await get_instance(self.hass).async_block_till_done()
+        await async_flush_recorder(self.hass)
         _LOGGER.info(
             "Rebuild for entry %s: cleared %d statistic(s); importing fresh",
             self.entry.entry_id,

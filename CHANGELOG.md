@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Cost could go missing after a rebuild or an automatic repair, for
+  utilities that bill through monthly summaries (Enbridge Gas, Burlington
+  Hydro and others): every bill was skipped as having "no recorded usage",
+  and no cost statistic was written at all. The integration read the usage
+  back before Home Assistant had finished saving it; whether it hit depended
+  on timing. It now waits for the save to finish. An entry with no cost
+  recovers by running the Rebuild statistics action once.
+
 ## [0.3.3] - 2026-10-28
 
 ### Added

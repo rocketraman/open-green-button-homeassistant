@@ -6,13 +6,16 @@ where a recorder is wired up; these focus on the pure-function bits that don't n
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder import statistics as recorder_statistics
 from homeassistant.components.recorder.models import StatisticMeanType
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
@@ -36,6 +39,7 @@ from custom_components.greenbutton.api import (
 from custom_components.greenbutton.const import DOMAIN
 from custom_components.greenbutton.statistics import (
     _recorded_forward_hours,
+    async_flush_recorder,
     async_stored_usage_shows_register_days,
     async_stored_usage_shows_resets,
     import_usage_statistics,
@@ -956,18 +960,17 @@ async def test_summary_cost_deferred_until_hass_started(hass: HomeAssistant) -> 
             new=AsyncMock(return_value=recorded),
         ),
         patch(
-            "custom_components.greenbutton.statistics.get_instance",
-        ) as get_instance_mock,
+            "custom_components.greenbutton.statistics.async_flush_recorder",
+            new=AsyncMock(),
+        ) as flush_mock,
         patch("custom_components.greenbutton.statistics.async_add_external_statistics") as add_mock,
     ):
-        get_instance_mock.return_value.async_block_till_done = AsyncMock()
-
         await import_usage_statistics(
             hass, entry, _summary_only_response(), utility_display_name="X"
         )
 
         # Nothing recorder-blocking may happen while HA is still starting.
-        get_instance_mock.return_value.async_block_till_done.assert_not_awaited()
+        flush_mock.assert_not_awaited()
         assert not [
             c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")
         ]
@@ -977,13 +980,121 @@ async def test_summary_cost_deferred_until_hass_started(hass: HomeAssistant) -> 
         hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
         await hass.async_block_till_done()
 
-        get_instance_mock.return_value.async_block_till_done.assert_awaited_once()
+        flush_mock.assert_awaited_once()
         cost_calls = [
             c for c in add_mock.call_args_list if c.args[1]["statistic_id"].endswith("_cost")
         ]
 
     assert len(cost_calls) == 1
     assert [round(s["sum"], 2) for s in cost_calls[0].args[2]] == [10.0, 40.0]
+
+
+class _HeldImports:
+    """Hold the recorder thread inside every statistics import until [release] is called.
+
+    Patched over the recorder's own ``import_statistics``, which its ``ImportStatisticsTask`` calls
+    on the recorder thread. While held, the task has been taken off the queue — so the queue is
+    empty — but nothing has been written: exactly the window a real recorder is in while it
+    commits a large import.
+    """
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self._released = threading.Event()
+        self._real = recorder_statistics.import_statistics
+
+    def __call__(self, *args: object, **kwargs: object) -> bool:
+        self.started.set()
+        self._released.wait(timeout=10)
+        return self._real(*args, **kwargs)
+
+    def release(self) -> None:
+        self._released.set()
+
+
+async def test_flush_recorder_waits_for_an_import_already_in_flight(hass: HomeAssistant) -> None:
+    """The flush must not return while the recorder is still running a task it has dequeued.
+
+    `Recorder.async_block_till_done()` returns at once when the queue is empty, and the queue
+    empties as soon as the recorder thread takes a task, not when it finishes it. Reading back
+    straight after an import then finds nothing: a 0.3.3 Enbridge rebuild wrote 15,384 usage rows
+    and then skipped all 24 bills for "no recorded usage", 23 ms later.
+    """
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    t0 = datetime(2026, 1, 8, tzinfo=UTC)
+    held = _HeldImports()
+    try:
+        with patch.object(recorder_statistics, "import_statistics", new=held):
+            await import_usage_statistics(
+                hass,
+                entry,
+                _one_usage_point(_series("DELTA_DATA", readings=_hourly(t0, 3))),
+                utility_display_name="X",
+                fresh=True,
+            )
+            assert await hass.async_add_executor_job(held.started.wait, 10)
+            recorder = get_instance(hass)
+            assert recorder._queue.empty()  # noqa: SLF001 — the precondition the race needs
+            # The precondition is real: HA's own wait sees an empty queue and doesn't wait.
+            await asyncio.wait_for(recorder.async_block_till_done(), timeout=1)
+
+            flush = hass.async_create_task(async_flush_recorder(hass))
+            await asyncio.sleep(0.1)
+            assert not flush.done()
+
+            held.release()
+            await asyncio.wait_for(flush, timeout=10)
+    finally:
+        held.release()
+
+    stat_id = statistic_id_for_series("01TESTENTRY", "up1", "FORWARD")
+    rows = await get_instance(hass).async_add_executor_job(
+        statistics_during_period, hass, t0, None, {stat_id}, "hour", None, {"sum"}
+    )
+    assert [round(r["sum"], 3) for r in rows[stat_id]] == [1.0, 2.0, 3.0]
+
+
+async def test_rebuild_costs_bills_when_the_usage_import_is_still_in_flight(
+    hass: HomeAssistant,
+) -> None:
+    """End to end: a bill in the same response as its usage is costed even if the write is slow.
+
+    The cost pass reads the period's usage back from the recorder. Held mid-import, the old
+    `async_block_till_done()` wait returned at once and the read-back found nothing, so the bill
+    was skipped and no cost statistic was written at all.
+    """
+    entry = MagicMock()
+    entry.entry_id = "01TESTENTRY"
+    t0 = datetime(2026, 4, 3, tzinfo=UTC)
+    up = UsagePoint(
+        usage_point_id="up1",
+        service_kind="electricity",
+        series=[_series("DELTA_DATA", readings=_hourly(t0, 4))],
+        summaries=[_summary(datetime(2026, 4, 1, tzinfo=UTC), 30, total_dollars=40.0)],
+    )
+    response = UsageResponse(updated=None, usage_points=[up], new_credentials=None)
+    held = _HeldImports()
+    try:
+        with patch.object(recorder_statistics, "import_statistics", new=held):
+            task = hass.async_create_task(
+                import_usage_statistics(hass, entry, response, utility_display_name="X", fresh=True)
+            )
+            assert await hass.async_add_executor_job(held.started.wait, 10)
+            await asyncio.sleep(0.1)
+            held.release()
+            await asyncio.wait_for(task, timeout=10)
+            await async_wait_recording_done(hass)
+    finally:
+        held.release()
+
+    cost_id = statistic_id_for_cost("01TESTENTRY", "up1")
+    rows = await get_instance(hass).async_add_executor_job(
+        statistics_during_period, hass, t0, None, {cost_id}, "hour", None, {"sum"}
+    )
+    # $40 over the hours the read-back can weigh: the first hour has no earlier row to diff its
+    # sum against, so the bill spreads over the other three.
+    assert [round(r["sum"], 2) for r in rows[cost_id]] == [13.33, 26.67, 40.0]
 
 
 def test_statistic_id_is_scoped_per_entry() -> None:

@@ -13,6 +13,7 @@ the id format — never construct one ad-hoc elsewhere.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from collections.abc import Callable
@@ -52,6 +53,7 @@ if TYPE_CHECKING:
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
+from homeassistant.components.recorder.tasks import SynchronizeTask
 
 # `mean_type` replaces `has_mean` in HA core ≥ 2025.6; the legacy field becomes a hard
 # requirement to omit at 2026.11. Import lazily so this module still loads on an HA core
@@ -64,6 +66,28 @@ except ImportError:  # pragma: no cover — older HA core, drop-through to has_m
     _MEAN_TYPE_NONE = None
 
 _LOGGER = logging.getLogger(__name__)
+
+
+async def async_flush_recorder(hass: HomeAssistant) -> None:
+    """Wait until the recorder has finished every task queued before this call.
+
+    Use this, never ``Recorder.async_block_till_done()``, to wait for statistics writes to land
+    before reading them back. ``async_block_till_done()`` returns at once when the recorder's
+    queue is empty — and the queue goes empty the moment the recorder thread *takes* a task, not
+    when it finishes it. So straight after `async_add_external_statistics`, if the thread picked
+    the import up immediately, the "wait" returns while thousands of rows are still being written,
+    and a read-back finds none of them: a rebuild then skips every bill as having no usage and
+    writes no cost at all (Enbridge, 0.3.3).
+
+    A ``SynchronizeTask`` queued unconditionally can't be skipped: the thread runs its queue in
+    order, so this resolves only after everything ahead of it — including a task already in
+    flight — has run and committed. Like ``async_block_till_done()``, it never completes before
+    Home Assistant has started; see the deadlock guard in [import_usage_statistics].
+    """
+    future: asyncio.Future[None] = hass.loop.create_future()
+    get_instance(hass).queue_task(SynchronizeTask(future))
+    await future
+
 
 # What a series measures, as far as statistic ids and labels care — see [_series_commodity].
 COMMODITY_ELECTRICITY = "electricity"
@@ -321,7 +345,7 @@ async def async_merge_usage_point_statistics(
         moved += len(stats)
 
     recorder.async_clear_statistics(source_ids)
-    await recorder.async_block_till_done()
+    await async_flush_recorder(hass)
     return moved
 
 
@@ -739,7 +763,7 @@ async def import_usage_statistics(
         #
         # `Recorder._run()` blocks in `_wait_startup_or_shutdown()` until HOMEASSISTANT_STARTED
         # and only then enters `_run_event_loop()`, which is what drains the queue. Our
-        # `async_block_till_done()` queues a SynchronizeTask and awaits it, so before start it can
+        # `async_flush_recorder()` queues a SynchronizeTask and awaits it, so before start it can
         # never complete. HA in turn doesn't fire STARTED until config-entry setup returns — and
         # this runs inside `async_config_entry_first_refresh()`. That's a genuine deadlock, broken
         # only by HA's SLOW_SETUP_MAX_WAIT (300s) cancelling the setup task:
@@ -753,7 +777,7 @@ async def import_usage_statistics(
             _LOGGER.debug(
                 "Running deferred cost import for entry %s (HA has started)", entry.entry_id
             )
-            await get_instance(hass).async_block_till_done()
+            await async_flush_recorder(hass)
             await _import_costs(hass, entry, response, utility_display_name, fresh=fresh)
 
         _LOGGER.debug(
@@ -765,7 +789,7 @@ async def import_usage_statistics(
         return
 
     if needs_recorder_flush:
-        await get_instance(hass).async_block_till_done()
+        await async_flush_recorder(hass)
     await _import_costs(hass, entry, response, utility_display_name, fresh=fresh)
 
 
