@@ -49,26 +49,6 @@ If usage stops arriving in the Energy dashboard while the integration reports no
 
 The integration notices this and asks whether the new ID is the same meter. **Merge** moves the readings imported under the new ID onto the end of your existing statistics and continues them from then on — nothing needs changing in the dashboard. **Keep separate** is for a meter that really is a different one: both sets of statistics are left as they are. The notice appears on the first poll after the change, so it can take up to a day.
 
-## Recomputing statistics after an update
-
-Statistics are written once, as they're fetched — so if an update changes how usage or **cost** is calculated, rows already in the database keep their old values.
-
-When an update fixes a calculation bug, the integration repairs affected accounts by itself: on the first poll after the update it checks whether your utility's feed has the shape the bug applied to, and if it does, rebuilds that account's statistics automatically (once — you'll see it in the log). Accounts the bug never touched are left alone rather than made to re-download their whole history.
-
-You can also rebuild on demand — after changing something yourself, or if an automatic repair failed. Run the **Rebuild statistics** action:
-
-**Developer Tools → Actions → “Open Green Button: Rebuild statistics” → Perform action.**
-
-Or in YAML:
-
-```yaml
-action: greenbutton.rebuild_statistics
-data:
-  config_entry_id: <your entry>   # optional — omit to rebuild every configured account
-```
-
-It deletes that account's imported energy and cost statistics, then re-downloads and recomputes the full history from scratch. Because it pulls the entire initial-history window, it puts the same load on your utility as a fresh setup — run it when you need it, not on a schedule. If the re-fetch fails partway (network/utility hiccup), the statistics simply repopulate on the next successful poll or the next rebuild.
-
 ### Polling schedule
 
 How often each utility may be polled is decided by that utility and passed to the integration by the proxy server — you can't make it poll more often. Most utilities publish once a day.
@@ -76,6 +56,82 @@ How often each utility may be polled is decided by that utility and passed to th
 When the cadence works out to exactly once a day, you can choose *when* that poll runs, under **Settings → Devices & services → Open Green Button → Configure**. Enable **Poll daily at a specific local time** and pick a time. It uses Home Assistant's timezone and follows daylight-saving changes. Utilities on a shorter or multi-day cadence ignore the setting and keep their own interval.
 
 If Home Assistant is down when a poll was due — either the interval elapsed or the daily time went by — the poll runs when it next starts. Restarting inside a window that has already been polled doesn't re-fetch: that data is already in the recorder, so the restart just waits for the next scheduled poll.
+
+## Fixing wrong or missing statistics: reload vs. rebuild
+
+Statistics are written once, as they're fetched.
+Each poll asks the utility only for what's new since the last reading it imported, and readings that are already stored are never written again.
+So if usage shows at the wrong scale, months are missing, or cost doesn't appear, reloading the integration won't change the rows that are already there.
+Rebuilding the statistics will.
+
+### What a reload does
+
+**Reload** (the account's **⋮** menu under **Settings → Devices & services → Open Green Button**) sets the account up again and polls the utility straight away.
+The poll picks up from the newest reading already imported, so it only fetches recent data.
+History is not fetched again, and stored rows are not rewritten.
+
+A Home Assistant restart is the same, except that it skips the poll if the account was already polled within its normal schedule.
+That data is already stored, so there's nothing to fetch until the next scheduled poll.
+
+Use a reload when:
+
+- polling hit an error (the utility or the proxy was down) and you don't want to wait for the next scheduled attempt;
+- you want to fetch new data now, for example after enabling debug logging (see [Debugging](#debugging)).
+
+Saving the integration's options already reloads the account, so you don't need to reload after changing them.
+After installing an update, restart Home Assistant: a reload alone keeps running the old code.
+
+### Fixes in updates usually repair your statistics automatically
+
+When an update fixes how usage or cost is calculated, you usually don't need to do anything.
+On the first poll after the update, the integration checks whether your utility's data has the shape that bug affected.
+If it does, the integration rebuilds that account's statistics once, by itself, and logs a warning while it runs.
+The same happens when the proxy server changes how it handles your utility's data.
+Accounts the bug never touched are left alone, so they don't have to download their whole history again.
+
+If that automatic rebuild fails (for example, because the utility didn't respond), your existing statistics are left as they were, and it's tried again on the next poll.
+
+### What a rebuild does
+
+The **Rebuild statistics** action (`greenbutton.rebuild_statistics`) does this:
+
+1. Downloads the account's full history again — the same window as a fresh setup, which the proxy server sets for each utility (for example, two years).
+2. Only once that download has succeeded, deletes the account's usage and cost statistics.
+3. Imports everything again from scratch, using the current version's calculations.
+
+If the download fails, nothing is deleted, and the action reports an error.
+Readings older than that history window are not downloaded again, so if you've been running the integration longer than the window, the dashboard loses those older readings.
+
+Rebuild an account when:
+
+- its statistics still look wrong — wrong scale, gaps, negative bars, cost missing — after updating and letting the automatic repair run;
+- history is missing that the utility does provide;
+- a maintainer asks you to, while debugging an issue.
+
+A rebuild asks your utility for the full history again, the same amount of data as a fresh setup, so run it when you need it, not on a schedule.
+It can take several minutes.
+The account's history in the Energy dashboard is replaced with the rebuilt version.
+You don't need to authorize with your utility again.
+
+### Rebuilding one account
+
+The action takes an optional **Account** (`config_entry_id`).
+Set it to rebuild only that account; leave it out to rebuild every Open Green Button account, one after another.
+
+From the UI: **Developer tools → Actions**, choose **Open Green Button: Rebuild statistics**, pick the account under **Account**, then **Perform action**.
+The account picker supplies the ID for you.
+
+In YAML mode, or from a script or automation:
+
+```yaml
+action: greenbutton.rebuild_statistics
+data:
+  config_entry_id: <entry id>
+```
+
+To find an account's entry ID yourself, open the account under **Settings → Devices & services → Open Green Button** and look at the browser's address bar: it ends in `config_entry=<entry id>`.
+It's also the `entry.entry_id` field in the account's [diagnostics download](#debugging).
+The account must be loaded (not failed or disabled) to be rebuilt.
 
 ## Supported utilities
 
