@@ -27,10 +27,10 @@ import aiohttp
 
 from .const import (
     API_VERSION,
+    QUIRK_ENBRIDGE_METER_READS,
     QUIRK_INTERVAL_COST_IN_THOUSANDTHS,
     QUIRK_INVERT_COST_IF_POSITIVE_MULTIPLIER,
     QUIRK_INVERT_USAGE_IF_POSITIVE_MULTIPLIER,
-    QUIRK_SUMMARY_METER_READS,
 )
 
 # An async callable that receives raw upstream XML bytes and persists them somewhere.
@@ -259,7 +259,7 @@ class CostDetail:
 class BillMeterReads:
     """The meter's register as one bill states it, from its UsageSummary detail lines.
 
-    Only parsed under the server's ``summaryMeterReads`` quirk (Enbridge Gas) — the lines are the
+    Only parsed under the server's ``enbridgeMeterReads`` quirk (Enbridge Gas) — the lines are the
     custodian's own notes, not ESPI. Read dates are calendar dates: the feed sends each as UTC
     midnight. A correction bill lists more than one current read — the estimate it corrects, then
     the actual read — so the reads are kept in feed order. See [meter_reads].
@@ -681,7 +681,7 @@ class OpenGbApi:
             invert_usage_if_positive_multiplier=QUIRK_INVERT_USAGE_IF_POSITIVE_MULTIPLIER in quirks,
             invert_cost_if_positive_multiplier=QUIRK_INVERT_COST_IF_POSITIVE_MULTIPLIER in quirks,
             interval_cost_in_thousandths=QUIRK_INTERVAL_COST_IN_THOUSANDTHS in quirks,
-            summary_meter_reads=QUIRK_SUMMARY_METER_READS in quirks,
+            enbridge_meter_reads=QUIRK_ENBRIDGE_METER_READS in quirks,
         )
         # xml_bytes goes out of scope here; the only persistent copy is whatever the sink
         # decided to do with it (default: nothing).

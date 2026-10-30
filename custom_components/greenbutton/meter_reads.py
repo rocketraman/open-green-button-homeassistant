@@ -4,7 +4,7 @@ Enbridge Gas reads most residential meters by hand every other month and estimat
 between. Its IntervalReadings are one per billing period, stop months before its bills do, and are
 never revised when an actual read corrects an estimate. Every bill, though, states the meter's
 register — previous and current read, their dates, and the atmospheric adjustment factor — and
-those chain without gaps. Under the server's ``summaryMeterReads`` quirk the parser reads them
+those chain without gaps. Under the server's ``enbridgeMeterReads`` quirk the parser reads them
 into [BillMeterReads]; this module turns a meter's bills into hourly usage.
 
 **From bills to a chain of reads.** Each bill contributes its current read as a point; the

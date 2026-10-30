@@ -39,7 +39,7 @@ from .const import (
     CONF_USAGE_POINT_ALIASES,
     DOMAIN,
     LAST_FETCHED_OVERLAP,
-    QUIRK_SUMMARY_METER_READS,
+    QUIRK_ENBRIDGE_METER_READS,
     USAGE_POINT_REPLACED_LOOKBACK,
 )
 from .tou import cost_detail_tou_bucket, ontario_tou_bucket
@@ -619,11 +619,11 @@ async def async_stored_usage_shows_register_days(
 def response_has_bill_meter_reads(response: UsageResponse) -> bool:
     """Revision 8: whether [response] carries bills whose meter reads now supply usage.
 
-    The server switching ``summaryMeterReads`` on already rebuilds every entry that has stored
+    The server switching ``enbridgeMeterReads`` on already rebuilds every entry that has stored
     rows (the quirk set changed). This catches the entry whose quirk set was recorded by an
     integration version that didn't yet act on it, and so never rebuilt.
     """
-    return QUIRK_SUMMARY_METER_READS in response.quirks and any(
+    return QUIRK_ENBRIDGE_METER_READS in response.quirks and any(
         meter_reads.has_meter_reads(up) for up in response.usage_points
     )
 
@@ -715,7 +715,7 @@ async def import_usage_statistics(
     rebuild there is by definition no prior data to resume from, so reading it is both
     unnecessary and the source of the race — bypass it.
 
-    A meter whose bills carry meter reads (the server's ``summaryMeterReads`` quirk) takes its
+    A meter whose bills carry meter reads (the server's ``enbridgeMeterReads`` quirk) takes its
     usage from them wherever no reading of a day or shorter covers the hour — see [meter_reads].
     Returns, per UsagePoint id, what that found ([UsagePointImport]).
     """

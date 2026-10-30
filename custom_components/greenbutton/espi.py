@@ -180,7 +180,7 @@ def parse_usage_feed(
     invert_usage_if_positive_multiplier: bool = False,
     invert_cost_if_positive_multiplier: bool = False,
     interval_cost_in_thousandths: bool = False,
-    summary_meter_reads: bool = False,
+    enbridge_meter_reads: bool = False,
 ) -> tuple[datetime | None, list[UsagePoint]]:
     """Parse an ESPI usage Atom feed.
 
@@ -193,7 +193,7 @@ def parse_usage_feed(
     The two ``invert_*`` flags correct a custodian that sends ``powerOfTenMultiplier`` with the
     wrong sign on its ReadingTypes (usage) or its UsageSummary cost lines (cost) — see
     [_power_of_ten]. ``interval_cost_in_thousandths`` reads IntervalReading ``<cost>`` in 1/1,000
-    of the currency rather than 1/100,000. ``summary_meter_reads`` reads the meter's register off
+    of the currency rather than 1/100,000. ``enbridge_meter_reads`` reads the meter's register off
     each UsageSummary's detail lines ([_parse_meter_reads]). All four come from the server's quirks
     of the same names, never decided here.
     """
@@ -244,7 +244,7 @@ def parse_usage_feed(
                 interval_cost_scale=(
                     _THOUSANDTHS_COST_SCALE if interval_cost_in_thousandths else _ESPI_COST_SCALE
                 ),
-                summary_meter_reads=summary_meter_reads,
+                enbridge_meter_reads=enbridge_meter_reads,
             )
             elem.clear()
 
@@ -382,7 +382,7 @@ def _classify_entry(
     invert_usage: bool = False,
     invert_cost: bool = False,
     interval_cost_scale: float = _ESPI_COST_SCALE,
-    summary_meter_reads: bool = False,
+    enbridge_meter_reads: bool = False,
 ) -> None:
     # Atom content wrapper → first child tells us the payload type.
     content = entry.find(f"{{{_ATOM_NS}}}content")
@@ -447,7 +447,7 @@ def _classify_entry(
         # UsagePoint's own link tree.
         up_id_from_related = _related_id(entry, "espi-entry/UsagePoint", "UsagePoint")
         summary = _parse_usage_summary(
-            payload, invert_cost=invert_cost, meter_reads=summary_meter_reads
+            payload, invert_cost=invert_cost, meter_reads=enbridge_meter_reads
         )
         if summary is not None:
             summaries.append(_RawUsageSummary(usage_point_id=up_id_from_related, summary=summary))

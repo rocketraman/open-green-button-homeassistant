@@ -61,9 +61,9 @@ from custom_components.greenbutton.const import (
     INITIAL_FETCH_LOOKBACK,
     LAST_FETCHED_OVERLAP,
     POLL_HISTORY_RETENTION,
+    QUIRK_ENBRIDGE_METER_READS,
     QUIRK_INVERT_COST_IF_POSITIVE_MULTIPLIER,
     QUIRK_INVERT_USAGE_IF_POSITIVE_MULTIPLIER,
-    QUIRK_SUMMARY_METER_READS,
 )
 from custom_components.greenbutton.coordinator import GreenButtonCoordinator
 from custom_components.greenbutton.meter_reads import Mismatch
@@ -2507,7 +2507,7 @@ async def test_unchanged_server_quirks_cost_nothing(hass: HomeAssistant) -> None
     clear_mock.assert_not_awaited()
 
 
-# --- bills' meter reads (summaryMeterReads) ------------------------------------------------------
+# --- bills' meter reads (enbridgeMeterReads) ------------------------------------------------------
 
 
 def _billed_meter(*bills: tuple[tuple[str, float], tuple[str, float], bool]) -> UsageResponse:
@@ -2539,7 +2539,7 @@ def _billed_meter(*bills: tuple[tuple[str, float], tuple[str, float], bool]) -> 
         updated=None,
         usage_points=[up],
         new_credentials=None,
-        quirks=frozenset({QUIRK_SUMMARY_METER_READS}),
+        quirks=frozenset({QUIRK_ENBRIDGE_METER_READS}),
     )
 
 

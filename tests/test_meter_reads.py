@@ -1,4 +1,4 @@
-"""Usage from bills' meter reads (the server's ``summaryMeterReads`` quirk; Enbridge Gas).
+"""Usage from bills' meter reads (the server's ``enbridgeMeterReads`` quirk; Enbridge Gas).
 
 The bill figures are the maintainer's own Enbridge bills: June 2026 estimated at 63 m³ ($50.98),
 July read actually at 21 m³ ($43.27), both at an adjustment factor of 1.004. The correction bills
@@ -31,7 +31,7 @@ from custom_components.greenbutton.api import (
     UsageReading,
     UsageResponse,
 )
-from custom_components.greenbutton.const import QUIRK_SUMMARY_METER_READS
+from custom_components.greenbutton.const import QUIRK_ENBRIDGE_METER_READS
 from custom_components.greenbutton.espi import parse_usage_feed
 from custom_components.greenbutton.statistics import (
     import_usage_statistics,
@@ -143,7 +143,7 @@ def _response(*bills: BillingSummary, series: list[MeterReadingSeries] | None = 
         updated=None,
         usage_points=[up],
         new_credentials=None,
-        quirks=frozenset({QUIRK_SUMMARY_METER_READS}),
+        quirks=frozenset({QUIRK_ENBRIDGE_METER_READS}),
     )
 
 
@@ -294,7 +294,7 @@ _FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
 
 def test_meter_reads_are_parsed_only_under_the_quirk() -> None:
     _, [up] = parse_usage_feed(
-        _FEED, invert_cost_if_positive_multiplier=True, summary_meter_reads=True
+        _FEED, invert_cost_if_positive_multiplier=True, enbridge_meter_reads=True
     )
     assert up.summaries[0].meter_reads == BillMeterReads(
         bill_date=date(2026, 8, 4),

@@ -113,7 +113,7 @@ QUIRK_INVERT_COST_IF_POSITIVE_MULTIPLIER = "invertCostIfPositiveMultiplier"
 QUIRK_INTERVAL_COST_IN_THOUSANDTHS = "intervalCostInThousandths"
 # Usage comes from the meter-read lines on each UsageSummary rather than from billing-period-long
 # IntervalReadings (Enbridge Gas). See [meter_reads].
-QUIRK_SUMMARY_METER_READS = "summaryMeterReads"
+QUIRK_ENBRIDGE_METER_READS = "enbridgeMeterReads"
 
 # The quirk set (sorted list) the entry's stored statistics were computed under. A poll that
 # arrives with a different set means those rows were scaled by rules that no longer apply, so the
@@ -358,7 +358,7 @@ CONF_IMPORT_LOGIC_REVISION = "import_logic_revision"
 #       a bare 1/100,000 amount, so every bill was priced ~100,000× too high — $470,770 for a
 #       13 kWh day. Affects UtilityAPI utilities billed through UsageSummary (El Paso Electric);
 #       recognized from any bill in the poll carrying such a line. (open-green-button issues/99)
-#   8 — usage from bills' meter reads (`summaryMeterReads`). Enbridge's IntervalReadings stop
+#   8 — usage from bills' meter reads (`enbridgeMeterReads`). Enbridge's IntervalReadings stop
 #       months before its bills and aren't revised when an actual read corrects an estimate, so
 #       usage is now built from the register on each bill. Recognized from any bill in the poll
 #       carrying meter reads under the quirk. The quirk-set change alone already rebuilds an

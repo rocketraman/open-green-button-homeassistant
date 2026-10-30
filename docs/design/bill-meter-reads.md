@@ -88,8 +88,10 @@ What each case gets:
 | Billing-only, no register lines (UtilityAPI) | no | yes | no | Unchanged |
 
 Step 3 relies on the register lines, which are Enbridge's own itemized-line notes, not part of ESPI.
-They are parsed only when the server sends a new client quirk, `summaryMeterReads`, set for Enbridge in `utilities.conf`, like the existing `invertUsageIfPositiveMultiplier`.
-Another utility can opt in once its notes are checked; matching note text without the quirk would make a cosmetic rename by any utility change how its usage is read.
+They are parsed only when the server sends a new client quirk, `enbridgeMeterReads`, set for Enbridge in `utilities.conf`, like the existing `invertUsageIfPositiveMultiplier`.
+The quirk is named for Enbridge because the parser is: the note wording, the unit codes, the epoch dates stored as values and the correction-bill layout are all Enbridge's.
+Elexicon, for one, sends a "Current Meter Read" line too, but in watt-hours at a different scale and with no read dates.
+Another utility with register lines gets its own quirk and parser, feeding the same chain and import logic; matching note text without a quirk would make a cosmetic rename by any utility change how its usage is read.
 
 ## From bills to a register
 
@@ -169,7 +171,7 @@ These polls can't tell whether bills are matched on their period or on their Bil
 
 ## Migration
 
-Turning on the `summaryMeterReads` quirk changes Enbridge's quirk set, which already rebuilds every entry with stored statistics.
+Turning on the `enbridgeMeterReads` quirk changes Enbridge's quirk set, which already rebuilds every entry with stored statistics.
 Import-logic revision 8 covers the entry that recorded the new quirk set on an integration version that ignored it, and so never rebuilt: its predicate is a poll carrying bills with meter reads under the quirk.
 That matches Enbridge entries and nothing else.
 Affected entries rebuild once, which re-imports two years from the bills.
