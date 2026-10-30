@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 import aiohttp
@@ -30,6 +30,7 @@ from .const import (
     QUIRK_INTERVAL_COST_IN_THOUSANDTHS,
     QUIRK_INVERT_COST_IF_POSITIVE_MULTIPLIER,
     QUIRK_INVERT_USAGE_IF_POSITIVE_MULTIPLIER,
+    QUIRK_SUMMARY_METER_READS,
 )
 
 # An async callable that receives raw upstream XML bytes and persists them somewhere.
@@ -255,6 +256,32 @@ class CostDetail:
 
 
 @dataclass(frozen=True, slots=True)
+class BillMeterReads:
+    """The meter's register as one bill states it, from its UsageSummary detail lines.
+
+    Only parsed under the server's ``summaryMeterReads`` quirk (Enbridge Gas) — the lines are the
+    custodian's own notes, not ESPI. Read dates are calendar dates: the feed sends each as UTC
+    midnight. A correction bill lists more than one current read — the estimate it corrects, then
+    the actual read — so the reads are kept in feed order. See [meter_reads].
+    """
+
+    bill_date: date | None
+    previous_read_date: date
+    current_read_date: date
+    previous_reads: tuple[float, ...]
+    current_reads: tuple[float, ...]
+    # "Adjustment Factor (atmospheric)": billed volume = register difference × this.
+    adjustment_factor: float
+    # ESPI qualityOfReading on the summary: 19 actual ("revenue quality"), 12 estimated.
+    quality_of_reading: int | None
+
+    @property
+    def is_correction(self) -> bool:
+        """True for a bill that restates an estimate: it lists the estimate and the actual read."""
+        return len(self.current_reads) > 1
+
+
+@dataclass(frozen=True, slots=True)
 class BillingSummary:
     """One periodic billing summary parsed from an ESPI UsageSummary entry.
 
@@ -269,6 +296,7 @@ class BillingSummary:
     cost_additional_last_period_raw: int | None
     cost_details: list[CostDetail]
     currency_numeric_code: int | None
+    meter_reads: BillMeterReads | None = None
 
     @property
     def total_cost(self) -> float:
@@ -349,6 +377,10 @@ class UsagePoint:
     # poll that happens to carry only a cumulative register can still be recognized as one — see
     # [statistics.is_interval_consumption_series].
     interval_flows_seen: frozenset[str] = frozenset()
+    # Whether this meter has published a reading of a day or shorter, in this poll or an earlier
+    # one. Filled in by the coordinator from CONF_FINE_READING_USAGE_POINTS: usage from bills'
+    # meter reads may only restate stored hours of a meter that never had such readings.
+    fine_readings_seen: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -649,6 +681,7 @@ class OpenGbApi:
             invert_usage_if_positive_multiplier=QUIRK_INVERT_USAGE_IF_POSITIVE_MULTIPLIER in quirks,
             invert_cost_if_positive_multiplier=QUIRK_INVERT_COST_IF_POSITIVE_MULTIPLIER in quirks,
             interval_cost_in_thousandths=QUIRK_INTERVAL_COST_IN_THOUSANDTHS in quirks,
+            summary_meter_reads=QUIRK_SUMMARY_METER_READS in quirks,
         )
         # xml_bytes goes out of scope here; the only persistent copy is whatever the sink
         # decided to do with it (default: nothing).

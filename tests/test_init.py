@@ -99,7 +99,7 @@ def _stub_network(fetch: AsyncMock) -> Iterator[None]:
         ),
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ),
     ):
         yield

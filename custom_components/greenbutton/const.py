@@ -111,6 +111,9 @@ QUIRK_INVERT_USAGE_IF_POSITIVE_MULTIPLIER = "invertUsageIfPositiveMultiplier"
 QUIRK_INVERT_COST_IF_POSITIVE_MULTIPLIER = "invertCostIfPositiveMultiplier"
 # IntervalReading <cost> is read in 1/1,000 of the currency unit, not 1/100,000 (Alectra, #33).
 QUIRK_INTERVAL_COST_IN_THOUSANDTHS = "intervalCostInThousandths"
+# Usage comes from the meter-read lines on each UsageSummary rather than from billing-period-long
+# IntervalReadings (Enbridge Gas). See [meter_reads].
+QUIRK_SUMMARY_METER_READS = "summaryMeterReads"
 
 # The quirk set (sorted list) the entry's stored statistics were computed under. A poll that
 # arrives with a different set means those rows were scaled by rules that no longer apply, so the
@@ -168,6 +171,30 @@ CONF_USAGE_POINT_CURSORS = "usage_point_cursors"
 # whatever its reading count or values. Only ever grows; a meter that has never shown a sibling
 # (Consumers Energy's billing-only feed) is never in it, so its lone series still imports.
 CONF_INTERVAL_FLOWS = "interval_flows"
+
+# Meters that have ever published a reading of a day or shorter: ``[usage_point_id]``.
+#
+# Usage spread from a bill's meter reads may restate hours already stored — that is how an
+# estimate is replaced once an actual read brackets it (see [meter_reads]) — but never hours a
+# finer reading measured. The stored rows don't say where they came from, and an incremental poll
+# only carries its own window, so whether a meter has ever had fine readings is remembered here.
+# Only ever grows.
+CONF_FINE_READING_USAGE_POINTS = "fine_reading_usage_points"
+
+# Per-meter UTC ISO 8601 date of the newest *actual* meter read on its bills:
+# ``{usage_point_id: iso}``. Usage after it is provisional — spread from an estimate, or from a
+# billing-period reading no bill covers yet — and is restated when the next actual read arrives,
+# which needs the bill carrying this read in the same response. So the poll window reaches back
+# to it; see [GreenButtonCoordinator._published_min]. Only moves forward.
+CONF_METER_READ_ANCHORS = "meter_read_anchors"
+
+# Where a bill's meter reads and the utility's IntervalReadings disagree, for diagnostics:
+# ``{usage_point_id: {"agreeing": int, "rows": [row, ...]}}``. A dropped reading's disagreement
+# is seen in the poll that carries both, and a restatement only in the poll that brings the
+# bill, so neither survives in a single response — they are kept here, newest
+# MISMATCH_HISTORY_MAX_ROWS per meter. A rebuild starts the list over.
+CONF_BILL_READING_MISMATCHES = "bill_reading_mismatches"
+MISMATCH_HISTORY_MAX_ROWS = 50
 
 # Meters the user has told us are one and the same: ``{usage_point_id: the id it replaced}``.
 #
@@ -331,7 +358,12 @@ CONF_IMPORT_LOGIC_REVISION = "import_logic_revision"
 #       a bare 1/100,000 amount, so every bill was priced ~100,000× too high — $470,770 for a
 #       13 kWh day. Affects UtilityAPI utilities billed through UsageSummary (El Paso Electric);
 #       recognized from any bill in the poll carrying such a line. (open-green-button issues/99)
-IMPORT_LOGIC_REVISION = 7
+#   8 — usage from bills' meter reads (`summaryMeterReads`). Enbridge's IntervalReadings stop
+#       months before its bills and aren't revised when an actual read corrects an estimate, so
+#       usage is now built from the register on each bill. Recognized from any bill in the poll
+#       carrying meter reads under the quirk. The quirk-set change alone already rebuilds an
+#       entry; this catches one that recorded the quirk on an integration version that ignored it.
+IMPORT_LOGIC_REVISION = 8
 
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see

@@ -9,7 +9,7 @@ mode, when to persist rotated credentials, etc.).
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
@@ -22,6 +22,8 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.greenbutton.api import (
+    BillingSummary,
+    BillMeterReads,
     CustomerInfo,
     CustomerResponse,
     MeterReadingSeries,
@@ -37,11 +39,14 @@ from custom_components.greenbutton.api import (
 )
 from custom_components.greenbutton.const import (
     CONF_APPLIED_QUIRKS,
+    CONF_BILL_READING_MISMATCHES,
     CONF_CUSTOMER_LABEL,
     CONF_ENCRYPTED_REFRESH_BLOB,
+    CONF_FINE_READING_USAGE_POINTS,
     CONF_IMPORT_LOGIC_REVISION,
     CONF_INTERVAL_FLOWS,
     CONF_LAST_FETCHED_AT,
+    CONF_METER_READ_ANCHORS,
     CONF_PENDING_PUBLISHED_MAX,
     CONF_PENDING_PUBLISHED_MIN,
     CONF_POLL_INTERVAL_SECONDS,
@@ -58,8 +63,11 @@ from custom_components.greenbutton.const import (
     POLL_HISTORY_RETENTION,
     QUIRK_INVERT_COST_IF_POSITIVE_MULTIPLIER,
     QUIRK_INVERT_USAGE_IF_POSITIVE_MULTIPLIER,
+    QUIRK_SUMMARY_METER_READS,
 )
 from custom_components.greenbutton.coordinator import GreenButtonCoordinator
+from custom_components.greenbutton.meter_reads import Mismatch
+from custom_components.greenbutton.statistics import UsagePointImport
 from custom_components.greenbutton.storage import xml_cache_path
 
 if TYPE_CHECKING:
@@ -147,7 +155,7 @@ async def test_first_refresh_calls_api_and_imports_stats(hass: HomeAssistant) ->
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ) as import_mock:
         await coordinator.async_refresh()
 
@@ -199,7 +207,7 @@ async def test_auth_expired_becomes_config_entry_auth_failed(hass: HomeAssistant
     with (
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ) as import_mock,
         pytest.raises(ConfigEntryAuthFailed),
     ):
@@ -218,7 +226,7 @@ async def test_generic_api_error_becomes_update_failed(hass: HomeAssistant) -> N
     with (
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ),
         pytest.raises(UpdateFailed),
     ):
@@ -247,7 +255,7 @@ async def test_rotated_credentials_persisted_on_upstream_error(hass: HomeAssista
     with (
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ),
         pytest.raises(UpdateFailed),
     ):
@@ -281,7 +289,7 @@ async def test_data_pending_raises_repair_issue_and_update_failed(hass: HomeAssi
     with (
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ) as import_mock,
         pytest.raises(UpdateFailed),
     ):
@@ -329,7 +337,7 @@ async def test_data_pending_escalates_to_an_error_after_a_day(hass: HomeAssistan
     with (
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ),
         pytest.raises(UpdateFailed),
     ):
@@ -367,7 +375,7 @@ async def test_data_pending_freezes_the_window_and_retries_replay_it(
     with (
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ),
         pytest.raises(UpdateFailed),
     ):
@@ -393,7 +401,7 @@ async def test_data_pending_freezes_the_window_and_retries_replay_it(
         with (
             patch(
                 "custom_components.greenbutton.coordinator.import_usage_statistics",
-                new=AsyncMock(),
+                new=AsyncMock(return_value={}),
             ),
             pytest.raises(UpdateFailed),
         ):
@@ -435,7 +443,7 @@ async def test_data_pending_logs_the_custodian_detail(
     with (
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ),
         caplog.at_level(logging.DEBUG, logger="custom_components.greenbutton"),
     ):
@@ -475,7 +483,7 @@ async def test_successful_fetch_clears_the_frozen_pending_window(hass: HomeAssis
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator._async_update_data()
 
@@ -505,7 +513,7 @@ async def test_rebuild_ignores_a_frozen_pending_window(hass: HomeAssistant) -> N
     with (
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ),
         patch(
             "custom_components.greenbutton.coordinator.async_clear_statistics_for_entry",
@@ -541,7 +549,7 @@ async def test_successful_refresh_clears_background_load_issue(hass: HomeAssista
     )
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator._async_update_data()
 
@@ -571,7 +579,7 @@ async def test_clean_fetch_with_no_data_at_all_explains_itself_and_retries_soon(
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator._async_update_data()
 
@@ -618,7 +626,7 @@ async def test_empty_wait_widens_and_is_capped_by_the_poll_interval(hass: HomeAs
         with (
             patch(
                 "custom_components.greenbutton.coordinator.import_usage_statistics",
-                new=AsyncMock(),
+                new=AsyncMock(return_value={}),
             ),
             patch("custom_components.greenbutton.coordinator.async_call_later") as call_later,
         ):
@@ -666,7 +674,7 @@ async def test_a_day_without_data_escalates_and_drops_the_fast_cadence(
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator._async_update_data()
 
@@ -693,7 +701,7 @@ async def test_first_data_clears_the_empty_wait(hass: HomeAssistant) -> None:
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator._async_update_data()
         assert CONF_EMPTY_SINCE in entry.data
@@ -733,7 +741,7 @@ async def test_an_established_entry_polling_into_a_quiet_window_stays_silent(
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator._async_update_data()
 
@@ -769,6 +777,7 @@ async def test_rotated_credentials_are_persisted_before_stats_import(
     async def capture_entry_at_import_time(*args, **kwargs):
         observed["blob"] = entry.data[CONF_ENCRYPTED_REFRESH_BLOB]
         observed["token"] = entry.data[CONF_PROXY_TOKEN]
+        return {}
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
@@ -808,7 +817,7 @@ async def test_rebuild_refetches_full_history_then_purges(hass: HomeAssistant) -
         ) as clear_mock,
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ) as import_mock,
     ):
         await coordinator.async_rebuild_statistics()
@@ -852,7 +861,7 @@ async def test_rebuild_leaves_stats_intact_when_refetch_fails(hass: HomeAssistan
         ) as clear_mock,
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ) as import_mock,
         pytest.raises(HomeAssistantError),
     ):
@@ -883,7 +892,7 @@ async def test_cursor_advances_to_newest_reading_not_wall_clock(hass: HomeAssist
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator.async_refresh()
 
@@ -907,7 +916,7 @@ async def test_cursor_not_advanced_on_empty_response(hass: HomeAssistant) -> Non
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator.async_refresh()
 
@@ -931,7 +940,7 @@ async def test_cursor_never_regresses_on_late_partial_window(hass: HomeAssistant
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator.async_refresh()
 
@@ -985,7 +994,7 @@ async def test_customer_label_retitles_entry_and_persists_details(hass: HomeAssi
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator.async_refresh()
 
@@ -1015,7 +1024,7 @@ async def test_customer_label_fetched_only_once(hass: HomeAssistant) -> None:
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator.async_refresh()
         await coordinator.async_refresh()
@@ -1044,7 +1053,7 @@ async def test_customer_label_permanent_error_marks_unavailable(hass: HomeAssist
 
         with patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ):
             await coordinator.async_refresh()
             await coordinator.async_refresh()
@@ -1074,7 +1083,7 @@ async def test_customer_label_transient_error_is_retried(hass: HomeAssistant) ->
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator.async_refresh()
         assert CONF_CUSTOMER_LABEL not in entry.data  # transient → not marked, will retry
@@ -1103,7 +1112,7 @@ async def test_customer_label_persists_rotated_credentials(hass: HomeAssistant) 
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator.async_refresh()
 
@@ -1156,7 +1165,8 @@ async def test_incremental_poll_uses_one_tight_window_at_usage_frontier(
     api = _api_returning(_empty_response())
     coordinator = GreenButtonCoordinator(hass, api, entry)
     with patch(
-        "custom_components.greenbutton.coordinator.import_usage_statistics", new=AsyncMock()
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(return_value={}),
     ):
         await coordinator.async_refresh()
 
@@ -1223,7 +1233,7 @@ def _migration_patches(*, had_statistics: bool):
         ),
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ),
     )
 
@@ -1612,7 +1622,7 @@ async def test_advance_cursor_writes_one_cursor_per_meter(hass: HomeAssistant) -
     coordinator = GreenButtonCoordinator(hass, api, entry)
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator._async_update_data()
 
@@ -1674,7 +1684,7 @@ async def test_register_only_response_does_not_advance_cursor(hass: HomeAssistan
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ) as import_mock:
         await coordinator._async_update_data()
 
@@ -1697,7 +1707,7 @@ async def test_interval_flows_are_remembered_across_polls(hass: HomeAssistant) -
     )
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator._async_update_data()
 
@@ -1756,7 +1766,7 @@ async def test_window_scopes_to_the_furthest_behind_meter(hass: HomeAssistant) -
     coordinator = GreenButtonCoordinator(hass, api, entry)
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator._async_update_data()
 
@@ -1788,7 +1798,7 @@ async def test_a_silent_meter_keeps_its_cursor(hass: HomeAssistant) -> None:
     coordinator = GreenButtonCoordinator(hass, api, entry)
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator._async_update_data()
 
@@ -1811,7 +1821,7 @@ async def test_meter_cursors_never_retreat(hass: HomeAssistant) -> None:
     coordinator = GreenButtonCoordinator(hass, api, entry)
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator._async_update_data()
 
@@ -1836,7 +1846,7 @@ async def test_entry_written_before_per_meter_cursors_uses_the_old_frontier(
     coordinator = GreenButtonCoordinator(hass, api, entry)
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator._async_update_data()
 
@@ -1862,7 +1872,7 @@ async def test_unparseable_meter_cursor_is_skipped_not_fatal(hass: HomeAssistant
     coordinator = GreenButtonCoordinator(hass, api, entry)
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator._async_update_data()
 
@@ -1895,7 +1905,7 @@ async def test_window_compliance_is_logged_per_meter(
     with (
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ),
         caplog.at_level(logging.INFO, logger="custom_components.greenbutton"),
     ):
@@ -1967,7 +1977,7 @@ async def test_deferred_fetch_probes_the_customer_feed_once(hass: HomeAssistant)
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         with pytest.raises(UpdateFailed):
             await coordinator._async_update_data()
@@ -2009,7 +2019,7 @@ async def test_a_deferred_customer_feed_is_reported_and_not_recorded(
     with (
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ),
         caplog.at_level(logging.INFO, logger="custom_components.greenbutton"),
         pytest.raises(UpdateFailed),
@@ -2031,7 +2041,7 @@ async def test_a_deferred_customer_feed_is_reported_and_not_recorded(
     with (
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ),
         pytest.raises(UpdateFailed),
     ):
@@ -2098,7 +2108,7 @@ async def test_a_deferred_batch_is_collected_from_its_usage_points(
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ) as import_mock:
         response = await coordinator._async_update_data()
 
@@ -2136,7 +2146,7 @@ async def test_a_first_sync_collects_from_the_resources_the_utility_announced(
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         response = await coordinator._async_update_data()
 
@@ -2184,7 +2194,7 @@ async def test_a_collected_resource_body_is_cached_for_diagnostics_only_under_de
         ),
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ),
     ):
         await coordinator._async_update_data()
@@ -2222,7 +2232,7 @@ async def test_announced_resources_win_over_the_meters_already_known(
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         response = await coordinator._async_update_data()
 
@@ -2252,7 +2262,7 @@ async def test_an_announced_resource_is_retried_bare_when_it_rejects_the_date_fi
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         response = await coordinator._async_update_data()
 
@@ -2286,7 +2296,7 @@ async def test_known_meters_are_collected_without_a_listing_request(
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator._async_update_data()
 
@@ -2312,7 +2322,7 @@ async def test_one_failing_meter_does_not_sink_the_others(hass: HomeAssistant) -
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         response = await coordinator._async_update_data()
 
@@ -2331,7 +2341,7 @@ async def test_a_listing_that_carries_readings_is_used_directly(hass: HomeAssist
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         response = await coordinator._async_update_data()
 
@@ -2357,7 +2367,7 @@ async def test_a_failed_collection_leaves_the_deferred_handling_untouched(
     with (
         patch(
             "custom_components.greenbutton.coordinator.import_usage_statistics",
-            new=AsyncMock(),
+            new=AsyncMock(return_value={}),
         ),
         pytest.raises(UpdateFailed),
     ):
@@ -2389,7 +2399,7 @@ async def test_recent_polls_persist_and_drop_entries_past_retention(hass: HomeAs
 
     with patch(
         "custom_components.greenbutton.coordinator.import_usage_statistics",
-        new=AsyncMock(),
+        new=AsyncMock(return_value={}),
     ):
         await coordinator.async_refresh()
     coordinator.cancel_pending_retry()
@@ -2495,3 +2505,110 @@ async def test_unchanged_server_quirks_cost_nothing(hass: HomeAssistant) -> None
     api.fetch_usage.assert_awaited_once()
     has_stats_mock.assert_not_awaited()
     clear_mock.assert_not_awaited()
+
+
+# --- bills' meter reads (summaryMeterReads) ------------------------------------------------------
+
+
+def _billed_meter(*bills: tuple[tuple[str, float], tuple[str, float], bool]) -> UsageResponse:
+    """One gas meter with no readings, only bills: ((prev date, read), (cur date, read), actual)."""
+    summaries = []
+    for (prev_day, prev), (cur_day, cur), actual in bills:
+        prev_date, cur_date = date.fromisoformat(prev_day), date.fromisoformat(cur_day)
+        summaries.append(
+            BillingSummary(
+                billing_period_start=datetime.combine(prev_date, datetime.min.time(), UTC),
+                billing_period_duration_seconds=(cur_date - prev_date).days * 86400,
+                bill_last_period_raw=0,
+                cost_additional_last_period_raw=0,
+                cost_details=[],
+                currency_numeric_code=124,
+                meter_reads=BillMeterReads(
+                    bill_date=cur_date + timedelta(days=3),
+                    previous_read_date=prev_date,
+                    current_read_date=cur_date,
+                    previous_reads=(prev,),
+                    current_reads=(cur,),
+                    adjustment_factor=1.004,
+                    quality_of_reading=19 if actual else 12,
+                ),
+            )
+        )
+    up = UsagePoint(usage_point_id="gas", service_kind="GAS", series=[], summaries=summaries)
+    return UsageResponse(
+        updated=None,
+        usage_points=[up],
+        new_credentials=None,
+        quirks=frozenset({QUIRK_SUMMARY_METER_READS}),
+    )
+
+
+async def test_a_billed_meter_cursor_follows_its_bills_and_the_window_its_last_actual_read(
+    hass: HomeAssistant,
+) -> None:
+    """With no IntervalReadings, the cursor moves with the newest bill; the window reaches back to
+    the newest actual read, since the estimate after it is restated when the next one arrives."""
+    response = _billed_meter(
+        (("2026-05-29", 35500.0), ("2026-06-29", 35563.0), False),
+        (("2026-06-29", 35563.0), ("2026-07-30", 35584.0), True),
+        (("2026-07-30", 35584.0), ("2026-08-29", 35645.0), False),
+    )
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, _api_returning(response), entry)
+    with patch(
+        "custom_components.greenbutton.coordinator.import_usage_statistics",
+        new=AsyncMock(return_value={}),
+    ):
+        await coordinator._async_update_data()
+
+    assert entry.data[CONF_USAGE_POINT_CURSORS] == {"gas": "2026-08-29T00:00:00+00:00"}
+    assert entry.data[CONF_METER_READ_ANCHORS] == {"gas": "2026-07-30T00:00:00+00:00"}
+    assert (
+        coordinator._published_min(datetime(2026, 10, 1, tzinfo=UTC))
+        == datetime(2026, 7, 30, tzinfo=UTC) - LAST_FETCHED_OVERLAP
+    )
+
+
+async def test_bill_reading_mismatches_are_kept_across_polls_and_reset_by_a_rebuild(
+    hass: HomeAssistant,
+) -> None:
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, _api_returning(_empty_response()), entry)
+    start, end = datetime(2026, 5, 30, 4, tzinfo=UTC), datetime(2026, 7, 31, 4, tzinfo=UTC)
+    dropped = Mismatch("same_response", start, end, reading=40.0, bill=84.0)
+    restated = Mismatch("restated", start, end, reading=63.0, bill=42.0)
+
+    coordinator._record_bill_reading_mismatches(
+        {"gas": UsagePointImport(mismatches=[dropped], agreeing=[end])}
+    )
+    # The next poll re-fetches the same reading (a repeat, not a new row) and restates.
+    coordinator._record_bill_reading_mismatches(
+        {"gas": UsagePointImport(mismatches=[dropped, restated], agreeing=[end])}
+    )
+    held = entry.data[CONF_BILL_READING_MISMATCHES]["gas"]
+    assert [row["kind"] for row in held["rows"]] == ["same_response", "restated"]
+    assert held["agreeing"] == [end.isoformat()]
+
+    coordinator._record_bill_reading_mismatches({"gas": UsagePointImport()}, fresh=True)
+    assert entry.data[CONF_BILL_READING_MISMATCHES] == {}
+
+
+async def test_a_meter_with_daily_readings_is_remembered_as_fine(hass: HomeAssistant) -> None:
+    """Once a meter has published readings a day or shorter, bills never restate its stored hours
+    — even on a later poll that happens to carry none."""
+    entry = _entry(hass)
+    coordinator = GreenButtonCoordinator(hass, _api_returning(_empty_response()), entry)
+    marked = coordinator._apply_interval_flows(
+        _response_with_readings(datetime(2026, 7, 1, tzinfo=UTC))
+    )
+    assert marked.usage_points[0].fine_readings_seen
+    assert entry.data[CONF_FINE_READING_USAGE_POINTS] == ["up1"]
+
+    later = coordinator._apply_interval_flows(
+        UsageResponse(
+            updated=None,
+            usage_points=[UsagePoint("up1", "electricity", [])],
+            new_credentials=None,
+        )
+    )
+    assert later.usage_points[0].fine_readings_seen

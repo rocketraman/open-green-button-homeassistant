@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Enbridge Gas: usage now comes from the meter reads printed on each bill
+  instead of the per-bill readings, which stop months before the bills do
+  (spring 2026 on every account we've seen) and are never corrected when a
+  meter reader's visit replaces an estimate
+  ([open-green-button#39](https://github.com/rocketraman/open-green-button/issues/39)).
+  Usage is spread evenly from one actual meter read to the next, so an
+  estimated month's figure is replaced once the next actual read arrives;
+  the bills between two actual reads still add up exactly. Each bill's cost
+  stays in its own billing period, and a correction bill is costed together
+  with the bill it corrects, so a credit no longer prices a month below zero.
+  Enbridge entries rebuild their statistics automatically, once. Requires the
+  Open Green Button server deployed on or after this release.
+- The diagnostics download now shows each Enbridge bill's meter reads, which
+  of them the usage was built from, and every reading that disagreed with the
+  bills (`bill_reading_mismatches`).
+
 ### Fixed
 
 - Cost could go missing after a rebuild or an automatic repair, for

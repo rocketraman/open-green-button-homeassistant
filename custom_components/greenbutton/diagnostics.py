@@ -25,6 +25,7 @@ import logging
 import os
 import re
 from dataclasses import asdict
+from datetime import date
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.diagnostics import REDACTED, async_redact_data
@@ -37,13 +38,14 @@ from .const import (
     CONF_PROXY_TOKEN,
     DOMAIN,
 )
+from .meter_reads import meter_read_points, points_as_dicts
 from .storage import xml_cache_path
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
 
-    from .api import UsageResponse
+    from .api import BillMeterReads, UsageResponse
     from .coordinator import GreenButtonCoordinator
 
 _LOGGER = logging.getLogger(__package__)
@@ -143,15 +145,30 @@ def _summarize_response(response: UsageResponse | None) -> dict[str, Any] | None
                         "currency_numeric_code": summary.currency_numeric_code,
                         "total_cost": summary.total_cost,
                         "cost_details": [asdict(d) for d in summary.cost_details],
+                        "meter_reads": _meter_reads(summary.meter_reads),
                     }
                     for summary in up.summaries
                 ],
+                # The chain of meter reads the bills state, and what became of each read (kept,
+                # provisional, superseded, bracketed) — see [meter_reads]. Empty for a meter
+                # whose bills carry none.
+                "meter_read_chain": points_as_dicts(meter_read_points(up.summaries)),
             }
             for up in response.usage_points
         ],
         "new_credentials_present": response.new_credentials is not None,
         # The server's per-utility parsing quirks (`OpenGB-Quirks`) this response was parsed under.
         "quirks": sorted(response.quirks),
+    }
+
+
+def _meter_reads(reads: BillMeterReads | None) -> dict[str, Any] | None:
+    """One bill's meter reads, with its dates as ISO strings."""
+    if reads is None:
+        return None
+    return {
+        key: value.isoformat() if isinstance(value, date) else value
+        for key, value in asdict(reads).items()
     }
 
 
