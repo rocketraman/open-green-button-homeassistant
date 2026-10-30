@@ -32,8 +32,8 @@ from __future__ import annotations
 import io
 import logging
 import xml.etree.ElementTree as ET  # Element/types only — parsing goes through defusedxml.
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass, field, replace
+from datetime import UTC, date, datetime
 from typing import IO
 
 # Defuse XML attacks (XXE, billion laughs) — the bytes here flow from the utility through
@@ -43,6 +43,7 @@ from defusedxml.ElementTree import iterparse as _safe_iterparse
 from .api import (
     UOM_CURRENCY,
     BillingSummary,
+    BillMeterReads,
     CostDetail,
     CustomerInfo,
     MeterReadingSeries,
@@ -110,6 +111,7 @@ _TAG_NOTE = f"{{{_ESPI_NS}}}note"
 _TAG_ITEM_KIND = f"{{{_ESPI_NS}}}itemKind"
 _TAG_UNIT_COST = f"{{{_ESPI_NS}}}unitCost"
 _TAG_MEASUREMENT = f"{{{_ESPI_NS}}}measurement"
+_TAG_QUALITY_OF_READING = f"{{{_ESPI_NS}}}qualityOfReading"
 
 # Customer-namespace payloads (RetailCustomer feed) — parsed by [parse_customer_feed], not the
 # usage parser. See the ESPI customer schema (`http://naesb.org/espi/customer`).
@@ -178,6 +180,7 @@ def parse_usage_feed(
     invert_usage_if_positive_multiplier: bool = False,
     invert_cost_if_positive_multiplier: bool = False,
     interval_cost_in_thousandths: bool = False,
+    enbridge_meter_reads: bool = False,
 ) -> tuple[datetime | None, list[UsagePoint]]:
     """Parse an ESPI usage Atom feed.
 
@@ -190,8 +193,9 @@ def parse_usage_feed(
     The two ``invert_*`` flags correct a custodian that sends ``powerOfTenMultiplier`` with the
     wrong sign on its ReadingTypes (usage) or its UsageSummary cost lines (cost) — see
     [_power_of_ten]. ``interval_cost_in_thousandths`` reads IntervalReading ``<cost>`` in 1/1,000
-    of the currency rather than 1/100,000. All three come from the server's quirks of the same
-    names, never decided here.
+    of the currency rather than 1/100,000. ``enbridge_meter_reads`` reads the meter's register off
+    each UsageSummary's detail lines ([_parse_meter_reads]). All four come from the server's quirks
+    of the same names, never decided here.
     """
     # iterparse wants a stream, not a bytes literal — wrap if needed.
     stream = io.BytesIO(source) if isinstance(source, bytes) else source
@@ -240,6 +244,7 @@ def parse_usage_feed(
                 interval_cost_scale=(
                     _THOUSANDTHS_COST_SCALE if interval_cost_in_thousandths else _ESPI_COST_SCALE
                 ),
+                enbridge_meter_reads=enbridge_meter_reads,
             )
             elem.clear()
 
@@ -377,6 +382,7 @@ def _classify_entry(
     invert_usage: bool = False,
     invert_cost: bool = False,
     interval_cost_scale: float = _ESPI_COST_SCALE,
+    enbridge_meter_reads: bool = False,
 ) -> None:
     # Atom content wrapper → first child tells us the payload type.
     content = entry.find(f"{{{_ATOM_NS}}}content")
@@ -440,13 +446,15 @@ def _classify_entry(
         # Pin to parent via "related" link, since UsageSummary doesn't appear in the
         # UsagePoint's own link tree.
         up_id_from_related = _related_id(entry, "espi-entry/UsagePoint", "UsagePoint")
-        summary = _parse_usage_summary(payload, invert_cost=invert_cost)
+        summary = _parse_usage_summary(
+            payload, invert_cost=invert_cost, meter_reads=enbridge_meter_reads
+        )
         if summary is not None:
             summaries.append(_RawUsageSummary(usage_point_id=up_id_from_related, summary=summary))
 
 
 def _parse_usage_summary(
-    payload: ET.Element, *, invert_cost: bool = False
+    payload: ET.Element, *, invert_cost: bool = False, meter_reads: bool = False
 ) -> BillingSummary | None:
     """Build a BillingSummary from the inside of a `<content><espi:UsageSummary>` block."""
     billing_period_elem = payload.find(_TAG_BILLING_PERIOD)
@@ -466,16 +474,75 @@ def _parse_usage_summary(
     # falls back to whatever the linked ReadingType carries.
     currency = _int_text(payload.find(_TAG_CURRENCY))
 
+    detail_elems = payload.findall(_TAG_COST_ADDITIONAL_DETAIL_LAST_PERIOD)
     return BillingSummary(
         billing_period_start=datetime.fromtimestamp(start_epoch, tz=UTC),
         billing_period_duration_seconds=duration_seconds,
         bill_last_period_raw=_int_text(payload.find(_TAG_BILL_LAST_PERIOD)),
         cost_additional_last_period_raw=_int_text(payload.find(_TAG_COST_ADDITIONAL_LAST_PERIOD)),
-        cost_details=[
-            _parse_cost_detail(d, invert_cost=invert_cost)
-            for d in payload.findall(_TAG_COST_ADDITIONAL_DETAIL_LAST_PERIOD)
-        ],
+        cost_details=[_parse_cost_detail(d, invert_cost=invert_cost) for d in detail_elems],
         currency_numeric_code=currency,
+        meter_reads=(
+            _parse_meter_reads(
+                detail_elems,
+                _int_text(payload.find(_TAG_QUALITY_OF_READING)),
+                invert=invert_cost,
+            )
+            if meter_reads
+            else None
+        ),
+    )
+
+
+# Detail-line notes (normalized as [CostDetail.normalized_note]) carrying the meter's register on
+# an Enbridge Gas bill. Each line's value sits in its <measurement>, not its <amount>.
+_NOTE_PREVIOUS_READ = "previous meter read"
+_NOTE_CURRENT_READ = "current meter read"
+_NOTE_PREVIOUS_READ_DATE = "billing period - previous read date"
+_NOTE_CURRENT_READ_DATE = "billing period - current read date"
+_NOTE_BILL_DATE = "bill date"
+_NOTE_ADJUSTMENT_FACTOR = "adjustment factor (atmospheric)"
+
+
+def _parse_meter_reads(
+    details: list[ET.Element], quality_of_reading: int | None, *, invert: bool
+) -> BillMeterReads | None:
+    """The meter's register as a bill states it, or None when the bill doesn't carry it whole.
+
+    Values are scaled by their own ``powerOfTenMultiplier``, read under the same sign correction
+    as the bill's cost lines ([invert] — Enbridge sends a 32,771 m³ register as ``32771000`` at
+    ``3``). Read dates are ``uom`` 27 epoch seconds at UTC midnight, taken as calendar dates.
+    """
+    reads: dict[str, list[float]] = {}
+    for elem in details:
+        note = " ".join((elem.findtext(_TAG_NOTE) or "").lower().split())
+        measurement = elem.find(_TAG_MEASUREMENT)
+        if measurement is None:
+            continue
+        raw = _int_text(measurement.find(_TAG_VALUE))
+        if raw is None:
+            continue
+        power = _power_of_ten(measurement.find(_TAG_POW10), invert_if_positive=invert) or 0
+        reads.setdefault(note, []).append(raw * 10.0**power)
+
+    def read_date(note: str) -> date | None:
+        values = reads.get(note)
+        return datetime.fromtimestamp(values[0], tz=UTC).date() if values else None
+
+    previous_date = read_date(_NOTE_PREVIOUS_READ_DATE)
+    current_date = read_date(_NOTE_CURRENT_READ_DATE)
+    current_reads = tuple(reads.get(_NOTE_CURRENT_READ, ()))
+    factor = reads.get(_NOTE_ADJUSTMENT_FACTOR)
+    if previous_date is None or current_date is None or not current_reads or not factor:
+        return None
+    return BillMeterReads(
+        bill_date=read_date(_NOTE_BILL_DATE),
+        previous_read_date=previous_date,
+        current_read_date=current_date,
+        previous_reads=tuple(reads.get(_NOTE_PREVIOUS_READ, ())),
+        current_reads=current_reads,
+        adjustment_factor=factor[0],
+        quality_of_reading=quality_of_reading,
     )
 
 
@@ -654,14 +721,7 @@ def _warn_if_cost_looks_scaled(series: MeterReadingSeries) -> None:
 def _with_currency_default(s: BillingSummary, fallback: int | None) -> BillingSummary:
     if s.currency_numeric_code is not None or fallback is None:
         return s
-    return BillingSummary(
-        billing_period_start=s.billing_period_start,
-        billing_period_duration_seconds=s.billing_period_duration_seconds,
-        bill_last_period_raw=s.bill_last_period_raw,
-        cost_additional_last_period_raw=s.cost_additional_last_period_raw,
-        cost_details=s.cost_details,
-        currency_numeric_code=fallback,
-    )
+    return replace(s, currency_numeric_code=fallback)
 
 
 def _normalize_reading_type(rt: _RawReadingType | None) -> NormalizedReadingType:

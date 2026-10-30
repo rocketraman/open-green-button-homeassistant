@@ -44,15 +44,18 @@ from .api import (
 from .const import (
     BACKGROUND_LOAD_ISSUE_URL,
     CONF_APPLIED_QUIRKS,
+    CONF_BILL_READING_MISMATCHES,
     CONF_CUSTOMER_ACCOUNT_ID,
     CONF_CUSTOMER_ADDRESS,
     CONF_CUSTOMER_LABEL,
     CONF_EMPTY_SINCE,
     CONF_ENCRYPTED_REFRESH_BLOB,
+    CONF_FINE_READING_USAGE_POINTS,
     CONF_IMPORT_LOGIC_REVISION,
     CONF_INITIAL_HISTORY_SECONDS,
     CONF_INTERVAL_FLOWS,
     CONF_LAST_FETCHED_AT,
+    CONF_METER_READ_ANCHORS,
     CONF_PENDING_PUBLISHED_MAX,
     CONF_PENDING_PUBLISHED_MIN,
     CONF_PENDING_SINCE,
@@ -69,12 +72,14 @@ from .const import (
     IMPORT_LOGIC_REVISION,
     INITIAL_FETCH_LOOKBACK,
     LAST_FETCHED_OVERLAP,
+    MISMATCH_HISTORY_MAX_ROWS,
     PENDING_ESCALATE_AFTER,
     PENDING_RETRY_INTERVAL,
     POLL_HISTORY_MAX_ENTRIES,
     POLL_HISTORY_RETENTION,
     SERVICE_REBUILD_STATISTICS,
 )
+from .meter_reads import meter_read_points, newest_actual_read, newest_read
 from .statistics import (
     async_clear_statistics_for_entry,
     async_entry_has_statistics,
@@ -83,6 +88,7 @@ from .statistics import (
     async_stored_usage_shows_register_days,
     async_stored_usage_shows_resets,
     async_usage_point_looks_replaced,
+    has_fine_readings,
     import_usage_statistics,
     interval_flows,
     is_interval_consumption_series,
@@ -98,12 +104,14 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
     from .api import OpenGbApi
+    from .statistics import UsagePointImport
 
 _LOGGER = logging.getLogger(__package__)
 
 
 def _newest_reading_start(response: UsageResponse) -> datetime | None:
-    """Return the latest reading ``start`` across every importable series, or None if none.
+    """Return the latest reading ``start`` across every importable series — or bill meter read
+    ([_newest_reading_start_by_usage_point]) — or None if none.
 
     Used to anchor the incremental cursor to the real data frontier (the newest interval we
     actually imported) rather than wall-clock ``now`` — see
@@ -113,15 +121,7 @@ def _newest_reading_start(response: UsageResponse) -> datetime | None:
     daily register without its hourly sibling, letting the register move the cursor would push
     the next window past the hourly data this poll was missing, and it would never be fetched.
     """
-    newest: datetime | None = None
-    for up in response.usage_points:
-        for series in up.series:
-            if not is_interval_consumption_series(up, series):
-                continue
-            for reading in series.readings:
-                if newest is None or reading.start > newest:
-                    newest = reading.start
-    return newest
+    return max(_newest_reading_start_by_usage_point(response).values(), default=None)
 
 
 def _newest_reading_start_by_usage_point(response: UsageResponse) -> dict[str, datetime]:
@@ -130,9 +130,16 @@ def _newest_reading_start_by_usage_point(response: UsageResponse) -> dict[str, d
     The per-meter counterpart of [_newest_reading_start]. A poll routinely returns data for some
     meters and not others (they publish on their own cadences), and a meter absent from this
     mapping must keep the cursor it already had rather than be reset or dropped.
+
+    A meter whose usage comes from its bills' meter reads advances to its newest read date too:
+    Enbridge's IntervalReadings stop months before its bills, and a cursor held there would never
+    move. How far back the window must reach for that meter is [CONF_METER_READ_ANCHORS]' job.
     """
     newest: dict[str, datetime] = {}
     for up in response.usage_points:
+        read = newest_read(up)
+        if read is not None:
+            newest[up.usage_point_id] = read
         for series in up.series:
             if not is_interval_consumption_series(up, series):
                 continue
@@ -259,12 +266,13 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         )
         self._record_poll(now, total_readings)
 
-        await import_usage_statistics(
+        reports = await import_usage_statistics(
             self.hass,
             self.entry,
             response,
             utility_display_name=self.entry.data.get(CONF_UTILITY_NAME, "Open Green Button"),
         )
+        self._record_bill_reading_mismatches(reports)
 
         # One-time: give the entry a human-distinguishable title from its customer data. Cheap
         # (guarded to run once) and best-effort — never lets a customer-fetch hiccup fail the poll.
@@ -797,17 +805,30 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             for up_id, flows in stored.items()
             if isinstance(flows, list)
         }
+        # Likewise which meters have ever had a reading of a day or shorter — see
+        # CONF_FINE_READING_USAGE_POINTS.
+        stored_fine = self.entry.data.get(CONF_FINE_READING_USAGE_POINTS)
+        stored_fine = stored_fine if isinstance(stored_fine, list) else []
+        fine = {up_id for up_id in stored_fine if isinstance(up_id, str)}
         usage_points = []
         for up in response.usage_points:
             seen = frozenset(merged.get(up.usage_point_id, ())) | interval_flows(up)
             if seen:
                 merged[up.usage_point_id] = sorted(seen)
-            usage_points.append(
-                up if seen == up.interval_flows_seen else replace(up, interval_flows_seen=seen)
-            )
+            if has_fine_readings(up):
+                fine.add(up.usage_point_id)
+            fine_seen = up.usage_point_id in fine
+            if seen != up.interval_flows_seen or fine_seen != up.fine_readings_seen:
+                up = replace(up, interval_flows_seen=seen, fine_readings_seen=fine_seen)
+            usage_points.append(up)
+        updates: dict[str, object] = {}
         if merged != stored:
+            updates[CONF_INTERVAL_FLOWS] = merged
+        if sorted(fine) != stored_fine:
+            updates[CONF_FINE_READING_USAGE_POINTS] = sorted(fine)
+        if updates:
             self.hass.config_entries.async_update_entry(
-                self.entry, data={**self.entry.data, CONF_INTERVAL_FLOWS: merged}
+                self.entry, data={**self.entry.data, **updates}
             )
         if all(a is b for a, b in zip(usage_points, response.usage_points, strict=True)):
             return response
@@ -833,6 +854,43 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             self.entry,
             data={**self.entry.data, CONF_RECENT_POLLS: kept[-POLL_HISTORY_MAX_ENTRIES:]},
         )
+
+    def _record_bill_reading_mismatches(
+        self, reports: dict[str, UsagePointImport], *, fresh: bool = False
+    ) -> None:
+        """Keep what the bill meter reads disagreed with, for diagnostics (see
+        CONF_BILL_READING_MISMATCHES). A rebuild ([fresh]) starts the record over.
+
+        A poll re-fetching a window reports the same dropped readings again, so rows are keyed by
+        kind and span and a repeat replaces the row it repeats. Like the poll history, this is
+        evidence for a human and never an input: anything stored that won't parse is dropped.
+        """
+        current = self.entry.data.get(CONF_BILL_READING_MISMATCHES)
+        stored = current if isinstance(current, dict) and not fresh else {}
+        merged: dict[str, dict[str, list]] = {}
+        for up_id, held in stored.items():
+            if isinstance(held, dict):
+                merged[up_id] = {
+                    "agreeing": [a for a in held.get("agreeing") or [] if isinstance(a, str)],
+                    "rows": [r for r in held.get("rows") or [] if isinstance(r, dict)],
+                }
+        for up_id, report in reports.items():
+            if not report.mismatches and not report.agreeing:
+                continue
+            held = merged.setdefault(up_id, {"agreeing": [], "rows": []})
+            agreeing = dict.fromkeys(held["agreeing"])
+            agreeing.update(dict.fromkeys(start.isoformat() for start in report.agreeing))
+            rows = {(r.get("kind"), r.get("start"), r.get("end")): r for r in held["rows"]}
+            for mismatch in report.mismatches:
+                row = mismatch.as_dict()
+                rows.pop((row["kind"], row["start"], row["end"]), None)
+                rows[(row["kind"], row["start"], row["end"])] = row
+            held["agreeing"] = list(agreeing)[-MISMATCH_HISTORY_MAX_ROWS:]
+            held["rows"] = list(rows.values())[-MISMATCH_HISTORY_MAX_ROWS:]
+        if merged != current and (merged or current is not None):
+            self.hass.config_entries.async_update_entry(
+                self.entry, data={**self.entry.data, CONF_BILL_READING_MISMATCHES: merged}
+            )
 
     def _advance_cursor(self, response: UsageResponse) -> None:
         """Persist the incremental cursor as the newest reading start we've imported.
@@ -875,17 +933,32 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
             merged.pop(retired, None)
         merged_iso = {up_id: value.isoformat() for up_id, value in merged.items()}
 
+        # The newest actual meter read per meter, also forward-only — see CONF_METER_READ_ANCHORS.
+        prior_anchors = self._meter_read_anchors()
+        anchors = dict(prior_anchors)
+        for up in response.usage_points:
+            anchor = newest_actual_read(meter_read_points(up.summaries))
+            known = prior_anchors.get(up.usage_point_id)
+            if anchor is not None and (known is None or anchor > known):
+                anchors[up.usage_point_id] = anchor
+        anchors_iso = {up_id: value.isoformat() for up_id, value in anchors.items()}
+
         stored_cursors = self.entry.data.get(CONF_USAGE_POINT_CURSORS)
-        if cursor_iso == prior_raw and merged_iso == stored_cursors:
+        stored_anchors = self.entry.data.get(CONF_METER_READ_ANCHORS)
+        if (
+            cursor_iso == prior_raw
+            and merged_iso == stored_cursors
+            and (anchors_iso == stored_anchors or (not anchors_iso and stored_anchors is None))
+        ):
             return  # No forward movement — avoid a no-op entry write (and its churn).
-        self.hass.config_entries.async_update_entry(
-            self.entry,
-            data={
-                **self.entry.data,
-                CONF_LAST_FETCHED_AT: cursor_iso,
-                CONF_USAGE_POINT_CURSORS: merged_iso,
-            },
-        )
+        data = {
+            **self.entry.data,
+            CONF_LAST_FETCHED_AT: cursor_iso,
+            CONF_USAGE_POINT_CURSORS: merged_iso,
+        }
+        if anchors_iso:
+            data[CONF_METER_READ_ANCHORS] = anchors_iso
+        self.hass.config_entries.async_update_entry(self.entry, data=data)
 
     def _reconcile_data_availability(self) -> None:
         """Settle, after a successful fetch, whether this account has produced any data yet.
@@ -1287,13 +1360,14 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         # per-series resume-point read. That read is what a rebuild raced against — if it saw
         # the pre-clear cursor, every reading in the re-fetched full-history feed looked
         # "already imported" and got skipped, importing nothing.
-        await import_usage_statistics(
+        reports = await import_usage_statistics(
             self.hass,
             self.entry,
             response,
             utility_display_name=self.entry.data.get(CONF_UTILITY_NAME, "Open Green Button"),
             fresh=True,
         )
+        self._record_bill_reading_mismatches(reports, fresh=True)
         self._advance_cursor(response)
         self._reconcile_data_availability()
         # Everything in the store was just computed by the current logic, so the entry is at the
@@ -1718,7 +1792,11 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
         # slow one has not delivered yet.
         cursors = self._usage_point_cursors()
         if cursors:
-            return min(cursors.values()) - LAST_FETCHED_OVERLAP
+            # A meter billed from its meter reads reaches back further, to its newest actual read:
+            # usage after it is provisional, and restating it needs the bill carrying that read.
+            # See CONF_METER_READ_ANCHORS.
+            anchors = self._meter_read_anchors()
+            return min([*cursors.values(), *anchors.values()]) - LAST_FETCHED_OVERLAP
 
         # No per-meter map yet: either a brand-new entry (fall through to full history) or one
         # written before CONF_USAGE_POINT_CURSORS existed, whose entry-wide frontier still stands
@@ -1764,6 +1842,18 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
                 continue
             cursors[up_id] = parsed
         return cursors
+
+    def _meter_read_anchors(self) -> dict[str, datetime]:
+        """Per-meter newest actual meter reads (CONF_METER_READ_ANCHORS), dropping corrupt ones."""
+        stored = self.entry.data.get(CONF_METER_READ_ANCHORS)
+        if not isinstance(stored, dict):
+            return {}
+        anchors: dict[str, datetime] = {}
+        for up_id, raw in stored.items():
+            parsed = _parse_iso_or_none(raw)
+            if parsed is not None:
+                anchors[up_id] = parsed
+        return anchors
 
     def _initial_lookback(self) -> timedelta:
         """How far back to backfill on the first fetch.

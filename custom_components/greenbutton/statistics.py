@@ -17,6 +17,7 @@ import asyncio
 import logging
 import math
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -30,11 +31,15 @@ from homeassistant.components.recorder.statistics import (
 from homeassistant.const import UnitOfEnergy, UnitOfVolume
 from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.helpers.start import async_at_started
+from homeassistant.util import dt as dt_util
 
+from . import meter_reads
+from .api import MeterReadingSeries, NormalizedReadingType
 from .const import (
     CONF_USAGE_POINT_ALIASES,
     DOMAIN,
     LAST_FETCHED_OVERLAP,
+    QUIRK_ENBRIDGE_METER_READS,
     USAGE_POINT_REPLACED_LOOKBACK,
 )
 from .tou import cost_detail_tou_bucket, ontario_tou_bucket
@@ -45,8 +50,6 @@ if TYPE_CHECKING:
 
     from .api import (
         BillingSummary,
-        MeterReadingSeries,
-        NormalizedReadingType,
         UsagePoint,
         UsageResponse,
     )
@@ -613,6 +616,18 @@ async def async_stored_usage_shows_register_days(
     return False
 
 
+def response_has_bill_meter_reads(response: UsageResponse) -> bool:
+    """Revision 8: whether [response] carries bills whose meter reads now supply usage.
+
+    The server switching ``enbridgeMeterReads`` on already rebuilds every entry that has stored
+    rows (the quirk set changed). This catches the entry whose quirk set was recorded by an
+    integration version that didn't yet act on it, and so never rebuilt.
+    """
+    return QUIRK_ENBRIDGE_METER_READS in response.quirks and any(
+        meter_reads.has_meter_reads(up) for up in response.usage_points
+    )
+
+
 # Recognition predicates keyed by the import-logic revision that fixed the bug. An entry stamped
 # at revision N is tested against every predicate for a revision > N — so a user who skipped a
 # release still gets each repair they're owed, in one rebuild rather than one per revision.
@@ -626,6 +641,7 @@ _IMPORT_MIGRATION_CHECKS: dict[int, Callable[[UsageResponse], bool | None]] = {
     5: response_has_series_sharing_a_statistic,
     6: response_damage_is_judged_from_stored_rows,
     7: response_cost_lines_carry_a_quantity,
+    8: response_has_bill_meter_reads,
 }
 
 
@@ -660,6 +676,21 @@ def _slugify(component: str) -> str:
     return "".join(c if c.isalnum() else "_" for c in component.lower())
 
 
+@dataclass(slots=True)
+class UsagePointImport:
+    """What importing one meter's bill meter reads found, for the coordinator to keep.
+
+    Only filled for a meter whose bills carry meter reads ([meter_reads]); empty otherwise.
+    """
+
+    # Readings dropped for, and stored usage restated by, a bill's meter reads that disagree with
+    # it — see [meter_reads.Mismatch]. Readings that agreed are only counted, by their start.
+    mismatches: list[meter_reads.Mismatch] = field(default_factory=list)
+    agreeing: list[datetime] = field(default_factory=list)
+    # The earliest stored hour the bill meter reads restated: cost is restated from there too.
+    restated_from: datetime | None = None
+
+
 async def import_usage_statistics(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -667,7 +698,7 @@ async def import_usage_statistics(
     utility_display_name: str,
     *,
     fresh: bool = False,
-) -> None:
+) -> dict[str, UsagePointImport]:
     """Push every interval-consumption series in [response] into HA long-term statistics.
 
     Cumulative meter registers are excluded — see [is_interval_consumption_series].
@@ -683,9 +714,16 @@ async def import_usage_statistics(
     full-history feed looked "already imported" and got skipped, importing nothing. On a
     rebuild there is by definition no prior data to resume from, so reading it is both
     unnecessary and the source of the race — bypass it.
+
+    A meter whose bills carry meter reads (the server's ``enbridgeMeterReads`` quirk) takes its
+    usage from them wherever no reading of a day or shorter covers the hour — see [meter_reads].
+    Returns, per UsagePoint id, what that found ([UsagePointImport]).
     """
+    reports: dict[str, UsagePointImport] = {}
     for up in response.usage_points:
         imported_any = False
+        report = reports.setdefault(up.usage_point_id, UsagePointImport())
+        bill_hours = _bill_hours(up)
         # Keyed by (flow direction, commodity), which is what [statistic_id_for_series] keys on:
         # every series in one group lands in the same statistic and has to be accumulated as one.
         by_target: dict[tuple[str, str | None], list[MeterReadingSeries]] = {}
@@ -716,10 +754,18 @@ async def import_usage_statistics(
                 continue
             target = (series.reading_type.flow_direction, _series_commodity(up, series))
             by_target.setdefault(target, []).append(series)
-        for group in by_target.values():
+        bill_target = _bill_target(up, by_target) if bill_hours else None
+        for target, group in by_target.items():
             # Call first, then OR — `or` short-circuits, and every group must be imported.
             imported = await _import_series_group(
-                hass, entry, up, group, utility_display_name, fresh=fresh
+                hass,
+                entry,
+                up,
+                group,
+                utility_display_name,
+                fresh=fresh,
+                bill_hours=bill_hours if target == bill_target else None,
+                report=report,
             )
             imported_any = imported or imported_any
         if up.series and not imported_any:
@@ -778,7 +824,9 @@ async def import_usage_statistics(
                 "Running deferred cost import for entry %s (HA has started)", entry.entry_id
             )
             await async_flush_recorder(hass)
-            await _import_costs(hass, entry, response, utility_display_name, fresh=fresh)
+            await _import_costs(
+                hass, entry, response, utility_display_name, fresh=fresh, reports=reports
+            )
 
         _LOGGER.debug(
             "HA is %s, not running — deferring cost import for entry %s until after startup",
@@ -786,11 +834,12 @@ async def import_usage_statistics(
             entry.entry_id,
         )
         entry.async_on_unload(async_at_started(hass, _deferred_cost_pass))
-        return
+        return reports
 
     if needs_recorder_flush:
         await async_flush_recorder(hass)
-    await _import_costs(hass, entry, response, utility_display_name, fresh=fresh)
+    await _import_costs(hass, entry, response, utility_display_name, fresh=fresh, reports=reports)
+    return reports
 
 
 async def _import_costs(
@@ -800,6 +849,7 @@ async def _import_costs(
     utility_display_name: str,
     *,
     fresh: bool = False,
+    reports: dict[str, UsagePointImport] | None = None,
 ) -> None:
     """Second-pass cost import for every usage point in [response].
 
@@ -815,7 +865,15 @@ async def _import_costs(
         if _has_interval_cost(up):
             await _import_cost_from_readings(hass, entry, up, utility_display_name, fresh=fresh)
         else:
-            await _import_cost_summaries(hass, entry, up, utility_display_name, fresh=fresh)
+            report = (reports or {}).get(up.usage_point_id)
+            await _import_cost_summaries(
+                hass,
+                entry,
+                up,
+                utility_display_name,
+                fresh=fresh,
+                restate_from=report.restated_from if report else None,
+            )
 
 
 # ESPI AccumulationKind values whose readings are a running meter register (a total since the
@@ -1029,6 +1087,116 @@ def _has_interval_cost(up: UsagePoint) -> bool:
     return any(r.cost is not None for s in _forward_interval_series(up) for r in s.readings)
 
 
+def _bill_hours(up: UsagePoint) -> dict[datetime, float]:
+    """``{hour: quantity}`` spread from [up]'s bill meter reads; empty for a meter without them.
+
+    Quantities are in the bills' unit, cubic metres (the only one a feed with meter reads has
+    sent); [_import_series_group] checks that against the statistic it lands in.
+    """
+    if not meter_reads.has_meter_reads(up):
+        return {}
+    tz = dt_util.get_default_time_zone()
+    hours: dict[datetime, float] = {}
+    for span in meter_reads.bill_spans(meter_reads.meter_read_points(up.summaries), tz):
+        seconds = int((span.end - span.start).total_seconds())
+        for hour, _, fraction in _hours_spanned(span.start, seconds):
+            hours[hour] = hours.get(hour, 0.0) + span.quantity * fraction
+    return hours
+
+
+# A stand-in series for a meter whose bills carry meter reads but whose poll carries no FORWARD
+# series at all. Enbridge's IntervalReadings stop months before its bills do, so an incremental poll
+# can carry bills and nothing else; the bills' usage still needs a statistic to land in.
+_BILL_READING_TYPE = NormalizedReadingType(
+    commodity="NATURAL_GAS",
+    flow_direction="FORWARD",
+    accumulation_behaviour="DELTA_DATA",
+    interval_length_seconds=0,
+    unit_of_measure="CUBIC_METERS",
+    unit_of_measure_symbol="m³",
+    power_of_ten_multiplier=0,
+    currency_numeric_code=None,
+)
+
+
+def _bill_target(
+    up: UsagePoint, by_target: dict[tuple[str, str | None], list[MeterReadingSeries]]
+) -> tuple[str, str | None]:
+    """The statistic group a meter's bill usage lands in: its FORWARD gas group, else any FORWARD
+    group, else a new one for [_BILL_READING_TYPE] (added to [by_target])."""
+    forward = [target for target in by_target if target[0] == "FORWARD"]
+    for target in forward:
+        if target[1] == COMMODITY_GAS:
+            return target
+    if forward:
+        return forward[0]
+    series = MeterReadingSeries(
+        meter_reading_id="bill-meter-reads", reading_type=_BILL_READING_TYPE, readings=[]
+    )
+    target = ("FORWARD", _series_commodity(up, series))
+    by_target[target] = [series]
+    return target
+
+
+def _apply_bill_hours(
+    by_hour: dict[datetime, float],
+    covered_seconds: dict[datetime, int],
+    group: list[MeterReadingSeries],
+    bill_hours: dict[datetime, float],
+    report: UsagePointImport | None,
+) -> set[datetime]:
+    """Give the bills' usage every hour no reading of a day or shorter covers; return them.
+
+    A billing-period reading and a bill over the same days describe the same gas, so for those
+    hours the reading is dropped — not added, as two readings of similar length normally are in
+    [_hourly_totals]. Each dropped reading is compared with the bill's usage over the hours it lost
+    and recorded in [report].
+    """
+    fine_hours = {
+        hour
+        for series in group
+        for reading in series.readings
+        if reading.duration_seconds <= meter_reads.FINE_READING_MAX_SECONDS
+        for hour, _, _ in _hours_spanned(reading.start, reading.duration_seconds)
+    }
+    taken = {hour for hour in bill_hours if hour not in fine_hours}
+    for hour in taken:
+        by_hour[hour] = bill_hours[hour]
+        covered_seconds[hour] = 3600
+
+    if report is not None:
+        for series in group:
+            for reading in series.readings:
+                if reading.duration_seconds <= meter_reads.FINE_READING_MAX_SECONDS:
+                    continue
+                lost = [
+                    (hour, overlap, fraction)
+                    for hour, overlap, fraction in _hours_spanned(
+                        reading.start, reading.duration_seconds
+                    )
+                    if hour in taken
+                ]
+                if not lost:
+                    continue
+                dropped = _to_ha_units(reading.value, series.reading_type) * sum(
+                    fraction for _, _, fraction in lost
+                )
+                bill = sum(bill_hours[hour] * overlap / 3600 for hour, overlap, _ in lost)
+                if meter_reads.agrees(dropped, bill):
+                    report.agreeing.append(reading.start)
+                    continue
+                report.mismatches.append(
+                    meter_reads.Mismatch(
+                        kind="same_response",
+                        start=reading.start,
+                        end=reading.start + timedelta(seconds=reading.duration_seconds),
+                        reading=dropped,
+                        bill=bill,
+                    )
+                )
+    return taken
+
+
 async def _import_series_group(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -1037,6 +1205,8 @@ async def _import_series_group(
     utility_display_name: str,
     *,
     fresh: bool = False,
+    bill_hours: dict[datetime, float] | None = None,
+    report: UsagePointImport | None = None,
 ) -> bool:
     """Import every series of one flow direction on [up] into the single statistic they share.
 
@@ -1052,6 +1222,12 @@ async def _import_series_group(
     the Energy dashboard), and on an ordinary poll a series older than one already written was
     dropped whole by the stale-window guard. A utility is free to publish one meter's history
     as many MeterReadings; UtilityAPI does (issue #21).
+
+    [bill_hours], when given, is usage spread from the meter's bill meter reads ([_bill_hours]):
+    it takes every hour no reading of a day or shorter covers ([_apply_bill_hours]). Those hours
+    may also restate stored ones — that is how an estimate is replaced once an actual read
+    brackets it — but only for a meter that has never published a reading that fine, whose
+    stored hours can't have been measured.
     """
     statistic_id = statistic_id_for_series(
         entry.entry_id,
@@ -1075,10 +1251,19 @@ async def _import_series_group(
         representable.append(series)
     if not representable:
         return False
-    if not any(series.readings for series in representable):
-        return True  # Nothing to write; keeps logs quiet on the test-lab empty-account case.
     series = representable[0]
     unit = _ha_unit_for(series.reading_type)
+    if bill_hours and unit != UnitOfVolume.CUBIC_METERS:
+        _warn_once(
+            f"{statistic_id}:bill-meter-reads-unit",
+            "Ignoring the bill meter reads for %s: its statistic is in %s, but bills state their "
+            "meter reads in cubic metres",
+            statistic_id,
+            unit,
+        )
+        bill_hours = None
+    if not bill_hours and not any(series.readings for series in representable):
+        return True  # Nothing to write; keeps logs quiet on the test-lab empty-account case.
 
     metadata: StatisticMetaData = {
         "has_mean": False,
@@ -1100,6 +1285,11 @@ async def _import_series_group(
     )
 
     by_hour, covered_seconds, measured = _hourly_totals(representable)
+    billed = (
+        _apply_bill_hours(by_hour, covered_seconds, representable, bill_hours, report)
+        if bill_hours
+        else set()
+    )
     _drop_incomplete_trailing_hour(by_hour, covered_seconds, statistic_id)
 
     stats: list[StatisticData] = []
@@ -1107,15 +1297,34 @@ async def _import_series_group(
     if resume_after_epoch is not None:
         # Hours this poll re-fetched that are already stored. A utility may correct a block
         # after first publishing it, so these are compared with the store instead of assumed
-        # identical; only hours the feed fully measured are trusted to overrule it.
+        # identical; only hours the feed fully measured are trusted to overrule it — and hours
+        # from a bill's meter reads, on a meter whose stored hours were never measured.
+        restating = measured
+        if billed and not up.fine_readings_seen and not _has_fine_readings(representable):
+            restating = measured | billed
         refetched = {
             hour: by_hour[hour]
-            for hour in measured
+            for hour in restating
             if hour in by_hour and hour.timestamp() <= resume_after_epoch
         }
         restated = await _restated_rows(hass, statistic_id, refetched)
         if restated is not None:
-            stats, running = restated
+            stats, running, stored_sum = restated
+            first = stats[0]["start"]
+            if first in billed and report is not None:
+                report.restated_from = first
+                base = stats[0]["sum"] - refetched[first]
+                before, after = stored_sum - base, running - base
+                if not meter_reads.agrees(before, after):
+                    report.mismatches.append(
+                        meter_reads.Mismatch(
+                            kind="restated",
+                            start=first,
+                            end=stats[-1]["start"] + timedelta(hours=1),
+                            reading=before,
+                            bill=after,
+                        )
+                    )
     for hour in sorted(by_hour):
         # Stale-window guard — HA's statistics machinery already deduplicates on
         # (statistic_id, start), but skipping locally avoids resetting `running` from
@@ -1147,7 +1356,7 @@ async def _restated_rows(
     hass: HomeAssistant,
     statistic_id: str,
     refetched: dict[datetime, float],
-) -> tuple[list[StatisticData], float] | None:
+) -> tuple[list[StatisticData], float, float] | None:
     """Rows that restate [statistic_id] where [refetched] disagrees with it, or None if it agrees.
 
     [refetched] is ``{hour: quantity}`` for hours at or before the statistic's last stored row.
@@ -1162,7 +1371,8 @@ async def _restated_rows(
     consumption already stored for them — and comes back with the sum it ends on, for the
     caller to continue from. HA upserts on (statistic_id, start), so writing these rows replaces
     the stored ones. A re-fetched hour with no stored row at all (a gap the feed has since
-    filled) counts as stored zero, and is inserted.
+    filled) counts as stored zero, and is inserted. The stored statistic's last sum comes back
+    third, so a caller can tell how far the restatement moved the total.
 
     Nothing is deleted and nothing outside the statistic is touched; a poll whose overlap
     matches the store — every ordinary poll — writes nothing here.
@@ -1227,7 +1437,24 @@ async def _restated_rows(
         running - last_stored_sum,
         len(rows),
     )
-    return rows, running
+    return rows, running, last_stored_sum
+
+
+def _has_fine_readings(group: list[MeterReadingSeries]) -> bool:
+    """Whether any reading in [group] is a day or shorter — finer than any bill."""
+    return any(
+        reading.duration_seconds <= meter_reads.FINE_READING_MAX_SECONDS
+        for series in group
+        for reading in series.readings
+    )
+
+
+def has_fine_readings(up: UsagePoint) -> bool:
+    """Whether [up] carries an interval reading of a day or shorter this poll.
+
+    What the coordinator remembers in CONF_FINE_READING_USAGE_POINTS.
+    """
+    return _has_fine_readings([s for s in up.series if is_interval_consumption_series(up, s)])
 
 
 def _hourly_totals(
@@ -1457,6 +1684,7 @@ async def _import_cost_summaries(
     utility_display_name: str,
     *,
     fresh: bool = False,
+    restate_from: datetime | None = None,
 ) -> None:
     """Write a cumulative-cost statistic from this UsagePoint's BillingSummary entries.
 
@@ -1511,6 +1739,19 @@ async def _import_cost_summaries(
     [coordinator.GreenButtonCoordinator._async_migrate_import]) re-imports from a clean slate and
     applies this to the whole history, which is how a feed imported under the old rule gets fixed.
 
+    **Bills with meter reads** ([meter_reads], Enbridge Gas) differ in three ways:
+
+    * The period comes from the read dates — the day after the previous read through the current
+      read, in local time — since the feed's ``billingPeriod`` runs a day short.
+    * A correction bill states only the difference between what the bills it corrects charged
+      and what the actual read says — often a credit. So it is costed together with them: their
+      amounts plus its own, spread over its whole span, replacing what they put there. Added on
+      top of them instead, a credit lands on the days past the corrected bills and can price a
+      month below zero.
+    * When the usage pass restated stored hours ([restate_from]), the cost from the start of the
+      bill period containing that hour is recomputed and restated too, so each bill's dollars are
+      spread over its corrected usage.
+
     Skipped when the UsagePoint has no summaries (most utilities only attach UsageSummary
     to accounts they bill; meter-only test profiles often won't), or when the currency code
     isn't one we have an ISO 4217 alpha mapping for.
@@ -1558,12 +1799,16 @@ async def _import_cost_summaries(
     # per-period so the summary below can say how many, over what span — "why is there no cost
     # statistic?" is otherwise unanswerable from the log at any level.
     uncostable: list[datetime] = []
+    tz = dt_util.get_default_time_zone()
+    periods: list[tuple[datetime, datetime]] = []
     # Each summary prices every hour of its own period, and a later one simply replaces whatever
     # an earlier one put on an hour they share — see the docstring on why replacing beats trimming.
+    # Corrections go last, over the bills they correct.
     cost_by_hour: dict[datetime, float] = {}
     for summary in sorted(
         up.summaries,
         key=lambda s: (
+            s.meter_reads is not None and s.meter_reads.is_correction,
             s.billing_period_start,
             -s.billing_period_duration_seconds,
             s.total_cost,
@@ -1574,8 +1819,22 @@ async def _import_cost_summaries(
             # Test-lab fixtures often have $0 placeholders — skip rather than emit a
             # cumulative-flat row across an entire month, or blank out a real bill's hours.
             continue
-        period_start = summary.billing_period_start
-        period_end = period_start + timedelta(seconds=summary.billing_period_duration_seconds)
+        period_start, period_end = meter_reads.billing_period(summary, tz) or (
+            summary.billing_period_start,
+            summary.billing_period_start
+            + timedelta(seconds=summary.billing_period_duration_seconds),
+        )
+        periods.append((period_start, period_end))
+        if summary.meter_reads is not None and summary.meter_reads.is_correction:
+            period_cost += sum(
+                other.total_cost
+                for other in up.summaries
+                if other.meter_reads is not None
+                and not other.meter_reads.is_correction
+                and (other_period := meter_reads.billing_period(other, tz)) is not None
+                and period_start <= other_period[0]
+                and other_period[1] <= period_end
+            )
         # FORWARD consumption for the period, read back from the recorder (see the docstring).
         # REVERSE flow (solar export) isn't part of consumption cost, so the usage stat we read
         # here — the FORWARD series — is the right basis.
@@ -1598,12 +1857,31 @@ async def _import_cost_summaries(
         # Per-hour cost = per-kWh TOU rate (zero if not a TOU bucket) + per-kWh non-TOU rate
         # for everything else (Delivery, Global Adjustment, rebates, etc.). Sum of all hourly
         # costs across the period equals the period's total bill — verified by construction.
-        cost_by_hour.update(_cost_distribution_for_period(summary, in_period, total_period_kwh))
+        cost_by_hour.update(
+            _cost_distribution_for_period(summary, in_period, total_period_kwh, period_cost)
+        )
 
     # One pass, in time order, so the cumulative sum is monotonic no matter what order the feed
     # listed its summaries in.
     stats: list[StatisticData] = []
     running = resume_from_sum
+    if resume_after_epoch is not None and restate_from is not None:
+        # The usage under already-costed hours changed, so every bill whose period reaches it is
+        # re-spread, from the start of the earliest such period.
+        since = min(
+            [restate_from] + [start for start, end in periods if start <= restate_from < end]
+        )
+        restated = await _restated_rows(
+            hass,
+            statistic_id,
+            {
+                hour: cost
+                for hour, cost in cost_by_hour.items()
+                if since <= hour and hour.timestamp() <= resume_after_epoch
+            },
+        )
+        if restated is not None:
+            stats, running, _ = restated
     for hour_start in sorted(cost_by_hour):
         if resume_after_epoch is not None and hour_start.timestamp() <= resume_after_epoch:
             continue
@@ -1737,7 +2015,7 @@ async def _import_cost_from_readings(
         }
         restated = await _restated_rows(hass, statistic_id, refetched)
         if restated is not None:
-            stats, running = restated
+            stats, running, _ = restated
     for hour in sorted(cost_by_hour):
         if resume_after_epoch is not None and hour.timestamp() <= resume_after_epoch:
             continue
@@ -1758,8 +2036,12 @@ def _cost_distribution_for_period(
     summary: BillingSummary,
     in_period: list[tuple[datetime, float]],
     total_period_kwh: float,
+    total_cost: float | None = None,
 ) -> dict[datetime, float]:
     """Return per-hour cost for the readings in [in_period].
+
+    [total_cost] overrides the summary's own total — a correction bill is costed together with
+    the bills it corrects (see [_import_cost_summaries]).
 
     When the summary's detail items include TOU line items (Off-Peak, Mid-Peak, On-Peak),
     each TOU portion is distributed across the hours of that bucket at its own rate, and
@@ -1797,7 +2079,7 @@ def _cost_distribution_for_period(
             bucket_rates[bucket] = cost / bucket_kwh
             tou_distributed += cost
 
-    flat_residual = summary.total_cost - tou_distributed
+    flat_residual = (summary.total_cost if total_cost is None else total_cost) - tou_distributed
     flat_rate = (flat_residual / total_period_kwh) if total_period_kwh > 0 else 0.0
 
     out: dict[datetime, float] = {}
