@@ -108,7 +108,9 @@ Its previous read is a point too.
   A correction bill is just the case where the actual read came in below the estimate; both cases end up the same.
 * Estimated points after the newest actual read are kept, as provisional usage, until the next actual read brackets them.
   They are then dropped and the span is restated (see below).
-* Usage between consecutive surviving points = register difference × PEF (the PEF of the bill whose current read ends the span).
+* Usage between consecutive surviving points = the sum of the volumes of the bills between them, each its own register difference × its PEF, rounded as the invoice rounds it.
+  Rounding the span once instead came out a cubic metre off the invoices on two of the four accounts (876 against Raman's 410 + 467).
+  When those bills don't account for the span's whole register difference (a bill missing from the response, or two bills for one period), the span falls back to register difference × the PEF of the bill ending it, rounded once.
 * Each span is spread evenly over its hours, from local midnight after the earlier read to local midnight after the later one (Home Assistant's configured time zone; Enbridge's LocalTimeParameters sends `tzOffset` -18, which is unusable).
   Spreading per hour rather than per day gives a daylight-saving day its 23 or 25 hours' share.
 

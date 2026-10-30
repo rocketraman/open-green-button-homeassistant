@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Enbridge Gas: usage between two actual meter reads could be a cubic metre
+  off the invoices, because it was rounded once over the whole stretch while
+  Enbridge rounds each bill. It now adds up each bill's own rounded volume.
+
 ## [0.3.4] - 2026-10-30
 
 ### Changed
