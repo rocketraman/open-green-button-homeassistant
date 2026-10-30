@@ -21,10 +21,12 @@ Bill Date wins, and between equal dates an actual read beats an estimate. Then:
 A correction bill (two current reads: the estimate, then the actual) is itself marked estimated,
 but its final read is the actual one — the correction exists because an actual read came in.
 
-**From the chain to hours.** Usage between consecutive points = register difference × the
-adjustment factor of the bill ending the span, rounded to a whole unit as the bill rounds it. It is
-spread evenly over the span: from local midnight after the earlier read through the end of the
-later read's day, in Home Assistant's time zone (Enbridge's own ``tzOffset`` is unusable).
+**From the chain to hours.** Usage between consecutive points is what the bills between them
+billed: each bill's register difference × its adjustment factor, rounded to a whole unit as the bill
+rounds it, summed. Summing the bills' own rounded volumes, rather than rounding the span once, keeps
+the total equal to the invoices'. It is spread evenly over the span: from local midnight after the
+earlier read through the end of the later read's day, in Home Assistant's time zone (Enbridge's
+own ``tzOffset`` is unusable).
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .api import BillingSummary, UsagePoint
+    from .api import BillingSummary, BillMeterReads, UsagePoint
 
 # ESPI qualityOfReading for a read the custodian took off the meter. Enbridge prints 19 as
 # "Actual" and 12 as "Estimated"; anything other than 19 is treated as an estimate.
@@ -168,12 +170,15 @@ def _with_status(point: MeterReadPoint, status: str) -> MeterReadPoint:
     )
 
 
-def bill_spans(points: list[MeterReadPoint], tz: tzinfo) -> list[BillSpan]:
-    """Usage between each pair of consecutive reads the chain keeps."""
+def bill_spans(
+    points: list[MeterReadPoint], tz: tzinfo, summaries: list[BillingSummary]
+) -> list[BillSpan]:
+    """Usage between each pair of consecutive reads the chain keeps, from [summaries]' bills."""
+    bills = [s.meter_reads for s in summaries if s.meter_reads is not None]
     chain = [p for p in points if p.status in (STATUS_KEPT, STATUS_PROVISIONAL)]
     spans: list[BillSpan] = []
     for earlier, later in zip(chain, chain[1:], strict=False):
-        quantity = round((later.value - earlier.value) * later.adjustment_factor)
+        quantity = _billed_volume(earlier, later, bills)
         if quantity < 0:
             # A register that went backwards between kept reads: a meter exchange or rollover,
             # which no bill seen so far has shown. Nothing sound can be spread over it.
@@ -187,6 +192,35 @@ def bill_spans(points: list[MeterReadPoint], tz: tzinfo) -> list[BillSpan]:
             )
         )
     return spans
+
+
+def _billed_volume(
+    earlier: MeterReadPoint, later: MeterReadPoint, bills: list[BillMeterReads]
+) -> int:
+    """What the bills between [earlier] and [later] billed, each rounded as its invoice rounds it.
+
+    Only when those bills account for the whole register difference between the two reads: a bill
+    missing from the response, or two bills restating one period, would make their sum wrong. Then
+    the span is the register difference × the adjustment factor of the read ending it, rounded once.
+    """
+    inside = [
+        b
+        for b in bills
+        if earlier.read_date <= b.previous_read_date
+        and earlier.read_date < b.current_read_date <= later.read_date
+    ]
+    # A correction bills from the estimate it corrects to the actual read; any other bill from its
+    # previous read. That is the register difference its own volume was billed on.
+    differences = [
+        (b.current_reads[-1] - (b.current_reads[0] if b.is_correction else b.previous_reads[0]), b)
+        for b in inside
+        if b.is_correction or len(b.previous_reads) == 1
+    ]
+    if len(differences) == len(inside) and math.isclose(
+        sum(d for d, _ in differences), later.value - earlier.value, abs_tol=1e-6
+    ):
+        return sum(round(d * b.adjustment_factor) for d, b in differences)
+    return round((later.value - earlier.value) * later.adjustment_factor)
 
 
 def billing_period(summary: BillingSummary, tz: tzinfo) -> tuple[datetime, datetime] | None:

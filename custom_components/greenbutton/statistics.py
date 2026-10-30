@@ -1097,7 +1097,9 @@ def _bill_hours(up: UsagePoint) -> dict[datetime, float]:
         return {}
     tz = dt_util.get_default_time_zone()
     hours: dict[datetime, float] = {}
-    for span in meter_reads.bill_spans(meter_reads.meter_read_points(up.summaries), tz):
+    for span in meter_reads.bill_spans(
+        meter_reads.meter_read_points(up.summaries), tz, up.summaries
+    ):
         seconds = int((span.end - span.start).total_seconds())
         for hour, _, fraction in _hours_spanned(span.start, seconds):
             hours[hour] = hours.get(hour, 0.0) + span.quantity * fraction

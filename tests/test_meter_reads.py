@@ -184,13 +184,14 @@ def _total(changes: list[tuple[datetime, float]], start: datetime, end: datetime
 
 
 def test_an_estimate_between_actual_reads_is_bracketed_and_usage_spreads_across_both() -> None:
-    points = meter_reads.meter_read_points([_JUNE, _JULY])
+    bills = [_JUNE, _JULY]
+    points = meter_reads.meter_read_points(bills)
     assert [(p.read_date.isoformat(), p.status) for p in points] == [
         ("2026-05-29", "kept"),
         ("2026-06-29", "bracketed"),
         ("2026-07-30", "kept"),
     ]
-    [span] = meter_reads.bill_spans(points, _TORONTO)
+    [span] = meter_reads.bill_spans(points, _TORONTO, bills)
     # 63 + 21 billed; (35584 − 35500) × 1.004 = 84.3, rounded as the bills round.
     assert span.quantity == 84
     assert (span.start, span.end) == (
@@ -200,10 +201,39 @@ def test_an_estimate_between_actual_reads_is_bracketed_and_usage_spreads_across_
     assert not span.provisional
 
 
+def test_a_span_totals_the_bills_own_rounded_volumes() -> None:
+    """Raman's January 29 to March 30: Enbridge billed 410 + 467 = 877 m³, rounding each bill.
+
+    Rounding the span once gives 873 × 1.004 = 876.5 → 876, a cubic metre short of the invoices.
+    """
+    jan29, feb27, mar30 = (
+        (date(2026, 1, 29), 34334.0),
+        (date(2026, 2, 27), 34742.0),
+        (date(2026, 3, 30), 35207.0),
+    )
+    bills = [
+        _bill(jan29, feb27, actual=False, dollars=159.71),
+        _bill(feb27, mar30, actual=True, dollars=176.96),
+    ]
+    [span] = meter_reads.bill_spans(meter_reads.meter_read_points(bills), _TORONTO, bills)
+    assert span.quantity == 877
+
+
+def test_a_span_whose_bills_dont_add_up_rounds_the_register_difference() -> None:
+    """Two bills for one period would bill its usage twice; the register difference is used."""
+    feb27, mar30 = (date(2026, 2, 27), 34742.0), (date(2026, 3, 30), 35207.0)
+    march = _bill(feb27, mar30, actual=True, dollars=176.96)
+    duplicate = _bill(feb27, mar30, actual=True, dollars=176.96, bill_date=date(2026, 4, 20))
+    bills = [march, duplicate]
+    [span] = meter_reads.bill_spans(meter_reads.meter_read_points(bills), _TORONTO, bills)
+    assert span.quantity == round(465 * 1.004)
+
+
 def test_an_estimate_after_the_newest_actual_read_is_provisional() -> None:
-    points = meter_reads.meter_read_points([_JUNE])
+    bills = [_JUNE]
+    points = meter_reads.meter_read_points(bills)
     assert [p.status for p in points] == ["kept", "provisional"]
-    [span] = meter_reads.bill_spans(points, _TORONTO)
+    [span] = meter_reads.bill_spans(points, _TORONTO, bills)
     assert span.quantity == 63
     assert span.provisional
     assert meter_reads.newest_actual_read(points) == datetime(2026, 5, 29, tzinfo=UTC)
@@ -220,13 +250,14 @@ def test_a_correction_supersedes_the_estimate_and_its_actual_read_is_kept() -> N
     correction = _bill(
         mar13, may13, actual=True, dollars=-46.35, bill_date=date(2026, 5, 19), corrects=53065.0
     )
-    points = meter_reads.meter_read_points([april, correction])
+    bills = [april, correction]
+    points = meter_reads.meter_read_points(bills)
     assert [(p.read_date.isoformat(), p.value, p.status) for p in points] == [
         ("2026-03-13", 52801.0, "kept"),
         ("2026-04-15", 53065.0, "superseded"),
         ("2026-05-13", 52806.0, "kept"),
     ]
-    [span] = meter_reads.bill_spans(points, _TORONTO)
+    [span] = meter_reads.bill_spans(points, _TORONTO, bills)
     assert span.quantity == 5  # never the −259 m³ the correction bills
 
 
