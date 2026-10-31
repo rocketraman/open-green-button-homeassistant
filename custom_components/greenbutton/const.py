@@ -363,7 +363,12 @@ CONF_IMPORT_LOGIC_REVISION = "import_logic_revision"
 #       usage is now built from the register on each bill. Recognized from any bill in the poll
 #       carrying meter reads under the quirk. The quirk-set change alone already rebuilds an
 #       entry; this catches one that recorded the quirk on an integration version that ignored it.
-IMPORT_LOGIC_REVISION = 8
+#   9 — a bill is priced from its itemized charges whenever it has any. A populated billLastPeriod
+#       used to win in feeds without per-line scales, and Burlington Hydro began sending one that
+#       is the whole bill: every other month it includes two months of water, with no line item,
+#       so electricity cost roughly doubled. Recognized from a bill in the poll whose
+#       billLastPeriod differs from its itemized charges.
+IMPORT_LOGIC_REVISION = 9
 
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see

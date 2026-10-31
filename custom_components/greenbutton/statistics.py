@@ -628,6 +628,33 @@ def response_has_bill_meter_reads(response: UsageResponse) -> bool:
     )
 
 
+def response_has_bill_total_beyond_its_itemization(response: UsageResponse) -> bool | None:
+    """Revision 9: whether [response] shows this entry's bills were priced off a whole-bill total.
+
+    A populated ``billLastPeriod`` used to win over the itemized charges in feeds without
+    per-line scales. Only a bill where the two differ shows that mattered (a Burlington water
+    month); a bill where they agree can't tell, because the same account's next bill may not.
+
+      - **True** — a bill in the poll states a ``billLastPeriod`` that differs from its itemized
+        charges ([BillingSummary.total_disagrees_with_itemization]).
+      - **False** — every usage point itemizes per-interval ``<cost>``, so no bill was ever
+        priced; or the old rule decided none of the poll's bills
+        ([BillingSummary.superseded_bill_total] is None: Enbridge, savagedata, a feed that
+        leaves ``billLastPeriod`` at 0).
+      - **None** — otherwise: no bills in the poll, or only bills whose total and itemization
+        agree. Like revision 3, an account that never shows a difference stays undecided and
+        re-checks each poll, with nothing to repair.
+    """
+    bills = [s for up in response.usage_points for s in up.summaries]
+    if any(s.total_disagrees_with_itemization for s in bills):
+        return True
+    if response.usage_points and all(_has_interval_cost(up) for up in response.usage_points):
+        return False
+    if bills and all(s.superseded_bill_total is None for s in bills):
+        return False
+    return None
+
+
 # Recognition predicates keyed by the import-logic revision that fixed the bug. An entry stamped
 # at revision N is tested against every predicate for a revision > N — so a user who skipped a
 # release still gets each repair they're owed, in one rebuild rather than one per revision.
@@ -642,6 +669,7 @@ _IMPORT_MIGRATION_CHECKS: dict[int, Callable[[UsageResponse], bool | None]] = {
     6: response_damage_is_judged_from_stored_rows,
     7: response_cost_lines_carry_a_quantity,
     8: response_has_bill_meter_reads,
+    9: response_has_bill_total_beyond_its_itemization,
 }
 
 
