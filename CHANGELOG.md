@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Burlington Hydro: every other month's electricity cost included two months
+  of Halton Region water, which Burlington bills on the same bill without a
+  line item for it, roughly doubling those months. A bill is now priced from
+  its itemized charges whenever it has any, rather than from its stated
+  total. Affected entries rebuild their statistics automatically.
 - Enbridge Gas: usage between two actual meter reads could be a cubic metre
   off the invoices, because it was rounded once over the whole stretch while
   Enbridge rounds each bill. It now adds up each bill's own rounded volume.

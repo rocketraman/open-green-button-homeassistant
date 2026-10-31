@@ -88,7 +88,8 @@ async def test_fetch_usage_parses_proxied_atom_xml_into_dataclasses(
     assert summary.billing_period_start == datetime(2024, 5, 19, 14, 40, 8, tzinfo=UTC)
     assert summary.billing_period_duration_seconds == 2_592_000
     assert summary.bill_last_period_raw == 10_250_000
-    assert summary.total_cost == 102.50
+    # Priced from its itemized lines, not the hand-written $102.50 billLastPeriod beside them.
+    assert summary.total_cost == 0.027 + 0.6178
     assert summary.currency_numeric_code == 124
     assert len(summary.cost_details) == 2
     assert summary.cost_details[0].note == "Regulatory Charges"
