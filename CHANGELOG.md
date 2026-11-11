@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   line item for it, roughly doubling those months. A bill is now priced from
   its itemized charges whenever it has any, rather than from its stated
   total. Affected entries rebuild their statistics automatically.
+- Enbridge Gas: usage was about 2.8 times too low on a meter whose register
+  counts hundreds of cubic feet rather than cubic metres, because the meter
+  reads on the bills were taken as cubic metres. The unit is now worked out
+  from each bill's own usage figure, and usage is always in cubic metres.
+  Affected entries rebuild their statistics automatically
+  ([#41](https://github.com/rocketraman/open-green-button-homeassistant/issues/41)).
 - Enbridge Gas: usage between two actual meter reads could be a cubic metre
   off the invoices, because it was rounded once over the whole stretch while
   Enbridge rounds each bill. It now adds up each bill's own rounded volume.

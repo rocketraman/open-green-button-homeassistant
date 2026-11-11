@@ -2569,6 +2569,35 @@ async def test_a_billed_meter_cursor_follows_its_bills_and_the_window_its_last_a
     )
 
 
+async def test_a_billed_meter_in_hundreds_of_cubic_feet_is_rebuilt_from_a_poll_of_bills_alone(
+    hass: HomeAssistant,
+) -> None:
+    """Revision 10 has to be judged from bills: an Enbridge poll carries no readings any more."""
+    from dataclasses import replace
+
+    hass.set_state(CoreState.running)
+    response = _billed_meter((("2026-09-22", 5000.0), ("2026-10-21", 5010.0), True))
+    [bill] = response.usage_points[0].summaries
+    imperial = replace(bill, meter_reads=replace(bill.meter_reads, usage_unadjusted=27.888))
+    response.usage_points[0].summaries[:] = [imperial]
+    entry = _entry(hass)
+    _stamp(hass, entry, 9)
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_APPLIED_QUIRKS: [QUIRK_ENBRIDGE_METER_READS]}
+    )
+    api = _api_returning(response)
+    coordinator = GreenButtonCoordinator(hass, api, entry)
+
+    has_stats, clear, _import = _migration_patches(had_statistics=True)
+    with has_stats, clear as clear_mock, _import:
+        await coordinator.async_refresh()
+
+    assert coordinator.last_exception is None
+    assert api.fetch_usage.await_count == 2  # the poll, then the rebuild's full-history re-fetch
+    clear_mock.assert_awaited_once_with(hass, entry.entry_id)
+    assert entry.data[CONF_IMPORT_LOGIC_REVISION] == IMPORT_LOGIC_REVISION
+
+
 async def test_bill_reading_mismatches_are_kept_across_polls_and_reset_by_a_rebuild(
     hass: HomeAssistant,
 ) -> None:

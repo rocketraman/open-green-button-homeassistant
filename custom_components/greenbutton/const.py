@@ -368,7 +368,13 @@ CONF_IMPORT_LOGIC_REVISION = "import_logic_revision"
 #       is the whole bill: every other month it includes two months of water, with no line item,
 #       so electricity cost roughly doubled. Recognized from a bill in the poll whose
 #       billLastPeriod differs from its itemized charges.
-IMPORT_LOGIC_REVISION = 9
+#  10 — the unit of the register on Enbridge's bills. A register difference was taken as cubic
+#       metres, but an older meter's register counts hundreds of cubic feet and the feed labels
+#       neither, so such a meter's usage was stored about 2.83× too low. The unit now comes from
+#       each bill's "Usage (unadjusted)", which is always cubic metres. Recognized from bills
+#       whose usage per register unit is nearer 2.83 than 1; a meter in cubic metres is stamped
+#       forward untouched.
+IMPORT_LOGIC_REVISION = 10
 
 # Customer-data fields, fetched once from the ESPI RetailCustomer feed and folded into the entry
 # title so two accounts at the same utility are distinguishable (see

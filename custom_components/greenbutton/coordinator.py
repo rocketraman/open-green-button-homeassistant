@@ -79,7 +79,7 @@ from .const import (
     POLL_HISTORY_RETENTION,
     SERVICE_REBUILD_STATISTICS,
 )
-from .meter_reads import meter_read_points, newest_actual_read, newest_read
+from .meter_reads import has_meter_reads, meter_read_points, newest_actual_read, newest_read
 from .statistics import (
     async_clear_statistics_for_entry,
     async_entry_has_statistics,
@@ -1173,7 +1173,11 @@ class GreenButtonCoordinator(DataUpdateCoordinator[UsageResponse]):
 
         # An empty poll says nothing about the feed's shape: "no offending series" may only mean
         # the utility published nothing in this window.
-        has_readings = any(s.readings for up in response.usage_points for s in up.series)
+        # Bills with meter reads count as readings: for such a meter they are the usage, and its
+        # polls routinely carry nothing else (Enbridge's IntervalReadings stopped in spring 2026).
+        has_readings = any(s.readings for up in response.usage_points for s in up.series) or any(
+            has_meter_reads(up) for up in response.usage_points
+        )
         verdict = (
             response_needs_import_migration(response, stamped_revision) if has_readings else None
         )

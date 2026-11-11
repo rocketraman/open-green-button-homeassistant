@@ -38,7 +38,7 @@ from .const import (
     CONF_PROXY_TOKEN,
     DOMAIN,
 )
-from .meter_reads import meter_read_points, points_as_dicts
+from .meter_reads import meter_read_points, points_as_dicts, register_unit
 from .storage import xml_cache_path
 
 if TYPE_CHECKING:
@@ -153,6 +153,9 @@ def _summarize_response(response: UsageResponse | None) -> dict[str, Any] | None
                 # provisional, superseded, bracketed) — see [meter_reads]. Empty for a meter
                 # whose bills carry none.
                 "meter_read_chain": points_as_dicts(meter_read_points(up.summaries)),
+                # Cubic metres in one unit of that register (1, or 2.8317 for hundreds of cubic
+                # feet); null when the bills can't say, and it is then taken as 1.
+                "meter_read_register_unit_m3": register_unit(up.summaries),
             }
             for up in response.usage_points
         ],
