@@ -35,6 +35,8 @@ They were checked against six of the maintainer's paper bills: every register va
 * `qualityOfReading` 19 is printed as "Actual", 12 as "Estimated".
 * Billed volume = (current read − previous read) × PEF, rounded; PEF is "Adjustment Factor (atmospheric)", e.g. 1.004.
   "Usage (unadjusted)" is billed volume ÷ PEF, not the raw register difference.
+* The register is not always in cubic metres.
+  An older meter's register counts hundreds of cubic feet, and its bill converts the difference to cubic metres before applying the PEF (see "The register's unit" below).
 * A correction bill (seen twice, both after an estimate) spans two periods back to the start of the estimated one.
   It lists two "Current Meter Read" lines, the estimate and then the actual read, and its volume is their difference (e.g. −259 m³).
   It is itself marked `qualityOfReading` 12, even though its final read is the actual one.
@@ -128,6 +130,26 @@ Its amount is only the difference between what the bills it corrects charged and
 Added on top of the corrected bill, that credit lands on the days past it and priced one month below zero (−$6.88).
 So a correction is costed together with the bills it corrects: their amounts plus its own ($113.16 − $46.35), spread over its whole span.
 
+### The register's unit
+
+Most registers count cubic metres, but an older meter's counts hundreds of cubic feet ([#41](https://github.com/rocketraman/open-green-button-homeassistant/issues/41)).
+Taking that register difference as cubic metres stored about 2.83 times too little gas.
+Nothing in the feed labels the unit.
+The register lines carry `uom` 114 on both kinds of meter, the same code Enbridge puts on the adjustment factor and the day count, and a poll usually has no ReadingType to consult.
+
+What the feed does carry is each bill's "Usage (unadjusted)" (`uom` 167), which is in cubic metres either way.
+So the unit is worked out per meter: the unadjusted usage over the register difference, summed across the response's ordinary bills that used gas, read as whichever of 1 (cubic metres) or 2.8317 (hundreds of cubic feet) it is nearer.
+Summing first keeps one small bill's rounding from deciding it, though a single bill on a register difference of 1 is still unambiguous (about 3 against about 1).
+Correction bills are left out, and bills that can't say (no such line, or no usage) leave the register in cubic metres.
+
+Every register difference is multiplied by that unit, so usage is always cubic metres.
+On a register in hundreds of cubic feet, an ordinary bill's volume is taken as its "Usage (unadjusted)" × PEF, rounded, rather than from the converted difference.
+That rounds back to the invoice exactly, where our conversion constant might land a cubic metre off; the constant is only used where no bill states the span.
+A register in cubic metres is computed exactly as before.
+
+`import_logic_revision` 10 rebuilds an entry whose bills show a register in another unit.
+Because such a poll carries bills and no readings, bills with meter reads now count as content when judging whether a poll can decide a repair.
+
 ## Restating months already imported
 
 A correction, or an actual read that brackets earlier estimates, changes usage up to about two months back.
@@ -195,11 +217,13 @@ So the list is persisted in the entry's data, like `recent_polls`, keeping the n
 This tells us how often a utility's readings are wrong and in which direction, and would catch a utility whose readings are right where its register lines are not.
 
 The diagnostics also show the register chain itself, as `meter_read_chain` on each usage point of the last response: each read's date, value, actual/estimated, and whether it was kept, superseded, bracketed or is provisional.
+`meter_read_register_unit_m3` beside it is the cubic metres in one register unit, or null when the bills can't say.
 
 ## Tests
 
 In [`tests/test_meter_reads.py`](../../tests/test_meter_reads.py) and [`tests/test_coordinator.py`](../../tests/test_coordinator.py):
 
+* The register's unit: hundreds of cubic feet recognized from several bills and from one small one, imported as the invoices' cubic metres, converted from the register where a bill is missing, and a rebuild triggered by a poll of bills alone.
 * The chain: a bracketed estimate, a provisional one, a correction superseding its estimate, and the later Bill Date winning a shared read date.
 * Parsing the meter-read lines, only under the quirk; the revision 8 predicate.
 * Actual-to-actual spreading: the June estimate is dropped and 84 m³ spreads over 62 days; each bill's cost lands in its own period.

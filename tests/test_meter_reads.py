@@ -66,6 +66,8 @@ def _bill(
     dollars: float,
     bill_date: date | None = None,
     corrects: float | None = None,
+    factor: float = 1.004,
+    usage_unadjusted: float | None = None,
 ) -> BillingSummary:
     """A bill from [previous] read to [current] read, shaped as Enbridge's feed sends it.
 
@@ -101,8 +103,9 @@ def _bill(
             current_read_date=current_date,
             previous_reads=(0.0, previous_read + 2) if corrects is not None else (previous_read,),
             current_reads=(corrects, current_read) if corrects is not None else (current_read,),
-            adjustment_factor=1.004,
+            adjustment_factor=factor,
             quality_of_reading=19 if actual and corrects is None else 12,
+            usage_unadjusted=usage_unadjusted,
         ),
     )
 
@@ -229,6 +232,79 @@ def test_a_span_whose_bills_dont_add_up_rounds_the_register_difference() -> None
     assert span.quantity == round(465 * 1.004)
 
 
+def _imperial_bills() -> list[BillingSummary]:
+    """Four bills on a register counting hundreds of cubic feet (made-up figures).
+
+    Each states "Usage (unadjusted)" as Enbridge does: the invoice's whole cubic metres ÷ the
+    adjustment factor. The invoices are 11, 28, 43 and 31 m³ on register differences of 4, 10, 15
+    and 11.
+    """
+    reads = [
+        (date(2026, 6, 15), 2000.0),
+        (date(2026, 6, 23), 2004.0),
+        (date(2026, 7, 22), 2014.0),
+        (date(2026, 8, 22), 2029.0),
+        (date(2026, 9, 21), 2040.0),
+    ]
+    invoiced = [11, 28, 43, 31]
+    return [
+        _bill(
+            previous,
+            current,
+            actual=index % 2 == 1,
+            dollars=40.0 + index,
+            factor=1.005,
+            usage_unadjusted=round(volume / 1.005, 3),
+        )
+        for index, (previous, current, volume) in enumerate(
+            zip(reads, reads[1:], invoiced, strict=False)
+        )
+    ]
+
+
+def test_a_register_in_hundreds_of_cubic_feet_is_read_from_the_bills_unadjusted_usage() -> None:
+    bills = _imperial_bills()
+    assert meter_reads.register_unit(bills) == meter_reads.REGISTER_UNIT_HUNDRED_CUBIC_FEET
+    spans = meter_reads.bill_spans(meter_reads.meter_read_points(bills), _TORONTO, bills)
+    # Actual to actual, in cubic metres, adding up to the invoices: 11 + 28, then 43 + 31.
+    assert [span.quantity for span in spans] == [39, 74]
+
+
+def test_one_small_bill_is_enough_to_tell_the_register_unit() -> None:
+    """An incremental poll carries one bill; a difference of 1 is the coarsest it gets."""
+    jun15, jul15 = (date(2026, 6, 15), 2000.0), (date(2026, 7, 15), 2001.0)
+    imperial = [_bill(jun15, jul15, actual=True, dollars=30, factor=1.005, usage_unadjusted=2.985)]
+    assert meter_reads.register_unit(imperial) == meter_reads.REGISTER_UNIT_HUNDRED_CUBIC_FEET
+    metric = [_bill(jun15, jul15, actual=True, dollars=30, factor=1.005, usage_unadjusted=0.995)]
+    assert meter_reads.register_unit(metric) == meter_reads.REGISTER_UNIT_CUBIC_METRES
+
+
+def test_a_register_in_cubic_metres_is_unchanged_by_its_unadjusted_usage() -> None:
+    bill = _bill(_JUN29, _JUL30, actual=True, dollars=43.27, usage_unadjusted=round(21 / 1.004, 3))
+    assert meter_reads.register_unit([bill]) == meter_reads.REGISTER_UNIT_CUBIC_METRES
+    [span] = meter_reads.bill_spans(meter_reads.meter_read_points([bill]), _TORONTO, [bill])
+    assert span.quantity == 21
+
+
+def test_bills_that_cant_say_leave_the_register_in_cubic_metres() -> None:
+    """No "Usage (unadjusted)" line, or a month with no usage: nothing to work a unit out from."""
+    assert meter_reads.register_unit([_JUNE, _JULY]) is None
+    idle = _bill(_JUN29, (date(2026, 7, 30), 35563.0), actual=True, dollars=25, usage_unadjusted=0)
+    assert meter_reads.register_unit([idle]) is None
+    [span] = meter_reads.bill_spans(
+        meter_reads.meter_read_points([_JUNE, _JULY]), _TORONTO, [_JUNE, _JULY]
+    )
+    assert span.quantity == 84
+
+
+def test_an_imperial_span_whose_bills_dont_add_up_converts_the_register_difference() -> None:
+    """A bill missing from the response: the span falls back to the register, converted."""
+    bills = _imperial_bills()
+    del bills[2]  # 2014 → 2029 is now stated by no bill
+    spans = meter_reads.bill_spans(meter_reads.meter_read_points(bills), _TORONTO, bills)
+    assert [span.quantity for span in spans] == [39, round(15 * 2.8317 * 1.005), 31]
+
+
 def test_an_estimate_after_the_newest_actual_read_is_provisional() -> None:
     bills = [_JUNE]
     points = meter_reads.meter_read_points(bills)
@@ -312,6 +388,14 @@ _FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
         <espi:measurement><espi:powerOfTenMultiplier>3</espi:powerOfTenMultiplier>
           <espi:uom>114</espi:uom><espi:value>35563000</espi:value></espi:measurement>
           </espi:costAdditionalDetailLastPeriod>
+      <espi:costAdditionalDetailLastPeriod><espi:note>Usage (unadjusted)</espi:note>
+        <espi:measurement><espi:powerOfTenMultiplier>3</espi:powerOfTenMultiplier>
+          <espi:uom>167</espi:uom><espi:value>20916</espi:value></espi:measurement>
+          </espi:costAdditionalDetailLastPeriod>
+      <espi:costAdditionalDetailLastPeriod><espi:note>Previous Usage consumption</espi:note>
+        <espi:measurement><espi:powerOfTenMultiplier>3</espi:powerOfTenMultiplier>
+          <espi:uom>167</espi:uom><espi:value>0</espi:value></espi:measurement>
+          </espi:costAdditionalDetailLastPeriod>
       <espi:costAdditionalDetailLastPeriod><espi:note>Adjustment Factor (atmospheric)</espi:note>
         <espi:measurement><espi:powerOfTenMultiplier>6</espi:powerOfTenMultiplier>
           <espi:uom>114</espi:uom><espi:value>1004000</espi:value></espi:measurement>
@@ -335,6 +419,7 @@ def test_meter_reads_are_parsed_only_under_the_quirk() -> None:
         current_reads=(35584.0,),
         adjustment_factor=1.004,
         quality_of_reading=19,
+        usage_unadjusted=pytest.approx(20.916),
     )
     _, [up] = parse_usage_feed(_FEED, invert_cost_if_positive_multiplier=True)
     assert up.summaries[0].meter_reads is None
@@ -346,6 +431,14 @@ def test_bills_with_meter_reads_are_the_revision_8_signal() -> None:
         updated=None, usage_points=_response(_JUNE).usage_points, new_credentials=None
     )
     assert response_needs_import_migration(unquirked, 7) is False
+
+
+def test_bills_on_a_register_in_another_unit_are_the_revision_10_signal() -> None:
+    assert response_needs_import_migration(_response(*_imperial_bills()), 9) is True
+    metric = _bill(_JUN29, _JUL30, actual=True, dollars=43.27, usage_unadjusted=20.916)
+    assert response_needs_import_migration(_response(metric), 9) is False
+    # Bills that can't say what the register counts: wait for one that can.
+    assert response_needs_import_migration(_response(_JUNE, _JULY), 9) is None
 
 
 # --- importing ---------------------------------------------------------------------------------
@@ -452,6 +545,14 @@ async def test_bills_import_on_a_poll_that_carries_no_readings(hass: HomeAssista
     await _import(hass, _response(_JUNE, _JULY, series=[]), fresh=True)
     usage = await _changes(hass, _USAGE_ID)
     assert round(sum(change for _, change in usage), 3) == 84
+
+
+async def test_a_register_in_hundreds_of_cubic_feet_imports_as_the_invoices_cubic_metres(
+    hass: HomeAssistant,
+) -> None:
+    await _import(hass, _response(*_imperial_bills(), series=[]), fresh=True)
+    usage = await _changes(hass, _USAGE_ID)
+    assert round(sum(change for _, change in usage), 3) == 11 + 28 + 43 + 31
 
 
 async def test_a_correction_bill_is_costed_together_with_the_bills_it_corrects(

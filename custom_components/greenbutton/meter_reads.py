@@ -27,6 +27,11 @@ rounds it, summed. Summing the bills' own rounded volumes, rather than rounding 
 the total equal to the invoices'. It is spread evenly over the span: from local midnight after the
 earlier read through the end of the later read's day, in Home Assistant's time zone (Enbridge's
 own ``tzOffset`` is unusable).
+
+**The register's unit.** Most registers count cubic metres; an older meter's counts hundreds of
+cubic feet, and nothing in the feed labels which. Each bill's "Usage (unadjusted)" is in cubic
+metres either way, so its ratio to the register difference gives the unit ([register_unit]), and
+every register difference is multiplied by it. Usage is always cubic metres.
 """
 
 from __future__ import annotations
@@ -57,6 +62,18 @@ FINE_READING_MAX_SECONDS = 86_400
 # Within this, a dropped reading and the bill's usage over the same hours agree: bills round their
 # volume to a whole unit, and a reading split across two spans rounds on each side.
 _AGREEMENT_TOLERANCE = 1.0
+
+# Cubic metres in one register unit: a metric register counts cubic metres, an imperial one
+# hundreds of cubic feet. Enbridge's own conversion constant isn't known to more digits than its
+# bills' whole-unit rounding shows, which is why a bill's stated usage is preferred over this
+# wherever the bill states it ([_bill_volume]).
+REGISTER_UNIT_CUBIC_METRES = 1.0
+REGISTER_UNIT_HUNDRED_CUBIC_FEET = 2.8317
+
+# Above this many cubic metres per register unit, the register counts hundreds of cubic feet.
+# Halfway between the two units: a bill rounds its volume to a whole cubic metre, so one bill on
+# a register difference of 1 can state anything from 2.5 to 3.5 for an imperial unit.
+_IMPERIAL_RATIO_THRESHOLD = (REGISTER_UNIT_CUBIC_METRES + REGISTER_UNIT_HUNDRED_CUBIC_FEET) / 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,15 +187,54 @@ def _with_status(point: MeterReadPoint, status: str) -> MeterReadPoint:
     )
 
 
+def register_unit(summaries: list[BillingSummary]) -> float | None:
+    """Cubic metres in one unit of the register on [summaries]' bills, or None when they can't say.
+
+    Taken over every ordinary bill that used gas and states its "Usage (unadjusted)": that usage,
+    in cubic metres, over the register difference it was billed on. Summed across the bills
+    before dividing, so one small bill's rounding doesn't decide it, then read as whichever unit
+    it is nearer ([REGISTER_UNIT_CUBIC_METRES] or [REGISTER_UNIT_HUNDRED_CUBIC_FEET]).
+
+    None when no bill offers both figures (only corrections, or months with no usage). A meter
+    keeps its unit, so a response is judged whole; a correction bill is left out because its
+    usage is a restatement, not what the register moved by.
+    """
+    usage = 0.0
+    difference = 0.0
+    for summary in summaries:
+        bill = summary.meter_reads
+        if (
+            bill is None
+            or bill.is_correction
+            or len(bill.previous_reads) != 1
+            or bill.usage_unadjusted is None
+            or bill.usage_unadjusted <= 0
+            or bill.current_reads[-1] <= bill.previous_reads[0]
+        ):
+            continue
+        usage += bill.usage_unadjusted
+        difference += bill.current_reads[-1] - bill.previous_reads[0]
+    if difference <= 0:
+        return None
+    if usage / difference > _IMPERIAL_RATIO_THRESHOLD:
+        return REGISTER_UNIT_HUNDRED_CUBIC_FEET
+    return REGISTER_UNIT_CUBIC_METRES
+
+
 def bill_spans(
     points: list[MeterReadPoint], tz: tzinfo, summaries: list[BillingSummary]
 ) -> list[BillSpan]:
-    """Usage between each pair of consecutive reads the chain keeps, from [summaries]' bills."""
+    """Usage between each pair of consecutive reads the chain keeps, from [summaries]' bills.
+
+    In cubic metres: register differences are multiplied by the [register_unit], taken as cubic
+    metres when the bills can't say.
+    """
     bills = [s.meter_reads for s in summaries if s.meter_reads is not None]
+    unit = register_unit(summaries) or REGISTER_UNIT_CUBIC_METRES
     chain = [p for p in points if p.status in (STATUS_KEPT, STATUS_PROVISIONAL)]
     spans: list[BillSpan] = []
     for earlier, later in zip(chain, chain[1:], strict=False):
-        quantity = _billed_volume(earlier, later, bills)
+        quantity = _billed_volume(earlier, later, bills, unit)
         if quantity < 0:
             # A register that went backwards between kept reads: a meter exchange or rollover,
             # which no bill seen so far has shown. Nothing sound can be spread over it.
@@ -195,13 +251,15 @@ def bill_spans(
 
 
 def _billed_volume(
-    earlier: MeterReadPoint, later: MeterReadPoint, bills: list[BillMeterReads]
+    earlier: MeterReadPoint, later: MeterReadPoint, bills: list[BillMeterReads], unit: float
 ) -> int:
     """What the bills between [earlier] and [later] billed, each rounded as its invoice rounds it.
 
     Only when those bills account for the whole register difference between the two reads: a bill
     missing from the response, or two bills restating one period, would make their sum wrong. Then
     the span is the register difference × the adjustment factor of the read ending it, rounded once.
+
+    [unit] is the cubic metres in one register unit ([register_unit]).
     """
     inside = [
         b
@@ -219,8 +277,25 @@ def _billed_volume(
     if len(differences) == len(inside) and math.isclose(
         sum(d for d, _ in differences), later.value - earlier.value, abs_tol=1e-6
     ):
-        return sum(round(d * b.adjustment_factor) for d, b in differences)
-    return round((later.value - earlier.value) * later.adjustment_factor)
+        return sum(_bill_volume(d, b, unit) for d, b in differences)
+    return round((later.value - earlier.value) * unit * later.adjustment_factor)
+
+
+def _bill_volume(difference: float, bill: BillMeterReads, unit: float) -> int:
+    """The cubic metres [bill] billed on a register [difference], rounded as its invoice rounds it.
+
+    On a register in cubic metres that is the difference × the adjustment factor. On one in
+    hundreds of cubic feet the bill's own "Usage (unadjusted)" stands in for the converted
+    difference where the bill is an ordinary one that states it: it is the invoice's volume ÷ the
+    factor, so it rounds back to the invoice exactly, which our conversion constant might not.
+    """
+    if (
+        unit != REGISTER_UNIT_CUBIC_METRES
+        and not bill.is_correction
+        and bill.usage_unadjusted is not None
+    ):
+        return round(bill.usage_unadjusted * bill.adjustment_factor)
+    return round(difference * unit * bill.adjustment_factor)
 
 
 def billing_period(summary: BillingSummary, tz: tzinfo) -> tuple[datetime, datetime] | None:

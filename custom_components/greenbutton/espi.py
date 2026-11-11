@@ -502,6 +502,7 @@ _NOTE_PREVIOUS_READ_DATE = "billing period - previous read date"
 _NOTE_CURRENT_READ_DATE = "billing period - current read date"
 _NOTE_BILL_DATE = "bill date"
 _NOTE_ADJUSTMENT_FACTOR = "adjustment factor (atmospheric)"
+_NOTE_USAGE_UNADJUSTED = "usage (unadjusted)"
 
 
 def _parse_meter_reads(
@@ -512,6 +513,11 @@ def _parse_meter_reads(
     Values are scaled by their own ``powerOfTenMultiplier``, read under the same sign correction
     as the bill's cost lines ([invert] — Enbridge sends a 32,771 m³ register as ``32771000`` at
     ``3``). Read dates are ``uom`` 27 epoch seconds at UTC midnight, taken as calendar dates.
+
+    A line's ``uom`` says nothing about the register's unit: Enbridge sends 114 on the meter
+    reads, the adjustment factor and the day count alike, for a register in cubic metres and one
+    in hundreds of cubic feet. The unit is worked out from "Usage (unadjusted)" instead, which is
+    always cubic metres ([meter_reads.register_unit]).
     """
     reads: dict[str, list[float]] = {}
     for elem in details:
@@ -535,6 +541,7 @@ def _parse_meter_reads(
     factor = reads.get(_NOTE_ADJUSTMENT_FACTOR)
     if previous_date is None or current_date is None or not current_reads or not factor:
         return None
+    usage_unadjusted = reads.get(_NOTE_USAGE_UNADJUSTED)
     return BillMeterReads(
         bill_date=read_date(_NOTE_BILL_DATE),
         previous_read_date=previous_date,
@@ -543,6 +550,7 @@ def _parse_meter_reads(
         current_reads=current_reads,
         adjustment_factor=factor[0],
         quality_of_reading=quality_of_reading,
+        usage_unadjusted=usage_unadjusted[0] if usage_unadjusted else None,
     )
 
 

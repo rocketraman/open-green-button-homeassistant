@@ -275,6 +275,10 @@ class BillMeterReads:
     adjustment_factor: float
     # ESPI qualityOfReading on the summary: 19 actual ("revenue quality"), 12 estimated.
     quality_of_reading: int | None
+    # "Usage (unadjusted)": the billed volume ÷ the adjustment factor, in cubic metres whatever
+    # the register counts. The only thing in the feed that tells a register in hundreds of cubic
+    # feet from one in cubic metres — see [meter_reads.register_unit].
+    usage_unadjusted: float | None = None
 
     @property
     def is_correction(self) -> bool:

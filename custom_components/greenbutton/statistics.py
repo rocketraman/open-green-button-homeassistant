@@ -655,6 +655,31 @@ def response_has_bill_total_beyond_its_itemization(response: UsageResponse) -> b
     return None
 
 
+def response_has_bill_meter_reads_in_another_unit(response: UsageResponse) -> bool | None:
+    """Revision 10: whether [response] carries bills whose register doesn't count cubic metres.
+
+    A register difference was taken as cubic metres whatever the register counts, so a meter
+    counting hundreds of cubic feet had its usage stored about 2.83× too low.
+
+      - **True** — some meter's bills put its [meter_reads.register_unit] at anything but a
+        cubic metre.
+      - **False** — no bill carries meter reads under the quirk, or every such meter's bills show
+        a register in cubic metres.
+      - **None** — a meter's bills carry meter reads but can't say what the register counts (no
+        usage in the poll's bills): wait for one that can.
+    """
+    if QUIRK_ENBRIDGE_METER_READS not in response.quirks:
+        return False
+    units = [
+        meter_reads.register_unit(up.summaries)
+        for up in response.usage_points
+        if meter_reads.has_meter_reads(up)
+    ]
+    if any(u is not None and u != meter_reads.REGISTER_UNIT_CUBIC_METRES for u in units):
+        return True
+    return None if any(u is None for u in units) else False
+
+
 # Recognition predicates keyed by the import-logic revision that fixed the bug. An entry stamped
 # at revision N is tested against every predicate for a revision > N — so a user who skipped a
 # release still gets each repair they're owed, in one rebuild rather than one per revision.
@@ -670,6 +695,7 @@ _IMPORT_MIGRATION_CHECKS: dict[int, Callable[[UsageResponse], bool | None]] = {
     7: response_cost_lines_carry_a_quantity,
     8: response_has_bill_meter_reads,
     9: response_has_bill_total_beyond_its_itemization,
+    10: response_has_bill_meter_reads_in_another_unit,
 }
 
 
@@ -1118,8 +1144,8 @@ def _has_interval_cost(up: UsagePoint) -> bool:
 def _bill_hours(up: UsagePoint) -> dict[datetime, float]:
     """``{hour: quantity}`` spread from [up]'s bill meter reads; empty for a meter without them.
 
-    Quantities are in the bills' unit, cubic metres (the only one a feed with meter reads has
-    sent); [_import_series_group] checks that against the statistic it lands in.
+    Quantities are cubic metres whatever the register counts ([meter_reads.register_unit]);
+    [_import_series_group] checks that against the statistic it lands in.
     """
     if not meter_reads.has_meter_reads(up):
         return {}
@@ -1286,8 +1312,8 @@ async def _import_series_group(
     if bill_hours and unit != UnitOfVolume.CUBIC_METERS:
         _warn_once(
             f"{statistic_id}:bill-meter-reads-unit",
-            "Ignoring the bill meter reads for %s: its statistic is in %s, but bills state their "
-            "meter reads in cubic metres",
+            "Ignoring the bill meter reads for %s: its statistic is in %s, but usage from bills' "
+            "meter reads is in cubic metres",
             statistic_id,
             unit,
         )
